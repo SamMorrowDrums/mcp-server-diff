@@ -1,0 +1,98 @@
+name: 'MCP Conformance Test'
+description: 'Test MCP server conformance between versions'
+author: 'Sam Morrow'
+branding:
+  icon: 'check-circle'
+  color: 'green'
+
+inputs:
+  install_command:
+    description: 'Command to install dependencies'
+    required: true
+  build_command:
+    description: 'Command to build the MCP server'
+    required: true
+  start_command:
+    description: 'Command to start the MCP server (stdio transport)'
+    required: true
+  env_vars:
+    description: 'Environment variables (newline-separated KEY=VALUE pairs)'
+    required: false
+    default: ''
+  server_timeout:
+    description: 'Timeout in seconds to wait for server response'
+    required: false
+    default: '10'
+
+outputs:
+  status:
+    description: 'Test status (passed or differences)'
+    value: ${{ steps.conformance.outputs.status }}
+  report_path:
+    description: 'Path to the conformance report'
+    value: 'conformance-report/CONFORMANCE_REPORT.md'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Download conformance test script
+      shell: bash
+      run: |
+        curl -sSL -o /tmp/mcp-conformance-test.sh \
+          https://raw.githubusercontent.com/sammorrowdrums/mcp-conformance-action/main/scripts/conformance-test.sh
+        chmod +x /tmp/mcp-conformance-test.sh
+
+    - name: Set environment variables
+      if: inputs.env_vars != ''
+      shell: bash
+      run: |
+        echo "${{ inputs.env_vars }}" >> $GITHUB_ENV
+
+    - name: Run conformance test
+      id: conformance
+      shell: bash
+      env:
+        MCP_INSTALL_COMMAND: ${{ inputs.install_command }}
+        MCP_BUILD_COMMAND: ${{ inputs.build_command }}
+        MCP_START_COMMAND: ${{ inputs.start_command }}
+        MCP_SERVER_TIMEOUT: ${{ inputs.server_timeout }}
+      run: |
+        /tmp/mcp-conformance-test.sh > conformance-summary.txt 2>&1 || true
+        
+        cat conformance-summary.txt
+        
+        if grep -q "RESULT: ALL TESTS PASSED" conformance-summary.txt; then
+          echo "status=passed" >> $GITHUB_OUTPUT
+        else
+          echo "status=differences" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Generate Job Summary
+      shell: bash
+      run: |
+        echo "# MCP Server Conformance Report" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Comparing current branch against merge-base" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -f conformance-report/CONFORMANCE_REPORT.md ]; then
+          tail -n +5 conformance-report/CONFORMANCE_REPORT.md >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ Report file not found - check the workflow logs for errors" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.conformance.outputs.status }}" = "passed" ]; then
+          echo "✅ **All conformance tests passed** - No behavioral differences detected." >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ **Differences detected** - Review the diffs above to ensure changes are intentional." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Common expected differences:" >> $GITHUB_STEP_SUMMARY
+          echo "- New tools added" >> $GITHUB_STEP_SUMMARY
+          echo "- Tool descriptions updated" >> $GITHUB_STEP_SUMMARY
+          echo "- New resources or prompts" >> $GITHUB_STEP_SUMMARY
+          echo "- Capability changes" >> $GITHUB_STEP_SUMMARY
+        fi

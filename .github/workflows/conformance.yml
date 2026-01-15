@@ -1,0 +1,194 @@
+name: MCP Conformance Test
+
+on:
+  workflow_call:
+    inputs:
+      install_command:
+        description: 'Command to install dependencies'
+        required: true
+        type: string
+      build_command:
+        description: 'Command to build the MCP server'
+        required: true
+        type: string
+      start_command:
+        description: 'Command to start the MCP server (stdio transport)'
+        required: true
+        type: string
+      env_vars:
+        description: 'Environment variables (newline-separated KEY=VALUE pairs)'
+        required: false
+        type: string
+        default: ''
+      working_directory:
+        description: 'Working directory for commands'
+        required: false
+        type: string
+        default: '.'
+      setup_go:
+        description: 'Set up Go environment'
+        required: false
+        type: boolean
+        default: false
+      go_version_file:
+        description: 'Go version file to use'
+        required: false
+        type: string
+        default: 'go.mod'
+      setup_node:
+        description: 'Set up Node.js environment'
+        required: false
+        type: boolean
+        default: false
+      node_version:
+        description: 'Node.js version to use'
+        required: false
+        type: string
+        default: '20'
+      setup_python:
+        description: 'Set up Python environment'
+        required: false
+        type: boolean
+        default: false
+      python_version:
+        description: 'Python version to use'
+        required: false
+        type: string
+        default: '3.11'
+      setup_rust:
+        description: 'Set up Rust environment'
+        required: false
+        type: boolean
+        default: false
+      rust_toolchain:
+        description: 'Rust toolchain to use'
+        required: false
+        type: string
+        default: 'stable'
+      setup_dotnet:
+        description: 'Set up .NET environment'
+        required: false
+        type: boolean
+        default: false
+      dotnet_version:
+        description: '.NET version to use'
+        required: false
+        type: string
+        default: '8.0.x'
+      server_timeout:
+        description: 'Timeout in seconds to wait for server response'
+        required: false
+        type: number
+        default: 10
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        if: inputs.setup_go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ inputs.go_version_file }}
+
+      - name: Set up Node.js
+        if: inputs.setup_node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Set up Python
+        if: inputs.setup_python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Set up Rust
+        if: inputs.setup_rust
+        uses: dtolnay/rust-action@master
+        with:
+          toolchain: ${{ inputs.rust_toolchain }}
+
+      - name: Set up .NET
+        if: inputs.setup_dotnet
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet_version }}
+
+      - name: Download conformance test script
+        run: |
+          curl -sSL -o /tmp/mcp-conformance-test.sh \
+            https://raw.githubusercontent.com/sammorrowdrums/mcp-conformance-action/main/scripts/conformance-test.sh
+          chmod +x /tmp/mcp-conformance-test.sh
+
+      - name: Set environment variables
+        if: inputs.env_vars != ''
+        run: |
+          echo "${{ inputs.env_vars }}" >> $GITHUB_ENV
+
+      - name: Run conformance test
+        id: conformance
+        env:
+          MCP_INSTALL_COMMAND: ${{ inputs.install_command }}
+          MCP_BUILD_COMMAND: ${{ inputs.build_command }}
+          MCP_START_COMMAND: ${{ inputs.start_command }}
+          MCP_SERVER_TIMEOUT: ${{ inputs.server_timeout }}
+        run: |
+          /tmp/mcp-conformance-test.sh > conformance-summary.txt 2>&1 || true
+          
+          cat conformance-summary.txt
+          
+          if grep -q "RESULT: ALL TESTS PASSED" conformance-summary.txt; then
+            echo "status=passed" >> $GITHUB_OUTPUT
+          else
+            echo "status=differences" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Job Summary
+        run: |
+          echo "# MCP Server Conformance Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Comparing PR branch against merge-base with \`origin/main\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f conformance-report/CONFORMANCE_REPORT.md ]; then
+            tail -n +5 conformance-report/CONFORMANCE_REPORT.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Report file not found - check the workflow logs for errors" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.conformance.outputs.status }}" = "passed" ]; then
+            echo "✅ **All conformance tests passed** - No behavioral differences detected." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Differences detected** - Review the diffs above to ensure changes are intentional." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Common expected differences:" >> $GITHUB_STEP_SUMMARY
+            echo "- New tools added" >> $GITHUB_STEP_SUMMARY
+            echo "- Tool descriptions updated" >> $GITHUB_STEP_SUMMARY
+            echo "- New resources or prompts" >> $GITHUB_STEP_SUMMARY
+            echo "- Capability changes (intentional improvements)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload conformance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-report
+          path: conformance-report/
+          if-no-files-found: ignore
