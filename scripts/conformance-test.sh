@@ -26,6 +26,8 @@ INSTALL_CMD="${MCP_INSTALL_COMMAND:-}"
 BUILD_CMD="${MCP_BUILD_COMMAND:-}"
 START_CMD="${MCP_START_COMMAND:-}"
 SERVER_TIMEOUT="${MCP_SERVER_TIMEOUT:-10}"
+COMPARE_REF="${MCP_COMPARE_REF:-}"
+GH_REF="${GITHUB_REF:-}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -59,17 +61,40 @@ log "  Start:   $START_CMD"
 log "  Timeout: ${SERVER_TIMEOUT}s"
 log ""
 
-# Find the common ancestor with origin/main (or main if origin not available)
-if git rev-parse --verify origin/main >/dev/null 2>&1; then
-    BASE_REF="origin/main"
-elif git rev-parse --verify main >/dev/null 2>&1; then
-    BASE_REF="main"
+# Determine what to compare against
+# Priority: 1) Explicit compare_ref, 2) Auto-detect previous tag, 3) Merge-base with main
+if [ -n "$COMPARE_REF" ]; then
+    # Explicit reference provided
+    MERGE_BASE="$COMPARE_REF"
+    log "Using explicit compare ref: $MERGE_BASE"
+elif [[ "$GH_REF" == refs/tags/* ]]; then
+    # Tag push - try to find previous tag
+    CURRENT_TAG="${GH_REF#refs/tags/}"
+    log "Detected tag push: $CURRENT_TAG"
+    
+    # Get all tags sorted by version, find previous one
+    PREVIOUS_TAG=$(git tag --sort=-v:refname | grep -A1 "^${CURRENT_TAG}$" | tail -1)
+    
+    if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$CURRENT_TAG" ]; then
+        MERGE_BASE="$PREVIOUS_TAG"
+        log "Auto-detected previous tag: $MERGE_BASE"
+    else
+        # No previous tag found, fall back to first commit
+        MERGE_BASE=$(git rev-list --max-parents=0 HEAD | head -1)
+        log "${YELLOW}No previous tag found, comparing against initial commit${NC}"
+    fi
 else
-    BASE_REF=$(git rev-list --max-parents=0 HEAD | head -1)
+    # Default: find merge-base with main
+    if git rev-parse --verify origin/main >/dev/null 2>&1; then
+        BASE_REF="origin/main"
+    elif git rev-parse --verify main >/dev/null 2>&1; then
+        BASE_REF="main"
+    else
+        BASE_REF=$(git rev-list --max-parents=0 HEAD | head -1)
+    fi
+    MERGE_BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || echo "$BASE_REF")
+    log "Using merge-base with $BASE_REF: $MERGE_BASE"
 fi
-
-MERGE_BASE=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || echo "$BASE_REF")
-log "Comparing against merge-base: $MERGE_BASE"
 log ""
 
 # Create report directory

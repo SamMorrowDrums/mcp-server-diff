@@ -120,6 +120,7 @@ jobs:
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
+| `compare_ref` | Git ref to compare against (auto-detects merge-base or previous tag if not set) | No | `""` |
 | `install_command` | Command to install dependencies | Yes | - |
 | `build_command` | Command to build the server (optional for interpreted languages) | No | `""` |
 | `start_command` | Command to start the MCP server (stdio transport) | Yes | - |
@@ -176,6 +177,35 @@ This ensures you catch changes:
 - Before merging (PR reviews)
 - After merging (validation)  
 - On releases (version comparison)
+
+## Comparing Tags / Releases
+
+When triggered by a tag push, the action **automatically detects the previous tag** and compares against it. This is perfect for release validation:
+
+```yaml
+# Automatically compares v1.1.0 against v1.0.0
+on:
+  push:
+    tags: ['v*']
+```
+
+You can also explicitly specify what to compare against using `compare_ref`:
+
+```yaml
+jobs:
+  conformance:
+    uses: sammorrowdrums/mcp-conformance-action/.github/workflows/conformance.yml@main
+    with:
+      compare_ref: 'v1.0.0'  # Compare against specific version
+      install_command: "npm install"
+      build_command: "npm run build"
+      start_command: "node dist/stdio.js"
+```
+
+The `compare_ref` input accepts any valid git ref:
+- Tags: `v1.0.0`, `release-2024-01`
+- Branches: `main`, `develop`
+- Commit SHAs: `abc123`
 
 ## License
 

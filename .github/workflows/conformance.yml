@@ -3,6 +3,11 @@ name: MCP Conformance Test
 on:
   workflow_call:
     inputs:
+      compare_ref:
+        description: 'Git ref to compare against (default: auto-detect merge-base or previous tag)'
+        required: false
+        type: string
+        default: ''
       install_command:
         description: 'Command to install dependencies'
         required: true
@@ -146,6 +151,8 @@ jobs:
           MCP_BUILD_COMMAND: ${{ inputs.build_command }}
           MCP_START_COMMAND: ${{ inputs.start_command }}
           MCP_SERVER_TIMEOUT: ${{ inputs.server_timeout }}
+          MCP_COMPARE_REF: ${{ inputs.compare_ref }}
+          GITHUB_REF: ${{ github.ref }}
         run: |
           /tmp/mcp-conformance-test.sh > conformance-summary.txt 2>&1 || true
           
@@ -161,7 +168,13 @@ jobs:
         run: |
           echo "# MCP Server Conformance Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Comparing PR branch against merge-base with \`origin/main\`" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ inputs.compare_ref }}" ]; then
+            echo "Comparing against: \`${{ inputs.compare_ref }}\`" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "Comparing tag against previous tag (auto-detected)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Comparing against merge-base with \`origin/main\`" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ -f conformance-report/CONFORMANCE_REPORT.md ]; then
