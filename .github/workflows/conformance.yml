@@ -19,8 +19,29 @@ on:
         default: ''
       start_command:
         description: 'Command to start the MCP server (stdio transport)'
-        required: true
+        required: false
         type: string
+        default: ''
+      transport:
+        description: 'Transport type: stdio or http'
+        required: false
+        type: string
+        default: 'stdio'
+      server_url:
+        description: 'Server URL for HTTP transport (e.g., http://localhost:3000/mcp)'
+        required: false
+        type: string
+        default: ''
+      health_endpoint:
+        description: 'Health check endpoint for HTTP servers (e.g., /health)'
+        required: false
+        type: string
+        default: '/health'
+      configurations:
+        description: 'JSON array of test configurations (for multiple configs). Each object can have: name, start_command, server_url, transport, env_vars'
+        required: false
+        type: string
+        default: ''
       env_vars:
         description: 'Environment variables (newline-separated KEY=VALUE pairs)'
         required: false
@@ -152,6 +173,10 @@ jobs:
           MCP_START_COMMAND: ${{ inputs.start_command }}
           MCP_SERVER_TIMEOUT: ${{ inputs.server_timeout }}
           MCP_COMPARE_REF: ${{ inputs.compare_ref }}
+          MCP_TRANSPORT: ${{ inputs.transport }}
+          MCP_SERVER_URL: ${{ inputs.server_url }}
+          MCP_HEALTH_ENDPOINT: ${{ inputs.health_endpoint }}
+          MCP_CONFIGURATIONS: ${{ inputs.configurations }}
           GITHUB_REF: ${{ github.ref }}
         run: |
           /tmp/mcp-conformance-test.sh > conformance-summary.txt 2>&1 || true

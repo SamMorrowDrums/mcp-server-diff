@@ -28,6 +28,10 @@ START_CMD="${MCP_START_COMMAND:-}"
 SERVER_TIMEOUT="${MCP_SERVER_TIMEOUT:-10}"
 COMPARE_REF="${MCP_COMPARE_REF:-}"
 GH_REF="${GITHUB_REF:-}"
+TRANSPORT="${MCP_TRANSPORT:-stdio}"
+SERVER_URL="${MCP_SERVER_URL:-}"
+HEALTH_ENDPOINT="${MCP_HEALTH_ENDPOINT:-/health}"
+CONFIGURATIONS="${MCP_CONFIGURATIONS:-}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -47,18 +51,46 @@ log "Report directory: $REPORT_DIR"
 log ""
 
 # Validate required environment variables
-if [ -z "$INSTALL_CMD" ] || [ -z "$START_CMD" ]; then
-    log "${RED}Error: Required environment variables not set${NC}"
-    log "  MCP_INSTALL_COMMAND: ${INSTALL_CMD:-<not set>}"
-    log "  MCP_START_COMMAND: ${START_CMD:-<not set>}"
+if [ -z "$INSTALL_CMD" ]; then
+    log "${RED}Error: MCP_INSTALL_COMMAND not set${NC}"
     exit 1
+fi
+
+# Build configurations array
+declare -a CONFIGS
+if [ -n "$CONFIGURATIONS" ]; then
+    # Parse JSON configurations
+    config_count=$(echo "$CONFIGURATIONS" | jq -r 'length')
+    for ((i=0; i<config_count; i++)); do
+        CONFIGS+=("$(echo "$CONFIGURATIONS" | jq -c ".[$i]")")
+    done
+    log "Loaded $config_count configuration(s) from JSON"
+else
+    # Single default configuration from env vars
+    if [ -z "$START_CMD" ] && [ -z "$SERVER_URL" ]; then
+        log "${RED}Error: Either start_command (stdio) or server_url (http) is required${NC}"
+        exit 1
+    fi
+    default_config=$(jq -n \
+        --arg name "default" \
+        --arg start_command "$START_CMD" \
+        --arg transport "$TRANSPORT" \
+        --arg server_url "$SERVER_URL" \
+        --arg health_endpoint "$HEALTH_ENDPOINT" \
+        '{name: $name, start_command: $start_command, transport: $transport, server_url: $server_url, health_endpoint: $health_endpoint}')
+    CONFIGS+=("$default_config")
 fi
 
 log "Configuration:"
 log "  Install: $INSTALL_CMD"
 log "  Build:   ${BUILD_CMD:-<skipped>}"
-log "  Start:   $START_CMD"
 log "  Timeout: ${SERVER_TIMEOUT}s"
+log "  Test Configurations: ${#CONFIGS[@]}"
+for config in "${CONFIGS[@]}"; do
+    cfg_name=$(echo "$config" | jq -r '.name')
+    cfg_transport=$(echo "$config" | jq -r '.transport // "stdio"')
+    log "    - $cfg_name ($cfg_transport)"
+done
 log ""
 
 # Determine what to compare against
@@ -129,14 +161,130 @@ normalize_json() {
     fi
 }
 
-# Function to run MCP server and capture output
-run_mcp_test() {
+# Function to wait for HTTP server to be ready
+wait_for_server() {
+    local url="$1"
+    local health="$2"
+    local timeout="$3"
+    local start_time=$(date +%s)
+    
+    while true; do
+        if curl -sf "${url}${health}" >/dev/null 2>&1; then
+            return 0
+        fi
+        
+        local elapsed=$(($(date +%s) - start_time))
+        if [ $elapsed -ge $timeout ]; then
+            return 1
+        fi
+        sleep 0.5
+    done
+}
+
+# Function to send MCP request via HTTP POST
+send_http_request() {
+    local url="$1"
+    local message="$2"
+    local timeout="$3"
+    
+    curl -sf -X POST "$url" \
+        -H "Content-Type: application/json" \
+        -d "$message" \
+        --max-time "$timeout" 2>/dev/null || echo "{}"
+}
+
+# Function to run MCP server test via HTTP
+run_mcp_test_http() {
     local working_dir="$1"
     local name="$2"
     local output_prefix="$3"
+    local cfg_start_cmd="$4"
+    local cfg_server_url="$5"
+    local cfg_health="$6"
+    local cfg_env="$7"
+    
+    local start_time end_time duration
+    local server_pid=""
+    
+    start_time=$(date +%s.%N 2>/dev/null || date +%s)
+    
+    # Start server if start_command provided (otherwise assume external server)
+    if [ -n "$cfg_start_cmd" ]; then
+        log "    Starting HTTP server..."
+        (
+            cd "$working_dir"
+            if [ -n "$cfg_env" ]; then
+                export $cfg_env
+            fi
+            eval "$cfg_start_cmd" &
+        ) &
+        server_pid=$!
+        
+        # Wait for server to be ready
+        if ! wait_for_server "$cfg_server_url" "$cfg_health" "$SERVER_TIMEOUT"; then
+            log "    ${RED}Server failed to start${NC}"
+            [ -n "$server_pid" ] && kill $server_pid 2>/dev/null
+            return 1
+        fi
+        log "    ${GREEN}Server ready${NC}"
+    fi
+    
+    # Initialize
+    init_response=$(send_http_request "$cfg_server_url" "$INIT_MSG" "$SERVER_TIMEOUT")
+    echo "$init_response" | jq -S '.' > "${output_prefix}_initialize.json" 2>/dev/null
+    
+    # Send initialized notification (no response expected)
+    send_http_request "$cfg_server_url" "$INITIALIZED_MSG" "$SERVER_TIMEOUT" >/dev/null 2>&1
+    
+    # List tools
+    tools_response=$(send_http_request "$cfg_server_url" "$LIST_TOOLS_MSG" "$SERVER_TIMEOUT")
+    echo "$tools_response" | jq -S '.' > "${output_prefix}_tools.json" 2>/dev/null
+    
+    # List resources
+    resources_response=$(send_http_request "$cfg_server_url" "$LIST_RESOURCES_MSG" "$SERVER_TIMEOUT")
+    echo "$resources_response" | jq -S '.' > "${output_prefix}_resources.json" 2>/dev/null
+    
+    # List prompts
+    prompts_response=$(send_http_request "$cfg_server_url" "$LIST_PROMPTS_MSG" "$SERVER_TIMEOUT")
+    echo "$prompts_response" | jq -S '.' > "${output_prefix}_prompts.json" 2>/dev/null
+    
+    # List resource templates
+    templates_response=$(send_http_request "$cfg_server_url" "$LIST_RESOURCE_TEMPLATES_MSG" "$SERVER_TIMEOUT")
+    echo "$templates_response" | jq -S '.' > "${output_prefix}_resource_templates.json" 2>/dev/null
+    
+    # Stop server if we started it
+    if [ -n "$server_pid" ]; then
+        kill $server_pid 2>/dev/null || true
+        wait $server_pid 2>/dev/null || true
+    fi
+    
+    end_time=$(date +%s.%N 2>/dev/null || date +%s)
+    duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "0")
+    
+    # Normalize all JSON files
+    for endpoint in initialize tools resources prompts resource_templates; do
+        normalize_json "${output_prefix}_${endpoint}.json"
+    done
+    
+    echo "$duration"
+}
+
+# Function to run MCP server test via stdio
+run_mcp_test_stdio() {
+    local working_dir="$1"
+    local name="$2"
+    local output_prefix="$3"
+    local cfg_start_cmd="$4"
+    local cfg_env="$5"
     
     local start_time end_time duration
     start_time=$(date +%s.%N 2>/dev/null || date +%s)
+    
+    # Build the command with optional env vars
+    local cmd="$cfg_start_cmd"
+    if [ -n "$cfg_env" ]; then
+        cmd="export $cfg_env && $cfg_start_cmd"
+    fi
     
     # Run the server with all list commands
     output=$(
@@ -152,7 +300,7 @@ run_mcp_test() {
             sleep 0.1
             echo "$LIST_RESOURCE_TEMPLATES_MSG"
             sleep 0.5
-        ) | timeout "${SERVER_TIMEOUT}s" bash -c "cd '$working_dir' && $START_CMD" 2>/dev/null || true
+        ) | timeout "${SERVER_TIMEOUT}s" bash -c "cd '$working_dir' && $cmd" 2>/dev/null || true
     )
     
     end_time=$(date +%s.%N 2>/dev/null || date +%s)
@@ -184,9 +332,34 @@ run_mcp_test() {
     echo "$duration"
 }
 
+# Function to run MCP test with config
+run_mcp_test() {
+    local working_dir="$1"
+    local name="$2"
+    local output_prefix="$3"
+    local config="$4"
+    
+    local cfg_transport=$(echo "$config" | jq -r '.transport // "stdio"')
+    local cfg_start_cmd=$(echo "$config" | jq -r '.start_command // empty')
+    local cfg_server_url=$(echo "$config" | jq -r '.server_url // empty')
+    local cfg_health=$(echo "$config" | jq -r '.health_endpoint // "/health"')
+    local cfg_env=$(echo "$config" | jq -r '.env_vars // empty')
+    
+    if [ "$cfg_transport" = "http" ]; then
+        run_mcp_test_http "$working_dir" "$name" "$output_prefix" "$cfg_start_cmd" "$cfg_server_url" "$cfg_health" "$cfg_env"
+    else
+        run_mcp_test_stdio "$working_dir" "$name" "$output_prefix" "$cfg_start_cmd" "$cfg_env"
+    fi
+}
+
 # Build and test both versions
 log "${YELLOW}Building and testing both versions...${NC}"
 log ""
+
+# Arrays to track timing and results per config
+declare -A branch_times
+declare -A main_times
+declare -A config_diffs
 
 # --- BUILD AND TEST CURRENT BRANCH ---
 log "${BLUE}Building current branch ($CURRENT_BRANCH)...${NC}"
@@ -209,14 +382,20 @@ else
     log "  ${YELLOW}Build step skipped (no build command)${NC}"
 fi
 
-mkdir -p "$REPORT_DIR/branch/default"
-log "  Running conformance test..."
-branch_time=$(run_mcp_test "$PROJECT_DIR" "branch" "$REPORT_DIR/branch/default/output")
-log "${GREEN}  Test complete (${branch_time}s)${NC}"
+# Run tests for each configuration
+for config in "${CONFIGS[@]}"; do
+    cfg_name=$(echo "$config" | jq -r '.name')
+    cfg_transport=$(echo "$config" | jq -r '.transport // "stdio"')
+    
+    mkdir -p "$REPORT_DIR/branch/$cfg_name"
+    log "  Running conformance test: $cfg_name ($cfg_transport)..."
+    branch_times[$cfg_name]=$(run_mcp_test "$PROJECT_DIR" "branch" "$REPORT_DIR/branch/$cfg_name/output" "$config")
+    log "${GREEN}    Test complete (${branch_times[$cfg_name]}s)${NC}"
+done
 log ""
 
 # --- BUILD AND TEST BASE BRANCH ---
-log "${BLUE}Building base branch (merge-base: $MERGE_BASE)...${NC}"
+log "${BLUE}Building base branch (compare ref: $MERGE_BASE)...${NC}"
 
 TEMP_WORKTREE=$(mktemp -d)
 git worktree add --quiet "$TEMP_WORKTREE" "$MERGE_BASE" 2>/dev/null || {
@@ -241,10 +420,16 @@ else
     log "  ${YELLOW}Build step skipped (no build command)${NC}"
 fi
 
-mkdir -p "$REPORT_DIR/main/default"
-log "  Running conformance test..."
-main_time=$(run_mcp_test "$WORK_DIR" "main" "$REPORT_DIR/main/default/output")
-log "${GREEN}  Test complete (${main_time}s)${NC}"
+# Run tests for each configuration
+for config in "${CONFIGS[@]}"; do
+    cfg_name=$(echo "$config" | jq -r '.name')
+    cfg_transport=$(echo "$config" | jq -r '.transport // "stdio"')
+    
+    mkdir -p "$REPORT_DIR/main/$cfg_name"
+    log "  Running conformance test: $cfg_name ($cfg_transport)..."
+    main_times[$cfg_name]=$(run_mcp_test "$WORK_DIR" "main" "$REPORT_DIR/main/$cfg_name/output" "$config")
+    log "${GREEN}    Test complete (${main_times[$cfg_name]}s)${NC}"
+done
 
 # Cleanup worktree
 if [ -n "$TEMP_WORKTREE" ]; then
@@ -257,22 +442,36 @@ log ""
 # --- GENERATE DIFFS ---
 log "${YELLOW}Generating comparison report...${NC}"
 
-mkdir -p "$REPORT_DIR/diffs/default"
-has_diff=false
+total_diff_count=0
+total_ok_count=0
 endpoints="initialize tools resources prompts resource_templates"
 
-for endpoint in $endpoints; do
-    main_file="$REPORT_DIR/main/default/output_${endpoint}.json"
-    branch_file="$REPORT_DIR/branch/default/output_${endpoint}.json"
-    diff_file="$REPORT_DIR/diffs/default/${endpoint}.diff"
+for config in "${CONFIGS[@]}"; do
+    cfg_name=$(echo "$config" | jq -r '.name')
     
-    if ! diff -u "$main_file" "$branch_file" > "$diff_file" 2>/dev/null; then
-        has_diff=true
-        lines=$(wc -l < "$diff_file" | tr -d ' ')
-        log "  ${YELLOW}${endpoint}: DIFF (${lines} lines)${NC}"
+    mkdir -p "$REPORT_DIR/diffs/$cfg_name"
+    config_diffs[$cfg_name]=false
+    
+    log "  Configuration: $cfg_name"
+    for endpoint in $endpoints; do
+        main_file="$REPORT_DIR/main/$cfg_name/output_${endpoint}.json"
+        branch_file="$REPORT_DIR/branch/$cfg_name/output_${endpoint}.json"
+        diff_file="$REPORT_DIR/diffs/$cfg_name/${endpoint}.diff"
+        
+        if ! diff -u "$main_file" "$branch_file" > "$diff_file" 2>/dev/null; then
+            config_diffs[$cfg_name]=true
+            lines=$(wc -l < "$diff_file" | tr -d ' ')
+            log "    ${YELLOW}${endpoint}: DIFF (${lines} lines)${NC}"
+        else
+            rm -f "$diff_file"
+            log "    ${GREEN}${endpoint}: OK${NC}"
+        fi
+    done
+    
+    if [ "${config_diffs[$cfg_name]}" = true ]; then
+        ((total_diff_count++))
     else
-        rm -f "$diff_file"
-        log "  ${GREEN}${endpoint}: OK${NC}"
+        ((total_ok_count++))
     fi
 done
 log ""
@@ -280,60 +479,89 @@ log ""
 # --- GENERATE REPORT ---
 REPORT_FILE="$REPORT_DIR/CONFORMANCE_REPORT.md"
 
-time_diff=$(echo "$branch_time - $main_time" | bc 2>/dev/null || echo "0")
-if (( $(echo "$time_diff > 0" | bc -l 2>/dev/null || echo "0") )); then
-    delta_str="+${time_diff}s"
-else
-    delta_str="${time_diff}s"
-fi
-
-if [ "$has_diff" = true ]; then
-    status_str="⚠️ DIFF"
-    diff_count=1
-    ok_count=0
-else
-    status_str="✅ OK"
-    diff_count=0
-    ok_count=1
-fi
+# Calculate totals
+total_branch_time=0
+total_main_time=0
 
 cat > "$REPORT_FILE" << EOF
 # MCP Server Conformance Report
 
 Generated: $(date)
 Current Branch: $CURRENT_BRANCH
-Compared Against: merge-base ($MERGE_BASE)
+Compared Against: $MERGE_BASE
 
 ## Summary
 
-| Test | Base Time | Branch Time | Δ Time | Status |
-|------|-----------|-------------|--------|--------|
-| default | ${main_time}s | ${branch_time}s | $delta_str | $status_str |
+| Configuration | Transport | Base Time | Branch Time | Δ Time | Status |
+|---------------|-----------|-----------|-------------|--------|--------|
+EOF
+
+for config in "${CONFIGS[@]}"; do
+    cfg_name=$(echo "$config" | jq -r '.name')
+    cfg_transport=$(echo "$config" | jq -r '.transport // "stdio"')
+    
+    bt="${branch_times[$cfg_name]}"
+    mt="${main_times[$cfg_name]}"
+    
+    time_diff=$(echo "$bt - $mt" | bc 2>/dev/null || echo "0")
+    if (( $(echo "$time_diff > 0" | bc -l 2>/dev/null || echo "0") )); then
+        delta_str="+${time_diff}s"
+    else
+        delta_str="${time_diff}s"
+    fi
+    
+    if [ "${config_diffs[$cfg_name]}" = true ]; then
+        status_str="⚠️ DIFF"
+    else
+        status_str="✅ OK"
+    fi
+    
+    echo "| $cfg_name | $cfg_transport | ${mt}s | ${bt}s | $delta_str | $status_str |" >> "$REPORT_FILE"
+    
+    total_branch_time=$(echo "$total_branch_time + $bt" | bc 2>/dev/null || echo "0")
+    total_main_time=$(echo "$total_main_time + $mt" | bc 2>/dev/null || echo "0")
+done
+
+total_time_diff=$(echo "$total_branch_time - $total_main_time" | bc 2>/dev/null || echo "0")
+if (( $(echo "$total_time_diff > 0" | bc -l 2>/dev/null || echo "0") )); then
+    total_delta_str="+${total_time_diff}s"
+else
+    total_delta_str="${total_time_diff}s"
+fi
+
+cat >> "$REPORT_FILE" << EOF
 
 ## Statistics
 
-- **Tests Passed (no diff):** $ok_count
-- **Tests with Differences:** $diff_count
-- **Total Base Time:** ${main_time}s
-- **Total Branch Time:** ${branch_time}s
-- **Overall Time Delta:** $delta_str
+- **Configurations Tested:** ${#CONFIGS[@]}
+- **Tests Passed (no diff):** $total_ok_count
+- **Tests with Differences:** $total_diff_count
+- **Total Base Time:** ${total_main_time}s
+- **Total Branch Time:** ${total_branch_time}s
+- **Overall Time Delta:** $total_delta_str
 
 ## Detailed Diffs
 
 EOF
 
-if [ "$has_diff" = true ]; then
-    echo "### default" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-    
-    for endpoint in $endpoints; do
-        diff_file="$REPORT_DIR/diffs/default/${endpoint}.diff"
-        if [ -f "$diff_file" ] && [ -s "$diff_file" ]; then
-            echo "#### ${endpoint}" >> "$REPORT_FILE"
-            echo '```diff' >> "$REPORT_FILE"
-            cat "$diff_file" >> "$REPORT_FILE"
-            echo '```' >> "$REPORT_FILE"
+if [ $total_diff_count -gt 0 ]; then
+    for config in "${CONFIGS[@]}"; do
+        cfg_name=$(echo "$config" | jq -r '.name')
+        
+        if [ "${config_diffs[$cfg_name]}" = true ]; then
+            echo "### $cfg_name" >> "$REPORT_FILE"
             echo "" >> "$REPORT_FILE"
+            
+            for endpoint in $endpoints; do
+                diff_file="$REPORT_DIR/diffs/$cfg_name/${endpoint}.diff"
+                if [ -f "$diff_file" ] && [ -s "$diff_file" ]; then
+                    echo "#### ${endpoint}" >> "$REPORT_FILE"
+                    echo '```diff' >> "$REPORT_FILE"
+                    cat "$diff_file" >> "$REPORT_FILE"
+                    echo '```' >> "$REPORT_FILE"
+                    echo "" >> "$REPORT_FILE"
+                fi
+            done
         fi
     done
 else
@@ -347,13 +575,14 @@ log ""
 
 # Output summary to stdout
 echo "=== Conformance Test Summary ==="
-echo "Tests passed: $ok_count"
-echo "Tests with diffs: $diff_count"
-echo "Total base time: ${main_time}s"
-echo "Total branch time: ${branch_time}s"
-echo "Time delta: $delta_str"
+echo "Configurations tested: ${#CONFIGS[@]}"
+echo "Tests passed: $total_ok_count"
+echo "Tests with diffs: $total_diff_count"
+echo "Total base time: ${total_main_time}s"
+echo "Total branch time: ${total_branch_time}s"
+echo "Time delta: $total_delta_str"
 
-if [ $diff_count -gt 0 ]; then
+if [ $total_diff_count -gt 0 ]; then
     log ""
     log "${YELLOW}⚠️  Differences detected. Review the diffs in:${NC}"
     log "   $REPORT_DIR/diffs/"

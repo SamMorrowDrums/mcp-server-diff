@@ -123,7 +123,11 @@ jobs:
 | `compare_ref` | Git ref to compare against (auto-detects merge-base or previous tag if not set) | No | `""` |
 | `install_command` | Command to install dependencies | Yes | - |
 | `build_command` | Command to build the server (optional for interpreted languages) | No | `""` |
-| `start_command` | Command to start the MCP server (stdio transport) | Yes | - |
+| `start_command` | Command to start the MCP server (stdio transport) | No* | `""` |
+| `transport` | Transport type: `stdio` or `http` | No | `stdio` |
+| `server_url` | Server URL for HTTP transport (e.g., `http://localhost:3000/mcp`) | No* | `""` |
+| `health_endpoint` | Health check endpoint for HTTP servers | No | `/health` |
+| `configurations` | JSON array of test configurations (for multiple configs) | No | `""` |
 | `env_vars` | Environment variables (newline-separated KEY=VALUE pairs) | No | `""` |
 | `working_directory` | Working directory for commands | No | `.` |
 | `setup_go` | Set up Go environment | No | `false` |
@@ -136,6 +140,8 @@ jobs:
 | `rust_toolchain` | Rust toolchain to use | No | `stable` |
 | `setup_dotnet` | Set up .NET environment | No | `false` |
 | `dotnet_version` | .NET version to use | No | `8.0.x` |
+
+*Either `start_command` (for stdio) or `server_url` (for http) is required.
 
 ## How It Works
 
@@ -206,6 +212,85 @@ The `compare_ref` input accepts any valid git ref:
 - Tags: `v1.0.0`, `release-2024-01`
 - Branches: `main`, `develop`
 - Commit SHAs: `abc123`
+
+## HTTP Transport
+
+For servers that expose an HTTP endpoint instead of stdio:
+
+```yaml
+jobs:
+  conformance:
+    uses: sammorrowdrums/mcp-conformance-action/.github/workflows/conformance.yml@main
+    with:
+      install_command: "npm install"
+      build_command: "npm run build"
+      start_command: "node dist/http-server.js"  # Starts HTTP server
+      transport: "http"
+      server_url: "http://localhost:3000/mcp"
+      health_endpoint: "/health"
+      setup_node: true
+```
+
+The action will:
+1. Start your server using `start_command`
+2. Wait for the health endpoint to respond
+3. Send MCP requests via HTTP POST
+4. Stop the server after tests complete
+
+For external/remote servers (already running), omit `start_command`:
+
+```yaml
+jobs:
+  conformance:
+    uses: sammorrowdrums/mcp-conformance-action/.github/workflows/conformance.yml@main
+    with:
+      install_command: "echo 'no install needed'"
+      transport: "http"
+      server_url: "https://my-mcp-server.example.com/mcp"
+```
+
+## Multiple Configurations
+
+Test your server with different configurations (e.g., stdio vs HTTP, different flags):
+
+```yaml
+jobs:
+  conformance:
+    uses: sammorrowdrums/mcp-conformance-action/.github/workflows/conformance.yml@main
+    with:
+      install_command: "npm install"
+      build_command: "npm run build"
+      setup_node: true
+      configurations: |
+        [
+          {
+            "name": "stdio",
+            "transport": "stdio",
+            "start_command": "node dist/stdio.js"
+          },
+          {
+            "name": "http",
+            "transport": "http",
+            "start_command": "node dist/http.js",
+            "server_url": "http://localhost:3000/mcp",
+            "health_endpoint": "/health"
+          },
+          {
+            "name": "stdio-debug",
+            "transport": "stdio",
+            "start_command": "node dist/stdio.js --debug",
+            "env_vars": "DEBUG=true"
+          }
+        ]
+```
+
+Each configuration in the array can have:
+- `name` (required): Identifier for this config
+- `transport`: `stdio` or `http` (default: `stdio`)
+- `start_command`: Command to start the server
+- `server_url`: URL for HTTP transport
+- `health_endpoint`: Health check path for HTTP (default: `/health`)
+- `env_vars`: Additional environment variables
 
 ## License
 
