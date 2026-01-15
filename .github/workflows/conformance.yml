@@ -8,9 +8,10 @@ on:
         required: true
         type: string
       build_command:
-        description: 'Command to build the MCP server'
-        required: true
+        description: 'Command to build the MCP server (optional for interpreted languages)'
+        required: false
         type: string
+        default: ''
       start_command:
         description: 'Command to start the MCP server (stdio transport)'
         required: true
@@ -117,7 +118,7 @@ jobs:
 
       - name: Set up Rust
         if: inputs.setup_rust
-        uses: dtolnay/rust-action@master
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ inputs.rust_toolchain }}
 

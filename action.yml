@@ -10,8 +10,9 @@ inputs:
     description: 'Command to install dependencies'
     required: true
   build_command:
-    description: 'Command to build the MCP server'
-    required: true
+    description: 'Command to build the MCP server (optional for interpreted languages)'
+    required: false
+    default: ''
   start_command:
     description: 'Command to start the MCP server (stdio transport)'
     required: true

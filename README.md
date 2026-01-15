@@ -45,6 +45,7 @@ jobs:
       install_command: "go mod download"
       build_command: "go build -o bin/server ./cmd/stdio"
       start_command: "./bin/server"
+      setup_go: true
 ```
 
 #### Python
@@ -54,8 +55,8 @@ jobs:
     uses: sammorrowdrums/mcp-conformance-action/.github/workflows/conformance.yml@main
     with:
       install_command: "pip install -e ."
-      build_command: "echo 'No build needed'"
       start_command: "python -m my_mcp_server"
+      setup_python: true
 ```
 
 #### TypeScript/Node.js
@@ -67,6 +68,7 @@ jobs:
       install_command: "npm install"
       build_command: "npm run build"
       start_command: "node dist/stdio.js"
+      setup_node: true
 ```
 
 #### Rust
@@ -78,6 +80,7 @@ jobs:
       install_command: "cargo fetch"
       build_command: "cargo build --release"
       start_command: "./target/release/my-mcp-server"
+      setup_rust: true
 ```
 
 #### C# / .NET
@@ -89,6 +92,28 @@ jobs:
       install_command: "dotnet restore"
       build_command: "dotnet build -c Release"
       start_command: "dotnet run --no-build -c Release"
+      setup_dotnet: true
+```
+
+#### Other Languages (Manual Setup)
+
+For languages not directly supported, you can set up the environment manually in your workflow before calling the conformance action:
+
+```yaml
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      # Your custom setup steps
+      - name: Set up my runtime
+        run: |
+          # Install your language/runtime here
+          
+      - name: Run conformance test
+        uses: sammorrowdrums/mcp-conformance-action@v1
+        with:
+          install_command: "my-install-command"
+          start_command: "my-start-command"
 ```
 
 ## Inputs
@@ -96,7 +121,7 @@ jobs:
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `install_command` | Command to install dependencies | Yes | - |
-| `build_command` | Command to build the server | Yes | - |
+| `build_command` | Command to build the server (optional for interpreted languages) | No | `""` |
 | `start_command` | Command to start the MCP server (stdio transport) | Yes | - |
 | `env_vars` | Environment variables (newline-separated KEY=VALUE pairs) | No | `""` |
 | `working_directory` | Working directory for commands | No | `.` |

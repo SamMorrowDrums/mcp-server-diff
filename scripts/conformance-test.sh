@@ -6,10 +6,10 @@ set -e
 #
 # Environment variables (required):
 #   MCP_INSTALL_COMMAND - Command to install dependencies
-#   MCP_BUILD_COMMAND   - Command to build the server
 #   MCP_START_COMMAND   - Command to start the MCP server (stdio transport)
 #
 # Environment variables (optional):
+#   MCP_BUILD_COMMAND   - Command to build the server (optional for interpreted languages)
 #   MCP_SERVER_TIMEOUT  - Timeout in seconds for server response (default: 10)
 #
 # Output:
@@ -45,17 +45,16 @@ log "Report directory: $REPORT_DIR"
 log ""
 
 # Validate required environment variables
-if [ -z "$INSTALL_CMD" ] || [ -z "$BUILD_CMD" ] || [ -z "$START_CMD" ]; then
+if [ -z "$INSTALL_CMD" ] || [ -z "$START_CMD" ]; then
     log "${RED}Error: Required environment variables not set${NC}"
     log "  MCP_INSTALL_COMMAND: ${INSTALL_CMD:-<not set>}"
-    log "  MCP_BUILD_COMMAND: ${BUILD_CMD:-<not set>}"
     log "  MCP_START_COMMAND: ${START_CMD:-<not set>}"
     exit 1
 fi
 
 log "Configuration:"
 log "  Install: $INSTALL_CMD"
-log "  Build:   $BUILD_CMD"
+log "  Build:   ${BUILD_CMD:-<skipped>}"
 log "  Start:   $START_CMD"
 log "  Timeout: ${SERVER_TIMEOUT}s"
 log ""
@@ -174,12 +173,16 @@ if ! eval "$INSTALL_CMD" >/dev/null 2>&1; then
 fi
 log "${GREEN}  Install successful${NC}"
 
-log "  Running build command..."
-if ! eval "$BUILD_CMD" >/dev/null 2>&1; then
-    log "${RED}  Build failed!${NC}"
-    exit 1
+if [ -n "$BUILD_CMD" ]; then
+    log "  Running build command..."
+    if ! eval "$BUILD_CMD" >/dev/null 2>&1; then
+        log "${RED}  Build failed!${NC}"
+        exit 1
+    fi
+    log "${GREEN}  Build successful${NC}"
+else
+    log "  ${YELLOW}Build step skipped (no build command)${NC}"
 fi
-log "${GREEN}  Build successful${NC}"
 
 mkdir -p "$REPORT_DIR/branch/default"
 log "  Running conformance test..."
@@ -204,9 +207,13 @@ if ! (cd "$WORK_DIR" && eval "$INSTALL_CMD") >/dev/null 2>&1; then
     log "${YELLOW}  Install warning (may be expected for older version)${NC}"
 fi
 
-log "  Running build command..."
-if ! (cd "$WORK_DIR" && eval "$BUILD_CMD") >/dev/null 2>&1; then
-    log "${YELLOW}  Build warning (may be expected for older version)${NC}"
+if [ -n "$BUILD_CMD" ]; then
+    log "  Running build command..."
+    if ! (cd "$WORK_DIR" && eval "$BUILD_CMD") >/dev/null 2>&1; then
+        log "${YELLOW}  Build warning (may be expected for older version)${NC}"
+    fi
+else
+    log "  ${YELLOW}Build step skipped (no build command)${NC}"
 fi
 
 mkdir -p "$REPORT_DIR/main/default"
