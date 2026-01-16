@@ -731,86 +731,23 @@ else
     echo "_No differences detected._" >> "$REPORT_FILE"
 fi
 
-# --- ADD FULL SCHEMA DETAILS SECTIONS ---
+# --- ADD ARTIFACT REFERENCE ---
 cat >> "$REPORT_FILE" << EOF
 
-## Full Schema Details
+## Full Data
 
-<details>
-<summary><strong>📋 Click to view full server schemas (before and after)</strong></summary>
+Full JSON responses and server logs are available in the uploaded **conformance-report** artifact:
 
-EOF
-
-for config in "${CONFIGS[@]}"; do
-    cfg_name=$(echo "$config" | jq -r '.name')
-    cfg_transport=$(echo "$config" | jq -r '.transport // "stdio"')
-    
-    cat >> "$REPORT_FILE" << EOF
-### $cfg_name ($cfg_transport)
+- \`main/<config>/output_*.json\` - Base version responses
+- \`branch/<config>/output_*.json\` - Branch version responses  
+- \`diffs/<config>/*.diff\` - Diff files for changed endpoints
+- \`*/output_stderr.log\` - Server stderr logs
 
 EOF
-    
-    # Build endpoint list for this config (base + custom message names)
-    cfg_endpoints="$base_endpoints"
-    cfg_custom_messages=$(echo "$config" | jq -r '.custom_messages // empty')
-    if [ -z "$cfg_custom_messages" ] && [ -n "$CUSTOM_MESSAGES" ]; then
-        cfg_custom_messages="$CUSTOM_MESSAGES"
-    fi
-    if [ -n "$cfg_custom_messages" ]; then
-        custom_names=$(echo "$cfg_custom_messages" | jq -r '.[].name' 2>/dev/null || true)
-        for cname in $custom_names; do
-            cfg_endpoints="$cfg_endpoints custom_$cname"
-        done
-    fi
-    
-    for endpoint in $cfg_endpoints; do
-        main_file="$REPORT_DIR/main/$cfg_name/output_${endpoint}.json"
-        branch_file="$REPORT_DIR/branch/$cfg_name/output_${endpoint}.json"
-        
-        echo "#### ${endpoint}" >> "$REPORT_FILE"
-        echo "" >> "$REPORT_FILE"
-        
-        # Base (before) schema
-        echo "<details>" >> "$REPORT_FILE"
-        echo "<summary>Base ($MERGE_BASE)</summary>" >> "$REPORT_FILE"
-        echo "" >> "$REPORT_FILE"
-        echo '```json' >> "$REPORT_FILE"
-        if [ -f "$main_file" ] && [ -s "$main_file" ]; then
-            cat "$main_file" >> "$REPORT_FILE"
-        else
-            echo "{}" >> "$REPORT_FILE"
-        fi
-        echo '```' >> "$REPORT_FILE"
-        echo "</details>" >> "$REPORT_FILE"
-        echo "" >> "$REPORT_FILE"
-        
-        # Branch (after) schema
-        echo "<details>" >> "$REPORT_FILE"
-        echo "<summary>Branch ($CURRENT_BRANCH)</summary>" >> "$REPORT_FILE"
-        echo "" >> "$REPORT_FILE"
-        echo '```json' >> "$REPORT_FILE"
-        if [ -f "$branch_file" ] && [ -s "$branch_file" ]; then
-            cat "$branch_file" >> "$REPORT_FILE"
-        else
-            echo "{}" >> "$REPORT_FILE"
-        fi
-        echo '```' >> "$REPORT_FILE"
-        echo "</details>" >> "$REPORT_FILE"
-        echo "" >> "$REPORT_FILE"
-    done
-done
 
-echo "</details>" >> "$REPORT_FILE"
+# --- ADD SERVER LOGS SUMMARY ---
+echo "### Server Logs Summary" >> "$REPORT_FILE"
 echo "" >> "$REPORT_FILE"
-
-# --- ADD SERVER LOGS SUMMARY (full logs in artifact) ---
-cat >> "$REPORT_FILE" << EOF
-
-## Server Logs (stderr)
-
-Server stderr logs are available in the uploaded artifact. Files are located at:
-
-EOF
 
 for config in "${CONFIGS[@]}"; do
     cfg_name=$(echo "$config" | jq -r '.name')
