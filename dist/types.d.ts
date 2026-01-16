@@ -42,6 +42,7 @@ export interface ActionInputs {
     configurations: TestConfiguration[];
     customMessages: CustomMessage[];
     compareRef: string;
+    failOnError: boolean;
     envVars: string;
     serverTimeout: number;
 }

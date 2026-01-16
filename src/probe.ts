@@ -180,15 +180,14 @@ export async function probeServer(options: ProbeOptions): Promise<ProbeResult> {
     core.info("  Probe complete");
 
     // Close the connection
-    await transport.close();
+    await client.close();
   } catch (error) {
     result.error = String(error);
     core.error(`  Error probing server: ${error}`);
 
-    // Try to close transport on error
+    // Try to close client on error
     try {
-      // @ts-expect-error transport may not be defined
-      if (transport) await transport.close();
+      await client.close();
     } catch {
       // Ignore close errors
     }

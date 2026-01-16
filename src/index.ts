@@ -75,6 +75,7 @@ function getInputs(): ActionInputs {
 
     // Test configuration
     compareRef: getInput("compare_ref"),
+    failOnError: getBooleanInput("fail_on_error") !== false, // default true
     envVars: getInput("env_vars"),
     serverTimeout: parseInt(getInput("server_timeout") || "30000", 10),
   };
@@ -247,9 +248,18 @@ async function run(): Promise<void> {
 
     // Set final status
     core.info("");
-    if (report.diffCount > 0) {
+
+    // Check for actual probe errors (separate from differences)
+    const hasErrors = results.some((r) => r.diffs.has("error"));
+
+    if (hasErrors && inputs.failOnError) {
+      const errorConfigs = results.filter((r) => r.diffs.has("error")).map((r) => r.configName);
+      core.setFailed(`❌ Probe errors occurred in: ${errorConfigs.join(", ")}`);
+    } else if (report.diffCount > 0) {
       core.warning(`⚠️ ${report.diffCount} configuration(s) have API differences`);
-      // Don't fail the action - let the user decide based on outputs
+      if (hasErrors) {
+        core.warning("Some configurations had probe errors (fail_on_error is disabled)");
+      }
     } else {
       core.info("✅ All conformance tests passed!");
     }

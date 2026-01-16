@@ -52,6 +52,7 @@ export interface ActionInputs {
 
   // Test configuration
   compareRef: string;
+  failOnError: boolean;
   envVars: string;
   serverTimeout: number;
 }

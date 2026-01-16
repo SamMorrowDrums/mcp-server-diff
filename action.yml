@@ -89,6 +89,10 @@ inputs:
     description: 'Git ref to compare against (auto-detects merge-base or previous tag if not set)'
     required: false
     default: ''
+  fail_on_error:
+    description: 'Fail the action if probe errors occur (not just API differences)'
+    required: false
+    default: 'true'
   env_vars:
     description: 'Environment variables (newline-separated KEY=VALUE pairs)'
     required: false
@@ -156,6 +160,7 @@ runs:
         INPUT_START_COMMAND: ${{ inputs.start_command }}
         INPUT_SERVER_TIMEOUT: ${{ inputs.server_timeout }}
         INPUT_COMPARE_REF: ${{ inputs.compare_ref }}
+        INPUT_FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
         INPUT_TRANSPORT: ${{ inputs.transport }}
         INPUT_SERVER_URL: ${{ inputs.server_url }}
         INPUT_CONFIGURATIONS: ${{ inputs.configurations }}
