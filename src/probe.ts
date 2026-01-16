@@ -197,8 +197,53 @@ export async function probeServer(options: ProbeOptions): Promise<ProbeResult> {
 }
 
 /**
+ * Get a sort key for an array element based on common MCP entity patterns.
+ * This ensures deterministic sorting for tools, prompts, resources, etc.
+ */
+function getSortKey(item: unknown): string {
+  if (item === null || item === undefined) {
+    return "";
+  }
+
+  if (typeof item !== "object") {
+    return String(item);
+  }
+
+  const obj = item as Record<string, unknown>;
+
+  // Primary sort keys for MCP entities (in priority order)
+  // Tools, prompts, arguments: use "name"
+  // Resources, resource templates: use "uri" or "uriTemplate"
+  // Content items: use "uri" or "type"
+  if (typeof obj.name === "string") {
+    return obj.name;
+  }
+  if (typeof obj.uri === "string") {
+    return obj.uri;
+  }
+  if (typeof obj.uriTemplate === "string") {
+    return obj.uriTemplate;
+  }
+  if (typeof obj.type === "string") {
+    return obj.type;
+  }
+  if (typeof obj.method === "string") {
+    return obj.method;
+  }
+
+  // Fallback to JSON string - but normalize first to ensure deterministic output
+  return JSON.stringify(normalizeProbeResult(item));
+}
+
+/**
  * Normalize a probe result for comparison by sorting keys and arrays recursively.
  * Also handles embedded JSON strings in "text" fields (from tool call responses).
+ *
+ * Sorting strategy:
+ * - Object keys: sorted alphabetically
+ * - Arrays of objects: sorted by primary key (name, uri, type) for deterministic output
+ * - Primitive arrays: sorted by string representation
+ * - Embedded JSON in "text" fields: parsed, normalized, and re-serialized
  */
 export function normalizeProbeResult(result: unknown): unknown {
   if (result === null || result === undefined) {
@@ -206,12 +251,14 @@ export function normalizeProbeResult(result: unknown): unknown {
   }
 
   if (Array.isArray(result)) {
-    // First normalize all elements, then sort by JSON string representation
+    // First normalize all elements
     const normalized = result.map(normalizeProbeResult);
+
+    // Then sort by sort key for deterministic output
     return normalized.sort((a, b) => {
-      const aStr = JSON.stringify(a);
-      const bStr = JSON.stringify(b);
-      return aStr.localeCompare(bStr);
+      const aKey = getSortKey(a);
+      const bKey = getSortKey(b);
+      return aKey.localeCompare(bKey);
     });
   }
 

@@ -21,6 +21,12 @@ export declare function probeServer(options: ProbeOptions): Promise<ProbeResult>
 /**
  * Normalize a probe result for comparison by sorting keys and arrays recursively.
  * Also handles embedded JSON strings in "text" fields (from tool call responses).
+ *
+ * Sorting strategy:
+ * - Object keys: sorted alphabetically
+ * - Arrays of objects: sorted by primary key (name, uri, type) for deterministic output
+ * - Primitive arrays: sorted by string representation
+ * - Embedded JSON in "text" fields: parsed, normalized, and re-serialized
  */
 export declare function normalizeProbeResult(result: unknown): unknown;
 /**

@@ -181,14 +181,107 @@ describe("normalizeProbeResult", () => {
     expect(nestedKeys).toEqual(["apple", "zebra"]);
   });
 
-  it("sorts arrays by JSON string representation", () => {
-    const input = [
-      { name: "zebra", value: 1 },
-      { name: "apple", value: 2 },
-    ];
-    const result = normalizeProbeResult(input) as Array<{ name: string }>;
-    expect(result[0].name).toBe("apple");
-    expect(result[1].name).toBe("zebra");
+  it("sorts arrays of objects by 'name' field (tools)", () => {
+    const input = {
+      tools: [
+        { name: "zebra_tool", description: "Z tool" },
+        { name: "apple_tool", description: "A tool" },
+        { name: "mango_tool", description: "M tool" },
+      ],
+    };
+    const result = normalizeProbeResult(input) as { tools: Array<{ name: string }> };
+    expect(result.tools[0].name).toBe("apple_tool");
+    expect(result.tools[1].name).toBe("mango_tool");
+    expect(result.tools[2].name).toBe("zebra_tool");
+  });
+
+  it("sorts arrays of objects by 'uri' field (resources)", () => {
+    const input = {
+      resources: [
+        { uri: "file:///z.txt", name: "Z" },
+        { uri: "file:///a.txt", name: "A" },
+        { uri: "file:///m.txt", name: "M" },
+      ],
+    };
+    const result = normalizeProbeResult(input) as { resources: Array<{ uri: string }> };
+    expect(result.resources[0].uri).toBe("file:///a.txt");
+    expect(result.resources[1].uri).toBe("file:///m.txt");
+    expect(result.resources[2].uri).toBe("file:///z.txt");
+  });
+
+  it("sorts arrays of objects by 'uriTemplate' field (resource templates)", () => {
+    const input = {
+      resourceTemplates: [
+        { uriTemplate: "file:///{z}", name: "Z Template" },
+        { uriTemplate: "file:///{a}", name: "A Template" },
+      ],
+    };
+    const result = normalizeProbeResult(input) as {
+      resourceTemplates: Array<{ uriTemplate: string }>;
+    };
+    expect(result.resourceTemplates[0].uriTemplate).toBe("file:///{a}");
+    expect(result.resourceTemplates[1].uriTemplate).toBe("file:///{z}");
+  });
+
+  it("sorts arrays of objects by 'type' field (content items)", () => {
+    const input = {
+      content: [
+        { type: "text", text: "Hello" },
+        { type: "image", data: "base64..." },
+        { type: "audio", data: "base64..." },
+      ],
+    };
+    const result = normalizeProbeResult(input) as { content: Array<{ type: string }> };
+    expect(result.content[0].type).toBe("audio");
+    expect(result.content[1].type).toBe("image");
+    expect(result.content[2].type).toBe("text");
+  });
+
+  it("sorts prompt arguments by name", () => {
+    const input = {
+      prompts: [
+        {
+          name: "test-prompt",
+          arguments: [
+            { name: "zebra_arg", required: true },
+            { name: "apple_arg", required: false },
+            { name: "mango_arg", required: true },
+          ],
+        },
+      ],
+    };
+    const result = normalizeProbeResult(input) as {
+      prompts: Array<{ arguments: Array<{ name: string }> }>;
+    };
+    const args = result.prompts[0].arguments;
+    expect(args[0].name).toBe("apple_arg");
+    expect(args[1].name).toBe("mango_arg");
+    expect(args[2].name).toBe("zebra_arg");
+  });
+
+  it("sorts tool inputSchema properties deterministically", () => {
+    const input = {
+      tools: [
+        {
+          name: "my_tool",
+          inputSchema: {
+            type: "object",
+            properties: {
+              zebra: { type: "string" },
+              apple: { type: "number" },
+            },
+            required: ["zebra", "apple"],
+          },
+        },
+      ],
+    };
+    const result = normalizeProbeResult(input) as {
+      tools: Array<{ inputSchema: { properties: Record<string, unknown>; required: string[] } }>;
+    };
+    const propKeys = Object.keys(result.tools[0].inputSchema.properties);
+    expect(propKeys).toEqual(["apple", "zebra"]);
+    // Required array should also be sorted
+    expect(result.tools[0].inputSchema.required).toEqual(["apple", "zebra"]);
   });
 
   it("handles embedded JSON in text fields", () => {
@@ -237,5 +330,104 @@ describe("normalizeProbeResult", () => {
     const result2 = JSON.stringify(normalizeProbeResult(input2));
 
     expect(result1).toBe(result2);
+  });
+
+  it("produces consistent JSON for complete MCP responses regardless of ordering", () => {
+    // Simulate two identical tool responses with different initial ordering
+    const response1 = {
+      tools: [
+        {
+          name: "get_user",
+          description: "Gets user info",
+          inputSchema: {
+            type: "object",
+            required: ["id", "name"],
+            properties: { name: { type: "string" }, id: { type: "number" } },
+          },
+        },
+        {
+          name: "add_numbers",
+          description: "Adds two numbers",
+          inputSchema: {
+            type: "object",
+            properties: { a: { type: "number" }, b: { type: "number" } },
+            required: ["a", "b"],
+          },
+        },
+      ],
+    };
+
+    const response2 = {
+      tools: [
+        {
+          description: "Adds two numbers",
+          name: "add_numbers",
+          inputSchema: {
+            required: ["a", "b"],
+            type: "object",
+            properties: { b: { type: "number" }, a: { type: "number" } },
+          },
+        },
+        {
+          inputSchema: {
+            properties: { id: { type: "number" }, name: { type: "string" } },
+            required: ["name", "id"],
+            type: "object",
+          },
+          description: "Gets user info",
+          name: "get_user",
+        },
+      ],
+    };
+
+    const normalized1 = JSON.stringify(normalizeProbeResult(response1), null, 2);
+    const normalized2 = JSON.stringify(normalizeProbeResult(response2), null, 2);
+
+    expect(normalized1).toBe(normalized2);
+
+    // Verify the order is deterministic (add_numbers before get_user)
+    const parsed = JSON.parse(normalized1) as { tools: Array<{ name: string }> };
+    expect(parsed.tools[0].name).toBe("add_numbers");
+    expect(parsed.tools[1].name).toBe("get_user");
+  });
+
+  it("is idempotent - normalizing twice produces same result", () => {
+    const input = {
+      tools: [
+        { name: "z_tool", description: "Last" },
+        { name: "a_tool", description: "First" },
+      ],
+      resources: [
+        { uri: "file:///z.txt" },
+        { uri: "file:///a.txt" },
+      ],
+    };
+
+    const once = normalizeProbeResult(input);
+    const twice = normalizeProbeResult(once);
+
+    expect(JSON.stringify(once)).toBe(JSON.stringify(twice));
+  });
+
+  it("handles arrays without identifiable sort keys", () => {
+    const input = {
+      data: [3, 1, 4, 1, 5, 9, 2, 6],
+    };
+    const result = normalizeProbeResult(input) as { data: number[] };
+    // Numbers sorted as strings
+    expect(result.data).toEqual([1, 1, 2, 3, 4, 5, 6, 9]);
+  });
+
+  it("handles mixed arrays with objects lacking standard keys", () => {
+    const input = {
+      items: [
+        { value: 3, label: "three" },
+        { value: 1, label: "one" },
+      ],
+    };
+    const result = normalizeProbeResult(input) as { items: Array<{ value: number }> };
+    // Falls back to JSON string comparison
+    expect(result.items[0].value).toBe(1);
+    expect(result.items[1].value).toBe(3);
   });
 });
