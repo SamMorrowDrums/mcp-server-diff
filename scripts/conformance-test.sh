@@ -252,7 +252,6 @@ run_mcp_test_http() {
     
     local start_time end_time duration
     local server_pid=""
-    local pid_file=$(mktemp)
     
     start_time=$(date +%s.%N 2>/dev/null || date +%s)
     
@@ -262,21 +261,18 @@ run_mcp_test_http() {
         log "    Command: $cfg_start_cmd"
         log "    URL: $cfg_server_url"
         
-        # Start server in background and capture its actual PID
-        # Use setsid to create new process group for clean termination
-        (
-            cd "$working_dir"
-            if [ -n "$cfg_env" ]; then
-                export $cfg_env
-            fi
-            # Write PID to file so parent can track it
-            echo $$ > "$pid_file"
-            exec $cfg_start_cmd
-        ) &
+        # Start server in background in its own process group
+        # Using setsid ensures killing the server doesn't affect parent script
+        cd "$working_dir"
+        if [ -n "$cfg_env" ]; then
+            export $cfg_env
+        fi
+        setsid $cfg_start_cmd > /dev/null 2>&1 &
+        server_pid=$!
+        cd "$PROJECT_DIR"
         
-        # Small delay to ensure PID file is written
+        # Small delay to let server initialize
         sleep 0.5
-        server_pid=$(cat "$pid_file" 2>/dev/null)
         log "    Server PID: ${server_pid:-unknown}"
         
         # Verify process is running
@@ -290,10 +286,9 @@ run_mcp_test_http() {
         if ! wait_for_server "$cfg_server_url" "$SERVER_TIMEOUT"; then
             log "    ${RED}Server failed to start${NC}"
             if [ -n "$server_pid" ]; then
-                kill -TERM $server_pid 2>/dev/null || true
-                kill -KILL $server_pid 2>/dev/null || true
+                kill -TERM -- -$server_pid 2>/dev/null || true
+                kill -KILL -- -$server_pid 2>/dev/null || true
             fi
-            rm -f "$pid_file"
             return 1
         fi
         log "    ${GREEN}Server ready${NC}"
@@ -322,19 +317,19 @@ run_mcp_test_http() {
     templates_response=$(send_http_request "$cfg_server_url" "$LIST_RESOURCE_TEMPLATES_MSG" "$SERVER_TIMEOUT")
     echo "$templates_response" | jq -S '.' > "${output_prefix}_resource_templates.json" 2>/dev/null
     
-    # Stop server if we started it - use SIGTERM first, then SIGKILL
+    # Stop server if we started it - kill process group with SIGTERM first, then SIGKILL
+    # Using negative PID kills the entire process group created by setsid
     if [ -n "$server_pid" ]; then
         log "    Stopping server (PID: $server_pid)..."
-        kill -TERM $server_pid 2>/dev/null || true
+        kill -TERM -- -$server_pid 2>/dev/null || true
         # Give it a moment to shut down gracefully
         sleep 0.5
         # Force kill if still running
         if kill -0 $server_pid 2>/dev/null; then
-            kill -KILL $server_pid 2>/dev/null || true
+            kill -KILL -- -$server_pid 2>/dev/null || true
         fi
-        wait $server_pid 2>/dev/null || true
+        # Don't wait - process is in different group, let it die async
     fi
-    rm -f "$pid_file"
     
     end_time=$(date +%s.%N 2>/dev/null || date +%s)
     duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "0")
