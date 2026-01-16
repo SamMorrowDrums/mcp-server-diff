@@ -803,54 +803,41 @@ done
 echo "</details>" >> "$REPORT_FILE"
 echo "" >> "$REPORT_FILE"
 
-# --- ADD SERVER LOGS SECTION ---
+# --- ADD SERVER LOGS SUMMARY (full logs in artifact) ---
 cat >> "$REPORT_FILE" << EOF
 
 ## Server Logs (stderr)
 
-<details>
-<summary><strong>📜 Click to view server stderr logs</strong></summary>
+Server stderr logs are available in the uploaded artifact. Files are located at:
 
 EOF
 
 for config in "${CONFIGS[@]}"; do
     cfg_name=$(echo "$config" | jq -r '.name')
     
-    echo "### $cfg_name" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
+    echo "- **$cfg_name**:" >> "$REPORT_FILE"
     
-    # Branch logs
+    # Branch logs summary
     branch_stderr="$REPORT_DIR/branch/$cfg_name/output_stderr.log"
-    echo "<details>" >> "$REPORT_FILE"
-    echo "<summary>Branch ($CURRENT_BRANCH)</summary>" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-    echo '```' >> "$REPORT_FILE"
     if [ -f "$branch_stderr" ] && [ -s "$branch_stderr" ]; then
-        cat "$branch_stderr" >> "$REPORT_FILE"
+        branch_lines=$(wc -l < "$branch_stderr" | tr -d ' ')
+        branch_size=$(du -h "$branch_stderr" | cut -f1)
+        echo "  - Branch: \`branch/$cfg_name/output_stderr.log\` ($branch_lines lines, $branch_size)" >> "$REPORT_FILE"
     else
-        echo "(no stderr output)" >> "$REPORT_FILE"
+        echo "  - Branch: (no stderr output)" >> "$REPORT_FILE"
     fi
-    echo '```' >> "$REPORT_FILE"
-    echo "</details>" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
     
-    # Base logs
+    # Base logs summary
     main_stderr="$REPORT_DIR/main/$cfg_name/output_stderr.log"
-    echo "<details>" >> "$REPORT_FILE"
-    echo "<summary>Base ($MERGE_BASE)</summary>" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-    echo '```' >> "$REPORT_FILE"
     if [ -f "$main_stderr" ] && [ -s "$main_stderr" ]; then
-        cat "$main_stderr" >> "$REPORT_FILE"
+        main_lines=$(wc -l < "$main_stderr" | tr -d ' ')
+        main_size=$(du -h "$main_stderr" | cut -f1)
+        echo "  - Base: \`main/$cfg_name/output_stderr.log\` ($main_lines lines, $main_size)" >> "$REPORT_FILE"
     else
-        echo "(no stderr output)" >> "$REPORT_FILE"
+        echo "  - Base: (no stderr output)" >> "$REPORT_FILE"
     fi
-    echo '```' >> "$REPORT_FILE"
-    echo "</details>" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
 done
 
-echo "</details>" >> "$REPORT_FILE"
 echo "" >> "$REPORT_FILE"
 
 log "${BLUE}=== Conformance Test Complete ===${NC}"
