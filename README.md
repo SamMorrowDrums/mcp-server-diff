@@ -1,5 +1,9 @@
 # MCP Conformance Action
 
+[![GitHub Marketplace](https://img.shields.io/badge/Marketplace-MCP%20Conformance%20Test-blue?logo=github)](https://github.com/marketplace/actions/mcp-conformance-test)
+[![GitHub release](https://img.shields.io/github/v/release/SamMorrowDrums/mcp-conformance-action)](https://github.com/SamMorrowDrums/mcp-conformance-action/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A reusable GitHub Actions workflow for testing [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server conformance between versions. This action detects behavioral changes in your MCP server by comparing the current branch against a base reference, helping you catch unintended regressions and document intentional API changes.
 
 ## Overview
