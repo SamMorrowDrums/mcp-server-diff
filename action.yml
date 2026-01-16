@@ -163,6 +163,7 @@ runs:
         MCP_SERVER_URL: ${{ inputs.server_url }}
         MCP_CONFIGURATIONS: ${{ inputs.configurations }}
         MCP_CUSTOM_MESSAGES: ${{ inputs.custom_messages }}
+        MCP_ENV_VARS: ${{ inputs.env_vars }}
         GITHUB_REF: ${{ github.ref }}
       run: |
         set +e

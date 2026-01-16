@@ -32,6 +32,7 @@ TRANSPORT="${MCP_TRANSPORT:-stdio}"
 SERVER_URL="${MCP_SERVER_URL:-}"
 CONFIGURATIONS="${MCP_CONFIGURATIONS:-}"
 CUSTOM_MESSAGES="${MCP_CUSTOM_MESSAGES:-}"
+ENV_VARS="${MCP_ENV_VARS:-}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -428,7 +429,7 @@ run_mcp_test_stdio() {
                 if [ -n "$cfg_custom_messages" ]; then
                     local msg_name=$(echo "$cfg_custom_messages" | jq -r ".[] | select(.message.id == $id) | .name" 2>/dev/null)
                     if [ -n "$msg_name" ]; then
-                        echo "$line" | jq -S '.' > "${output_prefix}_${msg_name}.json" 2>/dev/null
+                        echo "$line" | jq -S '.' > "${output_prefix}_custom_${msg_name}.json" 2>/dev/null
                     fi
                 fi
                 ;;
@@ -445,7 +446,7 @@ run_mcp_test_stdio() {
         local msg_count=$(echo "$cfg_custom_messages" | jq -r 'length')
         for ((m=0; m<msg_count; m++)); do
             local msg_name=$(echo "$cfg_custom_messages" | jq -r ".[$m].name")
-            touch "${output_prefix}_${msg_name}.json"
+            touch "${output_prefix}_custom_${msg_name}.json"
         done
     fi
     
@@ -459,7 +460,7 @@ run_mcp_test_stdio() {
         local msg_count=$(echo "$cfg_custom_messages" | jq -r 'length')
         for ((m=0; m<msg_count; m++)); do
             local msg_name=$(echo "$cfg_custom_messages" | jq -r ".[$m].name")
-            normalize_json "${output_prefix}_${msg_name}.json"
+            normalize_json "${output_prefix}_custom_${msg_name}.json"
         done
     fi
     
@@ -475,12 +476,28 @@ run_mcp_test() {
     
     local cfg_transport=$(echo "$config" | jq -r '.transport // "stdio"')
     local cfg_start_cmd=$(echo "$config" | jq -r '.start_command // empty')
+    local cfg_args=$(echo "$config" | jq -r '.args // empty')
     local cfg_server_url=$(echo "$config" | jq -r '.server_url // empty')
     local cfg_env=$(echo "$config" | jq -r '.env_vars // empty')
     # Get custom messages - either from config or global
     local cfg_custom_messages=$(echo "$config" | jq -c '.custom_messages // empty')
     if [ -z "$cfg_custom_messages" ] || [ "$cfg_custom_messages" = "null" ]; then
         cfg_custom_messages="$CUSTOM_MESSAGES"
+    fi
+    
+    # Fall back to global start command if not specified in config
+    if [ -z "$cfg_start_cmd" ]; then
+        cfg_start_cmd="$START_CMD"
+    fi
+    
+    # Append args to start command if provided
+    if [ -n "$cfg_args" ]; then
+        cfg_start_cmd="$cfg_start_cmd $cfg_args"
+    fi
+    
+    # Fall back to global env vars if not specified in config
+    if [ -z "$cfg_env" ]; then
+        cfg_env="$ENV_VARS"
     fi
     
     if [ "$cfg_transport" = "http" ]; then
