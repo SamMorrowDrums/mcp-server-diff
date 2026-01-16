@@ -232,15 +232,31 @@ wait_for_server() {
 }
 
 # Function to send MCP request via HTTP POST
+# Handles both plain JSON and SSE (Server-Sent Events) responses
+# For SSE, extracts JSON from the first "data:" line
 send_http_request() {
     local url="$1"
     local message="$2"
     local timeout="$3"
     
-    curl -sf -X POST "$url" \
+    # Use process substitution with stdbuf to get unbuffered output
+    # The grep -m1 will exit after finding first match, terminating curl
+    # This handles SSE streams that keep connection open
+    local result
+    result=$(curl -sN -X POST "$url" \
         -H "Content-Type: application/json" \
         -d "$message" \
-        --max-time "$timeout" 2>/dev/null || echo "{}"
+        --max-time "$timeout" 2>/dev/null | \
+        stdbuf -oL grep -m1 -E '^data:|^\{' | \
+        sed 's/^data: *//' | \
+        head -n1)
+    
+    # Return result or empty object
+    if [ -n "$result" ]; then
+        echo "$result"
+    else
+        echo "{}"
+    fi
 }
 
 # Function to run MCP server test via HTTP
