@@ -269,7 +269,7 @@ run_mcp_test_http() {
         if [ -n "$cfg_env" ]; then
             export $cfg_env
         fi
-        setsid $cfg_start_cmd > /dev/null 2>&1 &
+        setsid $cfg_start_cmd > /dev/null 2>"${output_prefix}_stderr.log" &
         server_pid=$!
         cd "$PROJECT_DIR"
         
@@ -387,7 +387,7 @@ run_mcp_test_stdio() {
                 done
             fi
             sleep 0.5
-        ) | timeout "${SERVER_TIMEOUT}s" bash -c "cd '$working_dir' && $cmd" 2>/dev/null || true
+        ) | timeout "${SERVER_TIMEOUT}s" bash -c "cd '$working_dir' && $cmd" 2>"${output_prefix}_stderr.log" || true
     )
     
     end_time=$(date +%s.%N 2>/dev/null || date +%s)
@@ -798,6 +798,56 @@ EOF
         echo "</details>" >> "$REPORT_FILE"
         echo "" >> "$REPORT_FILE"
     done
+done
+
+echo "</details>" >> "$REPORT_FILE"
+echo "" >> "$REPORT_FILE"
+
+# --- ADD SERVER LOGS SECTION ---
+cat >> "$REPORT_FILE" << EOF
+
+## Server Logs (stderr)
+
+<details>
+<summary><strong>📜 Click to view server stderr logs</strong></summary>
+
+EOF
+
+for config in "${CONFIGS[@]}"; do
+    cfg_name=$(echo "$config" | jq -r '.name')
+    
+    echo "### $cfg_name" >> "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
+    
+    # Branch logs
+    branch_stderr="$REPORT_DIR/branch/$cfg_name/output_stderr.log"
+    echo "<details>" >> "$REPORT_FILE"
+    echo "<summary>Branch ($CURRENT_BRANCH)</summary>" >> "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
+    echo '```' >> "$REPORT_FILE"
+    if [ -f "$branch_stderr" ] && [ -s "$branch_stderr" ]; then
+        cat "$branch_stderr" >> "$REPORT_FILE"
+    else
+        echo "(no stderr output)" >> "$REPORT_FILE"
+    fi
+    echo '```' >> "$REPORT_FILE"
+    echo "</details>" >> "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
+    
+    # Base logs
+    main_stderr="$REPORT_DIR/main/$cfg_name/output_stderr.log"
+    echo "<details>" >> "$REPORT_FILE"
+    echo "<summary>Base ($MERGE_BASE)</summary>" >> "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
+    echo '```' >> "$REPORT_FILE"
+    if [ -f "$main_stderr" ] && [ -s "$main_stderr" ]; then
+        cat "$main_stderr" >> "$REPORT_FILE"
+    else
+        echo "(no stderr output)" >> "$REPORT_FILE"
+    fi
+    echo '```' >> "$REPORT_FILE"
+    echo "</details>" >> "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
 done
 
 echo "</details>" >> "$REPORT_FILE"
