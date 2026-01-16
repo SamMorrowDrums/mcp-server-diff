@@ -359,23 +359,13 @@ run_mcp_test_stdio() {
     # Build the command with optional env vars
     local cmd="$cfg_start_cmd"
     if [ -n "$cfg_env" ]; then
-        cmd="export $cfg_env && $cfg_start_cmd"
-    fi
-    
-    # Build custom messages script if provided
-    local custom_msg_script=""
-    local custom_msg_names=""
-    if [ -n "$cfg_custom_messages" ]; then
-        local msg_count=$(echo "$cfg_custom_messages" | jq -r 'length')
-        for ((m=0; m<msg_count; m++)); do
-            local msg=$(echo "$cfg_custom_messages" | jq -r ".[$m].message | @json")
-            local msg_name=$(echo "$cfg_custom_messages" | jq -r ".[$m].name")
-            custom_msg_script="${custom_msg_script}sleep 0.1; echo ${msg}; "
-            custom_msg_names="${custom_msg_names} ${msg_name}"
-        done
+        # Export each env var properly
+        cmd="$cfg_start_cmd"
+        export $cfg_env 2>/dev/null || true
     fi
     
     # Run the server with all list commands plus custom messages
+    local output
     output=$(
         (
             echo "$INIT_MSG"
@@ -403,20 +393,11 @@ run_mcp_test_stdio() {
     end_time=$(date +%s.%N 2>/dev/null || date +%s)
     duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "0")
     
-    # Build a map of custom message IDs to names
-    declare -A custom_msg_map
-    if [ -n "$cfg_custom_messages" ]; then
-        local msg_count=$(echo "$cfg_custom_messages" | jq -r 'length')
-        for ((m=0; m<msg_count; m++)); do
-            local msg_id=$(echo "$cfg_custom_messages" | jq -r ".[$m].message.id")
-            local msg_name=$(echo "$cfg_custom_messages" | jq -r ".[$m].name")
-            custom_msg_map[$msg_id]="$msg_name"
-        done
-    fi
-    
     # Parse and save each response by matching JSON-RPC id
-    echo "$output" | while IFS= read -r line; do
+    # Use process substitution to avoid subshell issues with while loop
+    while IFS= read -r line; do
         [ -z "$line" ] && continue
+        local id
         id=$(echo "$line" | jq -r '.id // empty' 2>/dev/null)
         case "$id" in
             1) echo "$line" | jq -S '.' > "${output_prefix}_initialize.json" 2>/dev/null ;;
@@ -426,15 +407,16 @@ run_mcp_test_stdio() {
             5) echo "$line" | jq -S '.' > "${output_prefix}_resource_templates.json" 2>/dev/null ;;
             *)
                 # Check if it's a custom message response
-                if [ -n "$cfg_custom_messages" ]; then
-                    local msg_name=$(echo "$cfg_custom_messages" | jq -r ".[] | select(.message.id == $id) | .name" 2>/dev/null)
+                if [ -n "$cfg_custom_messages" ] && [ -n "$id" ]; then
+                    local msg_name
+                    msg_name=$(echo "$cfg_custom_messages" | jq -r ".[] | select(.message.id == $id) | .name" 2>/dev/null)
                     if [ -n "$msg_name" ]; then
                         echo "$line" | jq -S '.' > "${output_prefix}_custom_${msg_name}.json" 2>/dev/null
                     fi
                 fi
                 ;;
         esac
-    done
+    done <<< "$output"
     
     # Create empty files if not created
     touch "${output_prefix}_initialize.json" "${output_prefix}_tools.json" \
