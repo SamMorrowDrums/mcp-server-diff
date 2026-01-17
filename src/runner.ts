@@ -386,16 +386,16 @@ function generateJsonDiff(name: string, base: string, branch: string): string | 
   try {
     const baseObj = JSON.parse(base);
     const branchObj = JSON.parse(branch);
-    
+
     const differences = findJsonDifferences(baseObj, branchObj, "");
-    
+
     if (differences.length === 0) {
       return null;
     }
-    
+
     const diffLines = [`--- base/${name}.json`, `+++ branch/${name}.json`, ""];
     diffLines.push(...differences);
-    
+
     return diffLines.join("\n");
   } catch {
     // Fallback to simple diff if JSON parsing fails
@@ -408,7 +408,7 @@ function generateJsonDiff(name: string, base: string, branch: string): string | 
  */
 function findJsonDifferences(base: unknown, branch: unknown, path: string): string[] {
   const diffs: string[] = [];
-  
+
   // Handle null/undefined
   if (base === null || base === undefined) {
     if (branch !== null && branch !== undefined) {
@@ -416,33 +416,33 @@ function findJsonDifferences(base: unknown, branch: unknown, path: string): stri
     }
     return diffs;
   }
-  
+
   if (branch === null || branch === undefined) {
     diffs.push(`- ${path || "root"}: ${formatValue(base)}`);
     return diffs;
   }
-  
+
   // Handle type mismatch
   if (typeof base !== typeof branch) {
     diffs.push(`- ${path || "root"}: ${formatValue(base)}`);
     diffs.push(`+ ${path || "root"}: ${formatValue(branch)}`);
     return diffs;
   }
-  
+
   // Handle arrays
   if (Array.isArray(base) && Array.isArray(branch)) {
     return compareArrays(base, branch, path);
   }
-  
+
   // Handle objects
   if (typeof base === "object" && typeof branch === "object") {
     const baseObj = base as Record<string, unknown>;
     const branchObj = branch as Record<string, unknown>;
     const allKeys = new Set([...Object.keys(baseObj), ...Object.keys(branchObj)]);
-    
+
     for (const key of allKeys) {
       const newPath = path ? `${path}.${key}` : key;
-      
+
       if (!(key in baseObj)) {
         diffs.push(`+ ${newPath}: ${formatValue(branchObj[key])}`);
       } else if (!(key in branchObj)) {
@@ -453,13 +453,13 @@ function findJsonDifferences(base: unknown, branch: unknown, path: string): stri
     }
     return diffs;
   }
-  
+
   // Handle primitives
   if (base !== branch) {
     diffs.push(`- ${path}: ${formatValue(base)}`);
     diffs.push(`+ ${path}: ${formatValue(branch)}`);
   }
-  
+
   return diffs;
 }
 
@@ -468,21 +468,21 @@ function findJsonDifferences(base: unknown, branch: unknown, path: string): stri
  */
 function compareArrays(base: unknown[], branch: unknown[], path: string): string[] {
   const diffs: string[] = [];
-  
+
   // Try to identify items by name/uri for better diff
   const baseItems = new Map<string, { item: unknown; index: number }>();
   const branchItems = new Map<string, { item: unknown; index: number }>();
-  
+
   base.forEach((item, index) => {
     const key = getItemKey(item, index);
     baseItems.set(key, { item, index });
   });
-  
+
   branch.forEach((item, index) => {
     const key = getItemKey(item, index);
     branchItems.set(key, { item, index });
   });
-  
+
   // Find removed items
   for (const [key, { item }] of baseItems) {
     if (!branchItems.has(key)) {
@@ -490,7 +490,7 @@ function compareArrays(base: unknown[], branch: unknown[], path: string): string
       diffs.push(`- ${itemPath}: ${formatValue(item)}`);
     }
   }
-  
+
   // Find added items
   for (const [key, { item }] of branchItems) {
     if (!baseItems.has(key)) {
@@ -498,7 +498,7 @@ function compareArrays(base: unknown[], branch: unknown[], path: string): string
       diffs.push(`+ ${itemPath}: ${formatValue(item)}`);
     }
   }
-  
+
   // Find modified items
   for (const [key, { item: baseItem }] of baseItems) {
     const branchEntry = branchItems.get(key);
@@ -507,7 +507,7 @@ function compareArrays(base: unknown[], branch: unknown[], path: string): string
       diffs.push(...findJsonDifferences(baseItem, branchEntry.item, itemPath));
     }
   }
-  
+
   return diffs;
 }
 
@@ -518,9 +518,9 @@ function getItemKey(item: unknown, index: number): string {
   if (item === null || item === undefined || typeof item !== "object") {
     return `#${index}`;
   }
-  
+
   const obj = item as Record<string, unknown>;
-  
+
   // Try common identifier fields
   if (typeof obj.name === "string") return obj.name;
   if (typeof obj.uri === "string") return obj.uri;
@@ -529,7 +529,7 @@ function getItemKey(item: unknown, index: number): string {
     return `${obj.type}:${String(obj.text).slice(0, 50)}`;
   }
   if (typeof obj.method === "string") return obj.method;
-  
+
   return `#${index}`;
 }
 
@@ -539,7 +539,7 @@ function getItemKey(item: unknown, index: number): string {
 function formatValue(value: unknown): string {
   if (value === null) return "null";
   if (value === undefined) return "undefined";
-  
+
   if (typeof value === "string") {
     // Truncate long strings
     if (value.length > 100) {
@@ -547,7 +547,7 @@ function formatValue(value: unknown): string {
     }
     return JSON.stringify(value);
   }
-  
+
   if (typeof value === "object") {
     const json = JSON.stringify(value);
     // Truncate long objects
@@ -556,7 +556,7 @@ function formatValue(value: unknown): string {
     }
     return json;
   }
-  
+
   return String(value);
 }
 
