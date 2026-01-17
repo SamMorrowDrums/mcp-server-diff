@@ -42,7 +42,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: SamMorrowDrums/mcp-conformance-action@v1
+      - uses: SamMorrowDrums/mcp-conformance-action@v2
         with:
           setup_node: true
           install_command: npm ci
@@ -55,7 +55,7 @@ jobs:
 ### Node.js / TypeScript
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v1
+- uses: SamMorrowDrums/mcp-conformance-action@v2
   with:
     setup_node: true
     node_version: '22'
@@ -67,7 +67,7 @@ jobs:
 ### Python
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v1
+- uses: SamMorrowDrums/mcp-conformance-action@v2
   with:
     setup_python: true
     python_version: '3.12'
@@ -78,7 +78,7 @@ jobs:
 ### Go
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v1
+- uses: SamMorrowDrums/mcp-conformance-action@v2
   with:
     setup_go: true
     install_command: go mod download
@@ -89,7 +89,7 @@ jobs:
 ### Rust
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v1
+- uses: SamMorrowDrums/mcp-conformance-action@v2
   with:
     setup_rust: true
     install_command: cargo fetch
@@ -100,7 +100,7 @@ jobs:
 ### C# / .NET
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v1
+- uses: SamMorrowDrums/mcp-conformance-action@v2
   with:
     setup_dotnet: true
     dotnet_version: '9.0.x'
@@ -125,7 +125,7 @@ steps:
       cache: 'npm'
       registry-url: 'https://npm.pkg.github.com'
 
-  - uses: SamMorrowDrums/mcp-conformance-action@v1
+  - uses: SamMorrowDrums/mcp-conformance-action@v2
     with:
       install_command: npm ci
       build_command: npm run build
@@ -137,7 +137,7 @@ steps:
 Test both stdio and HTTP transports in a single run using the `configurations` input:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v1
+- uses: SamMorrowDrums/mcp-conformance-action@v2
   with:
     setup_node: true
     install_command: npm ci
@@ -258,10 +258,10 @@ Differences appear as unified diffs in the report. Common changes include:
 
 ### stdio Transport
 
-The default transport communicates with your server via stdin/stdout using JSON-RPC:
+The default transport communicates with your server via stdin/stdout using JSON-RPC. For stdio, each configuration spawns a fresh server process:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v1
+- uses: SamMorrowDrums/mcp-conformance-action@v2
   with:
     setup_node: true
     install_command: npm ci
@@ -271,48 +271,51 @@ The default transport communicates with your server via stdin/stdout using JSON-
 
 ### Streamable HTTP Transport
 
-For servers exposing an HTTP endpoint, the action can automatically manage the server lifecycle. Use `start_command` and the action will spawn your server, wait for it to start, probe it, then shut it down:
-
-```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v1
-  with:
-    setup_node: true
-    install_command: npm ci
-    build_command: npm run build
-    configurations: |
-      [{
-        "name": "http-server",
-        "transport": "streamable-http",
-        "start_command": "node dist/http.js",
-        "server_url": "http://localhost:3000/mcp",
-        "startup_wait_ms": 2000
-      }]
-```
-
-The action will:
-1. Start the server using `start_command`
-2. Wait `startup_wait_ms` (default: 2000ms) for the server to initialize
-3. Send MCP requests via HTTP POST
-4. Terminate the server after tests complete
-
-For more control, you can use `pre_test_command` and `post_test_command` to manage server lifecycle yourself:
+For HTTP servers, you typically want to **start the server once** and test multiple configurations against it. Use `start_command` at the configuration level—the action spawns the server, waits for startup, probes it, then terminates it after that configuration completes:
 
 ```yaml
 configurations: |
   [{
     "name": "http-server",
     "transport": "streamable-http",
+    "start_command": "node dist/http.js",
     "server_url": "http://localhost:3000/mcp",
-    "pre_test_command": "node dist/http.js &",
-    "pre_test_wait_ms": 2000,
-    "post_test_command": "pkill -f 'node dist/http.js' || true"
+    "startup_wait_ms": 2000
   }]
 ```
 
-For pre-deployed servers, omit both `start_command` and `pre_test_command`:
+**Per-configuration server lifecycle**: If your use case requires a fresh server instance per configuration (e.g., testing different flags or environment variables), include `start_command` in each configuration—each will get its own server process started and stopped.
+
+**Shared server for multiple configurations**: If you want one HTTP server to handle multiple test configurations, use `pre_test_command`/`post_test_command` on the first/last configuration, or start the server in a prior workflow step:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v1
+configurations: |
+  [
+    {
+      "name": "config-a",
+      "transport": "streamable-http",
+      "server_url": "http://localhost:3000/mcp",
+      "pre_test_command": "node dist/http.js &",
+      "pre_test_wait_ms": 2000
+    },
+    {
+      "name": "config-b",
+      "transport": "streamable-http",
+      "server_url": "http://localhost:3000/mcp"
+    },
+    {
+      "name": "config-c",
+      "transport": "streamable-http",
+      "server_url": "http://localhost:3000/mcp",
+      "post_test_command": "pkill -f 'node dist/http.js' || true"
+    }
+  ]
+```
+
+**Pre-deployed servers**: For already-running servers (staging, production), omit lifecycle commands entirely:
+
+```yaml
+- uses: SamMorrowDrums/mcp-conformance-action@v2
   with:
     install_command: 'true'
     transport: streamable-http
@@ -342,7 +345,7 @@ on:
 Specify any git ref to compare against:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v1
+- uses: SamMorrowDrums/mcp-conformance-action@v2
   with:
     setup_node: true
     install_command: npm ci
@@ -382,7 +385,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: SamMorrowDrums/mcp-conformance-action@v1
+      - uses: SamMorrowDrums/mcp-conformance-action@v2
         with:
           setup_node: true
           install_command: npm ci
