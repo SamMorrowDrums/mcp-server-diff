@@ -53601,128 +53601,10 @@ function generateSimpleTextDiff(name, base, branch) {
     return `--- base/${name}.json\n+++ branch/${name}.json\n${diffLines.join("\n")}`;
 }
 /**
- * Run conformance tests for a single configuration
- * @param useSharedServer - If true, skip per-config HTTP server management for CURRENT branch (shared server is running)
- * @param httpStartCommand - Command to start HTTP server for base ref testing (needed when using shared server)
- */
-async function runSingleConfigTest(config, ctx, useSharedServer = false, httpStartCommand) {
-    const result = {
-        configName: config.name,
-        transport: config.transport,
-        branchTime: 0,
-        baseTime: 0,
-        hasDifferences: false,
-        diffs: new Map(),
-    };
-    const globalEnvVars = parseEnvVars(ctx.inputs.envVars);
-    const globalHeaders = ctx.inputs.headers || {};
-    const globalCustomMessages = ctx.inputs.customMessages || [];
-    lib_core.info(`\n📋 Testing configuration: ${config.name} (${config.transport})`);
-    // Test current branch
-    lib_core.info("🔄 Testing current branch...");
-    const branchStart = Date.now();
-    let branchResult;
-    try {
-        branchResult = await probeWithConfig(config, ctx.workDir, globalEnvVars, globalHeaders, globalCustomMessages, useSharedServer);
-    }
-    finally {
-        // Always run post-test cleanup
-        await runPostTestCommand(config, ctx.workDir);
-    }
-    result.branchTime = Date.now() - branchStart;
-    if (branchResult.error) {
-        lib_core.warning(`Error on current branch: ${branchResult.error}`);
-        result.hasDifferences = true;
-        result.diffs.set("error", `Current branch probe failed: ${branchResult.error}`);
-        return result;
-    }
-    const branchFiles = probeResultToFiles(branchResult);
-    // Set up comparison ref
-    const worktreePath = external_path_.join(ctx.workDir, ".conformance-base");
-    let useWorktree = false;
-    try {
-        lib_core.info(`🔄 Setting up comparison ref: ${ctx.compareRef}`);
-        // Try worktree first
-        useWorktree = await createWorktree(ctx.compareRef, worktreePath);
-        if (!useWorktree) {
-            lib_core.info("  Worktree not available, using checkout");
-            await checkout(ctx.compareRef);
-        }
-        const baseWorkDir = useWorktree ? worktreePath : ctx.workDir;
-        // Build on base
-        lib_core.info("🔨 Building on comparison ref...");
-        await runBuild(baseWorkDir, ctx.inputs);
-        // For HTTP configs using shared server on current branch, we need to start
-        // a separate server for the base ref (since the shared server runs current branch code)
-        let baseServerProcess = null;
-        const needsBaseServer = useSharedServer && config.transport === "streamable-http" && httpStartCommand;
-        try {
-            if (needsBaseServer) {
-                lib_core.info("🚀 Starting HTTP server for base ref testing...");
-                // Create a synthetic config to start the server
-                const baseServerConfig = {
-                    name: "base-server",
-                    transport: "streamable-http",
-                    start_command: httpStartCommand,
-                    server_url: config.server_url,
-                    startup_wait_ms: ctx.inputs.httpStartupWaitMs || 2000,
-                };
-                baseServerProcess = await startHttpServer(baseServerConfig, baseWorkDir, globalEnvVars);
-            }
-            // Probe on base - never use shared server for base ref since it runs current branch code
-            lib_core.info("🔄 Testing comparison ref...");
-            const baseStart = Date.now();
-            let baseResult;
-            try {
-                baseResult = await probeWithConfig(config, baseWorkDir, globalEnvVars, globalHeaders, globalCustomMessages, false // Never use shared server for base ref - we started our own or need per-config
-                );
-            }
-            finally {
-                // Always run post-test cleanup
-                await runPostTestCommand(config, baseWorkDir);
-            }
-            result.baseTime = Date.now() - baseStart;
-            if (baseResult.error) {
-                lib_core.warning(`Error on base ref: ${baseResult.error}`);
-                result.hasDifferences = true;
-                result.diffs.set("error", `Base ref probe failed: ${baseResult.error}`);
-                return result;
-            }
-            const baseFiles = probeResultToFiles(baseResult);
-            // Compare results
-            result.diffs = compareResults(branchFiles, baseFiles);
-            result.hasDifferences = result.diffs.size > 0;
-            if (result.hasDifferences) {
-                lib_core.warning(`⚠️ Configuration ${config.name}: ${result.diffs.size} differences found`);
-            }
-            else {
-                lib_core.info(`✅ Configuration ${config.name}: no differences`);
-            }
-        }
-        finally {
-            // Stop the base server if we started one
-            if (baseServerProcess) {
-                lib_core.info("🛑 Stopping base ref HTTP server...");
-                stopHttpServer(baseServerProcess);
-            }
-        }
-    }
-    finally {
-        // Clean up
-        if (useWorktree) {
-            await removeWorktree(worktreePath);
-        }
-        else {
-            await checkoutPrevious();
-        }
-    }
-    return result;
-}
-/**
  * Start a shared HTTP server for all HTTP transport configurations
  */
 async function startSharedHttpServer(command, workDir, waitMs, envVars) {
-    lib_core.info(`🚀 Starting shared HTTP server: ${command}`);
+    lib_core.info(`🚀 Starting HTTP server: ${command}`);
     // Merge environment variables
     const env = {};
     for (const [key, value] of Object.entries(process.env)) {
@@ -53741,31 +53623,54 @@ async function startSharedHttpServer(command, workDir, waitMs, envVars) {
     });
     // Log server output for debugging
     serverProcess.stdout?.on("data", (data) => {
-        lib_core.debug(`  [shared server stdout]: ${data.toString().trim()}`);
+        lib_core.debug(`  [HTTP server stdout]: ${data.toString().trim()}`);
     });
     serverProcess.stderr?.on("data", (data) => {
-        lib_core.debug(`  [shared server stderr]: ${data.toString().trim()}`);
+        lib_core.debug(`  [HTTP server stderr]: ${data.toString().trim()}`);
     });
-    lib_core.info(`  Waiting ${waitMs}ms for shared HTTP server to start...`);
+    lib_core.info(`  Waiting ${waitMs}ms for HTTP server to start...`);
     await sleep(waitMs);
     // Check if process is still running
     if (serverProcess.exitCode !== null) {
-        throw new Error(`Shared HTTP server exited prematurely with code ${serverProcess.exitCode}`);
+        throw new Error(`HTTP server exited prematurely with code ${serverProcess.exitCode}`);
     }
-    lib_core.info("  ✅ Shared HTTP server started");
+    lib_core.info("  ✅ HTTP server started");
     return serverProcess;
 }
 /**
- * Run all conformance tests
+ * Probe a single configuration (without comparison)
+ */
+async function probeConfig(config, workDir, envVars, headers, customMessages, useSharedServer) {
+    lib_core.info(`  📋 Probing: ${config.name} (${config.transport})`);
+    const start = Date.now();
+    let result;
+    try {
+        result = await probeWithConfig(config, workDir, envVars, headers, customMessages, useSharedServer);
+    }
+    finally {
+        await runPostTestCommand(config, workDir);
+    }
+    return { result, time: Date.now() - start };
+}
+/**
+ * Run all conformance tests using the "probe all, then compare" approach
  */
 async function runAllTests(ctx) {
-    const results = [];
     const globalEnvVars = parseEnvVars(ctx.inputs.envVars);
+    const globalHeaders = ctx.inputs.headers || {};
+    const globalCustomMessages = ctx.inputs.customMessages || [];
     // Check if we have a shared HTTP server to manage
     const httpStartCommand = ctx.inputs.httpStartCommand;
     const httpStartupWaitMs = ctx.inputs.httpStartupWaitMs || 2000;
     const hasHttpConfigs = ctx.inputs.configurations.some((c) => c.transport === "streamable-http");
     const useSharedServer = !!httpStartCommand && hasHttpConfigs;
+    // Store probe results for comparison
+    const branchResults = new Map();
+    const baseResults = new Map();
+    // ========================================
+    // PHASE 1: Probe all configs on current branch
+    // ========================================
+    lib_core.info("\n🔄 Phase 1: Testing current branch...");
     let sharedServerProcess = null;
     try {
         // Start shared HTTP server if configured
@@ -53773,39 +53678,145 @@ async function runAllTests(ctx) {
             sharedServerProcess = await startSharedHttpServer(httpStartCommand, ctx.workDir, httpStartupWaitMs, globalEnvVars);
         }
         for (const config of ctx.inputs.configurations) {
+            const configUsesSharedServer = useSharedServer && config.transport === "streamable-http";
             try {
-                // Use shared server for HTTP configs when available
-                const configUsesSharedServer = useSharedServer && config.transport === "streamable-http";
-                const result = await runSingleConfigTest(config, ctx, configUsesSharedServer, httpStartCommand // Pass the command so base ref can start its own server
-                );
-                results.push(result);
-                // Save individual result
-                const resultPath = external_path_.join(ctx.workDir, ".conformance-results", `${config.name}.json`);
-                external_fs_.mkdirSync(external_path_.dirname(resultPath), { recursive: true });
-                external_fs_.writeFileSync(resultPath, JSON.stringify({
-                    ...result,
-                    diffs: Object.fromEntries(result.diffs),
-                }, null, 2));
+                const probeData = await probeConfig(config, ctx.workDir, globalEnvVars, globalHeaders, globalCustomMessages, configUsesSharedServer);
+                branchResults.set(config.name, probeData);
             }
             catch (error) {
-                lib_core.error(`Failed to run configuration ${config.name}: ${error}`);
-                results.push({
-                    configName: config.name,
-                    transport: config.transport,
-                    branchTime: 0,
-                    baseTime: 0,
-                    hasDifferences: true,
-                    diffs: new Map([["error", String(error)]]),
+                lib_core.error(`Failed to probe ${config.name} on current branch: ${error}`);
+                branchResults.set(config.name, {
+                    result: {
+                        initialize: null,
+                        tools: null,
+                        prompts: null,
+                        resources: null,
+                        resourceTemplates: null,
+                        customResponses: new Map(),
+                        error: String(error),
+                    },
+                    time: 0,
                 });
             }
         }
     }
     finally {
-        // Stop shared HTTP server if we started one
         if (sharedServerProcess) {
-            lib_core.info("🛑 Stopping shared HTTP server...");
+            lib_core.info("🛑 Stopping current branch HTTP server...");
             stopHttpServer(sharedServerProcess);
+            await sleep(500); // Give time for port to be released
         }
+    }
+    // ========================================
+    // PHASE 2: Probe all configs on base ref
+    // ========================================
+    lib_core.info(`\n🔄 Phase 2: Testing comparison ref: ${ctx.compareRef}...`);
+    const worktreePath = external_path_.join(ctx.workDir, ".conformance-base");
+    let useWorktree = false;
+    try {
+        // Set up comparison ref
+        useWorktree = await createWorktree(ctx.compareRef, worktreePath);
+        if (!useWorktree) {
+            lib_core.info("  Worktree not available, using checkout");
+            await checkout(ctx.compareRef);
+        }
+        const baseWorkDir = useWorktree ? worktreePath : ctx.workDir;
+        // Build on base
+        lib_core.info("🔨 Building on comparison ref...");
+        await runBuild(baseWorkDir, ctx.inputs);
+        let baseServerProcess = null;
+        try {
+            // Start HTTP server for base ref if needed
+            if (useSharedServer) {
+                baseServerProcess = await startSharedHttpServer(httpStartCommand, baseWorkDir, httpStartupWaitMs, globalEnvVars);
+            }
+            for (const config of ctx.inputs.configurations) {
+                const configUsesSharedServer = useSharedServer && config.transport === "streamable-http";
+                try {
+                    const probeData = await probeConfig(config, baseWorkDir, globalEnvVars, globalHeaders, globalCustomMessages, configUsesSharedServer);
+                    baseResults.set(config.name, probeData);
+                }
+                catch (error) {
+                    lib_core.error(`Failed to probe ${config.name} on base ref: ${error}`);
+                    baseResults.set(config.name, {
+                        result: {
+                            initialize: null,
+                            tools: null,
+                            prompts: null,
+                            resources: null,
+                            resourceTemplates: null,
+                            customResponses: new Map(),
+                            error: String(error),
+                        },
+                        time: 0,
+                    });
+                }
+            }
+        }
+        finally {
+            if (baseServerProcess) {
+                lib_core.info("🛑 Stopping base ref HTTP server...");
+                stopHttpServer(baseServerProcess);
+            }
+        }
+    }
+    finally {
+        // Clean up
+        if (useWorktree) {
+            await removeWorktree(worktreePath);
+        }
+        else {
+            await checkoutPrevious();
+        }
+    }
+    // ========================================
+    // PHASE 3: Compare all results
+    // ========================================
+    lib_core.info("\n📊 Phase 3: Comparing results...");
+    const results = [];
+    for (const config of ctx.inputs.configurations) {
+        const branchData = branchResults.get(config.name);
+        const baseData = baseResults.get(config.name);
+        const result = {
+            configName: config.name,
+            transport: config.transport,
+            branchTime: branchData?.time || 0,
+            baseTime: baseData?.time || 0,
+            hasDifferences: false,
+            diffs: new Map(),
+        };
+        // Handle errors
+        if (branchData?.result.error) {
+            result.hasDifferences = true;
+            result.diffs.set("error", `Current branch probe failed: ${branchData.result.error}`);
+            results.push(result);
+            continue;
+        }
+        if (baseData?.result.error) {
+            result.hasDifferences = true;
+            result.diffs.set("error", `Base ref probe failed: ${baseData.result.error}`);
+            results.push(result);
+            continue;
+        }
+        // Compare results
+        const branchFiles = probeResultToFiles(branchData.result);
+        const baseFiles = probeResultToFiles(baseData.result);
+        result.diffs = compareResults(branchFiles, baseFiles);
+        result.hasDifferences = result.diffs.size > 0;
+        if (result.hasDifferences) {
+            lib_core.warning(`⚠️ Configuration ${config.name}: ${result.diffs.size} differences found`);
+        }
+        else {
+            lib_core.info(`✅ Configuration ${config.name}: no differences`);
+        }
+        // Save individual result
+        const resultPath = external_path_.join(ctx.workDir, ".conformance-results", `${config.name}.json`);
+        external_fs_.mkdirSync(external_path_.dirname(resultPath), { recursive: true });
+        external_fs_.writeFileSync(resultPath, JSON.stringify({
+            ...result,
+            diffs: Object.fromEntries(result.diffs),
+        }, null, 2));
+        results.push(result);
     }
     return results;
 }
