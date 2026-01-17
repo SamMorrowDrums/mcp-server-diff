@@ -127,7 +127,7 @@ runs:
     # Optional language setup
     - name: Set up Node.js
       if: inputs.setup_node == 'true'
-      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
       with:
         node-version: ${{ inputs.node_version }}
 
