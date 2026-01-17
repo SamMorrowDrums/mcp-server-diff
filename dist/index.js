@@ -53406,8 +53406,8 @@ function compareResults(branchFiles, baseFiles) {
             diffs.set(endpoint, `Endpoint added in current branch (not present in base)`);
         }
         else if (branchContent !== baseContent) {
-            // Generate a simple diff
-            const diff = generateSimpleDiff(endpoint, baseContent || "", branchContent || "");
+            // Generate a semantic JSON diff
+            const diff = generateJsonDiff(endpoint, baseContent || "", branchContent || "");
             if (diff) {
                 diffs.set(endpoint, diff);
             }
@@ -53416,9 +53416,169 @@ function compareResults(branchFiles, baseFiles) {
     return diffs;
 }
 /**
- * Generate a simple line-by-line diff
+ * Generate a semantic JSON diff that shows actual changes
+ * rather than line-by-line text comparison
  */
-function generateSimpleDiff(name, base, branch) {
+function generateJsonDiff(name, base, branch) {
+    try {
+        const baseObj = JSON.parse(base);
+        const branchObj = JSON.parse(branch);
+        const differences = findJsonDifferences(baseObj, branchObj, "");
+        if (differences.length === 0) {
+            return null;
+        }
+        const diffLines = [`--- base/${name}.json`, `+++ branch/${name}.json`, ""];
+        diffLines.push(...differences);
+        return diffLines.join("\n");
+    }
+    catch {
+        // Fallback to simple diff if JSON parsing fails
+        return generateSimpleTextDiff(name, base, branch);
+    }
+}
+/**
+ * Recursively find differences between two JSON objects
+ */
+function findJsonDifferences(base, branch, path) {
+    const diffs = [];
+    // Handle null/undefined
+    if (base === null || base === undefined) {
+        if (branch !== null && branch !== undefined) {
+            diffs.push(`+ ${path || "root"}: ${formatValue(branch)}`);
+        }
+        return diffs;
+    }
+    if (branch === null || branch === undefined) {
+        diffs.push(`- ${path || "root"}: ${formatValue(base)}`);
+        return diffs;
+    }
+    // Handle type mismatch
+    if (typeof base !== typeof branch) {
+        diffs.push(`- ${path || "root"}: ${formatValue(base)}`);
+        diffs.push(`+ ${path || "root"}: ${formatValue(branch)}`);
+        return diffs;
+    }
+    // Handle arrays
+    if (Array.isArray(base) && Array.isArray(branch)) {
+        return compareArrays(base, branch, path);
+    }
+    // Handle objects
+    if (typeof base === "object" && typeof branch === "object") {
+        const baseObj = base;
+        const branchObj = branch;
+        const allKeys = new Set([...Object.keys(baseObj), ...Object.keys(branchObj)]);
+        for (const key of allKeys) {
+            const newPath = path ? `${path}.${key}` : key;
+            if (!(key in baseObj)) {
+                diffs.push(`+ ${newPath}: ${formatValue(branchObj[key])}`);
+            }
+            else if (!(key in branchObj)) {
+                diffs.push(`- ${newPath}: ${formatValue(baseObj[key])}`);
+            }
+            else {
+                diffs.push(...findJsonDifferences(baseObj[key], branchObj[key], newPath));
+            }
+        }
+        return diffs;
+    }
+    // Handle primitives
+    if (base !== branch) {
+        diffs.push(`- ${path}: ${formatValue(base)}`);
+        diffs.push(`+ ${path}: ${formatValue(branch)}`);
+    }
+    return diffs;
+}
+/**
+ * Compare arrays by finding items by their identity (name, uri, etc.)
+ */
+function compareArrays(base, branch, path) {
+    const diffs = [];
+    // Try to identify items by name/uri for better diff
+    const baseItems = new Map();
+    const branchItems = new Map();
+    base.forEach((item, index) => {
+        const key = getItemKey(item, index);
+        baseItems.set(key, { item, index });
+    });
+    branch.forEach((item, index) => {
+        const key = getItemKey(item, index);
+        branchItems.set(key, { item, index });
+    });
+    // Find removed items
+    for (const [key, { item }] of baseItems) {
+        if (!branchItems.has(key)) {
+            const itemPath = `${path}[${key}]`;
+            diffs.push(`- ${itemPath}: ${formatValue(item)}`);
+        }
+    }
+    // Find added items
+    for (const [key, { item }] of branchItems) {
+        if (!baseItems.has(key)) {
+            const itemPath = `${path}[${key}]`;
+            diffs.push(`+ ${itemPath}: ${formatValue(item)}`);
+        }
+    }
+    // Find modified items
+    for (const [key, { item: baseItem }] of baseItems) {
+        const branchEntry = branchItems.get(key);
+        if (branchEntry) {
+            const itemPath = `${path}[${key}]`;
+            diffs.push(...findJsonDifferences(baseItem, branchEntry.item, itemPath));
+        }
+    }
+    return diffs;
+}
+/**
+ * Get a unique key for an array item based on common identifiers
+ */
+function getItemKey(item, index) {
+    if (item === null || item === undefined || typeof item !== "object") {
+        return `#${index}`;
+    }
+    const obj = item;
+    // Try common identifier fields
+    if (typeof obj.name === "string")
+        return obj.name;
+    if (typeof obj.uri === "string")
+        return obj.uri;
+    if (typeof obj.uriTemplate === "string")
+        return obj.uriTemplate;
+    if (typeof obj.type === "string" && typeof obj.text === "string") {
+        return `${obj.type}:${String(obj.text).slice(0, 50)}`;
+    }
+    if (typeof obj.method === "string")
+        return obj.method;
+    return `#${index}`;
+}
+/**
+ * Format a value for display in the diff
+ */
+function formatValue(value) {
+    if (value === null)
+        return "null";
+    if (value === undefined)
+        return "undefined";
+    if (typeof value === "string") {
+        // Truncate long strings
+        if (value.length > 100) {
+            return JSON.stringify(value.slice(0, 100) + "...");
+        }
+        return JSON.stringify(value);
+    }
+    if (typeof value === "object") {
+        const json = JSON.stringify(value);
+        // Truncate long objects
+        if (json.length > 200) {
+            return json.slice(0, 200) + "...";
+        }
+        return json;
+    }
+    return String(value);
+}
+/**
+ * Generate a simple line-by-line diff (fallback for non-JSON)
+ */
+function generateSimpleTextDiff(name, base, branch) {
     const baseLines = base.split("\n");
     const branchLines = branch.split("\n");
     const diffLines = [];
@@ -53442,9 +53602,10 @@ function generateSimpleDiff(name, base, branch) {
 }
 /**
  * Run conformance tests for a single configuration
- * @param useSharedServer - If true, skip per-config HTTP server management (shared server is running)
+ * @param useSharedServer - If true, skip per-config HTTP server management for CURRENT branch (shared server is running)
+ * @param httpStartCommand - Command to start HTTP server for base ref testing (needed when using shared server)
  */
-async function runSingleConfigTest(config, ctx, useSharedServer = false) {
+async function runSingleConfigTest(config, ctx, useSharedServer = false, httpStartCommand) {
     const result = {
         configName: config.name,
         transport: config.transport,
@@ -53491,33 +53652,59 @@ async function runSingleConfigTest(config, ctx, useSharedServer = false) {
         // Build on base
         lib_core.info("🔨 Building on comparison ref...");
         await runBuild(baseWorkDir, ctx.inputs);
-        // Probe on base
-        lib_core.info("🔄 Testing comparison ref...");
-        const baseStart = Date.now();
-        let baseResult;
+        // For HTTP configs using shared server on current branch, we need to start
+        // a separate server for the base ref (since the shared server runs current branch code)
+        let baseServerProcess = null;
+        const needsBaseServer = useSharedServer && config.transport === "streamable-http" && httpStartCommand;
         try {
-            baseResult = await probeWithConfig(config, baseWorkDir, globalEnvVars, globalHeaders, globalCustomMessages, useSharedServer);
+            if (needsBaseServer) {
+                lib_core.info("🚀 Starting HTTP server for base ref testing...");
+                // Create a synthetic config to start the server
+                const baseServerConfig = {
+                    name: "base-server",
+                    transport: "streamable-http",
+                    start_command: httpStartCommand,
+                    server_url: config.server_url,
+                    startup_wait_ms: ctx.inputs.httpStartupWaitMs || 2000,
+                };
+                baseServerProcess = await startHttpServer(baseServerConfig, baseWorkDir, globalEnvVars);
+            }
+            // Probe on base - never use shared server for base ref since it runs current branch code
+            lib_core.info("🔄 Testing comparison ref...");
+            const baseStart = Date.now();
+            let baseResult;
+            try {
+                baseResult = await probeWithConfig(config, baseWorkDir, globalEnvVars, globalHeaders, globalCustomMessages, false // Never use shared server for base ref - we started our own or need per-config
+                );
+            }
+            finally {
+                // Always run post-test cleanup
+                await runPostTestCommand(config, baseWorkDir);
+            }
+            result.baseTime = Date.now() - baseStart;
+            if (baseResult.error) {
+                lib_core.warning(`Error on base ref: ${baseResult.error}`);
+                result.hasDifferences = true;
+                result.diffs.set("error", `Base ref probe failed: ${baseResult.error}`);
+                return result;
+            }
+            const baseFiles = probeResultToFiles(baseResult);
+            // Compare results
+            result.diffs = compareResults(branchFiles, baseFiles);
+            result.hasDifferences = result.diffs.size > 0;
+            if (result.hasDifferences) {
+                lib_core.warning(`⚠️ Configuration ${config.name}: ${result.diffs.size} differences found`);
+            }
+            else {
+                lib_core.info(`✅ Configuration ${config.name}: no differences`);
+            }
         }
         finally {
-            // Always run post-test cleanup
-            await runPostTestCommand(config, baseWorkDir);
-        }
-        result.baseTime = Date.now() - baseStart;
-        if (baseResult.error) {
-            lib_core.warning(`Error on base ref: ${baseResult.error}`);
-            result.hasDifferences = true;
-            result.diffs.set("error", `Base ref probe failed: ${baseResult.error}`);
-            return result;
-        }
-        const baseFiles = probeResultToFiles(baseResult);
-        // Compare results
-        result.diffs = compareResults(branchFiles, baseFiles);
-        result.hasDifferences = result.diffs.size > 0;
-        if (result.hasDifferences) {
-            lib_core.warning(`⚠️ Configuration ${config.name}: ${result.diffs.size} differences found`);
-        }
-        else {
-            lib_core.info(`✅ Configuration ${config.name}: no differences`);
+            // Stop the base server if we started one
+            if (baseServerProcess) {
+                lib_core.info("🛑 Stopping base ref HTTP server...");
+                stopHttpServer(baseServerProcess);
+            }
         }
     }
     finally {
@@ -53589,7 +53776,8 @@ async function runAllTests(ctx) {
             try {
                 // Use shared server for HTTP configs when available
                 const configUsesSharedServer = useSharedServer && config.transport === "streamable-http";
-                const result = await runSingleConfigTest(config, ctx, configUsesSharedServer);
+                const result = await runSingleConfigTest(config, ctx, configUsesSharedServer, httpStartCommand // Pass the command so base ref can start its own server
+                );
                 results.push(result);
                 // Save individual result
                 const resultPath = external_path_.join(ctx.workDir, ".conformance-results", `${config.name}.json`);
