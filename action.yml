@@ -72,7 +72,18 @@ inputs:
     required: false
     default: ''
   configurations:
-    description: 'JSON array of test configurations for multiple transports. Each object: name, transport, start_command, server_url, env_vars, custom_messages'
+    description: |
+      JSON array of test configurations for multiple transports/scenarios. 
+      Each object supports: name, transport, start_command, args, server_url, headers, env_vars, custom_messages.
+      
+      For HTTP transport, use start_command to have the action manage server lifecycle:
+        - start_command: Command to start the server (action spawns, probes, then kills it)
+        - startup_wait_ms: Milliseconds to wait for server startup (default: 2000)
+      
+      Or use pre/post commands for manual control:
+        - pre_test_command: Command to run before probing (e.g., start server in background)
+        - pre_test_wait_ms: Milliseconds to wait after pre_test_command
+        - post_test_command: Command to run after probing (e.g., kill server process)
     required: false
     default: ''
   custom_messages:

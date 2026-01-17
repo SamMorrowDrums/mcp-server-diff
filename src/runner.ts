@@ -6,6 +6,7 @@ import * as exec from "@actions/exec";
 import * as core from "@actions/core";
 import * as path from "path";
 import * as fs from "fs";
+import { spawn, ChildProcess } from "child_process";
 import { probeServer, probeResultToFiles } from "./probe.js";
 import { createWorktree, removeWorktree, checkout, checkoutPrevious } from "./git.js";
 import type {
@@ -179,6 +180,81 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Start an HTTP server process for the given configuration.
+ * Returns the spawned process which should be killed after probing.
+ */
+async function startHttpServer(
+  config: TestConfiguration,
+  workDir: string,
+  envVars: Record<string, string>
+): Promise<ChildProcess | null> {
+  if (!config.start_command) {
+    return null;
+  }
+
+  core.info(`  Starting HTTP server: ${config.start_command}`);
+
+  // Merge environment variables
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) {
+      env[key] = value;
+    }
+  }
+  for (const [key, value] of Object.entries(envVars)) {
+    env[key] = value;
+  }
+
+  const serverProcess = spawn("sh", ["-c", config.start_command], {
+    cwd: workDir,
+    env,
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  // Log server output for debugging
+  serverProcess.stdout?.on("data", (data) => {
+    core.debug(`  [server stdout]: ${data.toString().trim()}`);
+  });
+  serverProcess.stderr?.on("data", (data) => {
+    core.debug(`  [server stderr]: ${data.toString().trim()}`);
+  });
+
+  // Wait for server to start up
+  const waitMs = config.startup_wait_ms ?? config.pre_test_wait_ms ?? 2000;
+  core.info(`  Waiting ${waitMs}ms for server to start...`);
+  await sleep(waitMs);
+
+  // Check if process is still running
+  if (serverProcess.exitCode !== null) {
+    throw new Error(`HTTP server exited prematurely with code ${serverProcess.exitCode}`);
+  }
+
+  core.info("  HTTP server started");
+  return serverProcess;
+}
+
+/**
+ * Stop an HTTP server process
+ */
+function stopHttpServer(serverProcess: ChildProcess | null): void {
+  if (!serverProcess) {
+    return;
+  }
+
+  core.info("  Stopping HTTP server...");
+  try {
+    // Kill the process group (negative PID kills the group)
+    if (serverProcess.pid) {
+      process.kill(-serverProcess.pid, "SIGTERM");
+    }
+  } catch (error) {
+    // Process might already be dead
+    core.debug(`  Error stopping server: ${error}`);
+  }
+}
+
+/**
  * Run pre-test command if specified
  */
 async function runPreTestCommand(config: TestConfiguration, workDir: string): Promise<void> {
@@ -246,13 +322,24 @@ async function probeWithConfig(
       customMessages,
     });
   } else {
-    return await probeServer({
-      transport: "streamable-http",
-      url: config.server_url,
-      headers,
-      envVars,
-      customMessages,
-    });
+    // For HTTP transport, optionally start the server if start_command is provided
+    let serverProcess: ChildProcess | null = null;
+    try {
+      if (config.start_command) {
+        serverProcess = await startHttpServer(config, workDir, envVars);
+      }
+
+      return await probeServer({
+        transport: "streamable-http",
+        url: config.server_url,
+        headers,
+        envVars,
+        customMessages,
+      });
+    } finally {
+      // Always stop the server if we started it
+      stopHttpServer(serverProcess);
+    }
   }
 }
 

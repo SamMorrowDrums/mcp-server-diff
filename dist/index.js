@@ -35477,6 +35477,8 @@ async function checkoutPrevious() {
 var external_path_ = __nccwpck_require__(6928);
 // EXTERNAL MODULE: external "fs"
 var external_fs_ = __nccwpck_require__(9896);
+// EXTERNAL MODULE: external "child_process"
+var external_child_process_ = __nccwpck_require__(5317);
 ;// CONCATENATED MODULE: ./node_modules/zod/v4/core/core.js
 /** A special constant with type `never` */
 const NEVER = Object.freeze({
@@ -53107,6 +53109,7 @@ function probeResultToFiles(result) {
 
 
 
+
 /**
  * Parse configurations from input
  */
@@ -53246,6 +53249,68 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 /**
+ * Start an HTTP server process for the given configuration.
+ * Returns the spawned process which should be killed after probing.
+ */
+async function startHttpServer(config, workDir, envVars) {
+    if (!config.start_command) {
+        return null;
+    }
+    lib_core.info(`  Starting HTTP server: ${config.start_command}`);
+    // Merge environment variables
+    const env = {};
+    for (const [key, value] of Object.entries(process.env)) {
+        if (value !== undefined) {
+            env[key] = value;
+        }
+    }
+    for (const [key, value] of Object.entries(envVars)) {
+        env[key] = value;
+    }
+    const serverProcess = (0,external_child_process_.spawn)("sh", ["-c", config.start_command], {
+        cwd: workDir,
+        env,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+    // Log server output for debugging
+    serverProcess.stdout?.on("data", (data) => {
+        lib_core.debug(`  [server stdout]: ${data.toString().trim()}`);
+    });
+    serverProcess.stderr?.on("data", (data) => {
+        lib_core.debug(`  [server stderr]: ${data.toString().trim()}`);
+    });
+    // Wait for server to start up
+    const waitMs = config.startup_wait_ms ?? config.pre_test_wait_ms ?? 2000;
+    lib_core.info(`  Waiting ${waitMs}ms for server to start...`);
+    await sleep(waitMs);
+    // Check if process is still running
+    if (serverProcess.exitCode !== null) {
+        throw new Error(`HTTP server exited prematurely with code ${serverProcess.exitCode}`);
+    }
+    lib_core.info("  HTTP server started");
+    return serverProcess;
+}
+/**
+ * Stop an HTTP server process
+ */
+function stopHttpServer(serverProcess) {
+    if (!serverProcess) {
+        return;
+    }
+    lib_core.info("  Stopping HTTP server...");
+    try {
+        // Kill the process group (negative PID kills the group)
+        if (serverProcess.pid) {
+            process.kill(-serverProcess.pid, "SIGTERM");
+        }
+    }
+    catch (error) {
+        // Process might already be dead
+        lib_core.debug(`  Error stopping server: ${error}`);
+    }
+}
+/**
  * Run pre-test command if specified
  */
 async function runPreTestCommand(config, workDir) {
@@ -53302,13 +53367,24 @@ async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, gl
         });
     }
     else {
-        return await probeServer({
-            transport: "streamable-http",
-            url: config.server_url,
-            headers,
-            envVars,
-            customMessages,
-        });
+        // For HTTP transport, optionally start the server if start_command is provided
+        let serverProcess = null;
+        try {
+            if (config.start_command) {
+                serverProcess = await startHttpServer(config, workDir, envVars);
+            }
+            return await probeServer({
+                transport: "streamable-http",
+                url: config.server_url,
+                headers,
+                envVars,
+                customMessages,
+            });
+        }
+        finally {
+            // Always stop the server if we started it
+            stopHttpServer(serverProcess);
+        }
     }
 }
 /**

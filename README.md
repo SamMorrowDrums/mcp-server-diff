@@ -209,9 +209,15 @@ When using `configurations`, each object supports:
 |-------|-------------|----------|
 | `name` | Identifier for this configuration (appears in report) | Yes |
 | `transport` | `stdio` or `streamable-http` | No (default: `stdio`) |
-| `start_command` | Server start command | Yes (unless using external server) |
-| `server_url` | URL for HTTP transport | Required if transport is `streamable-http` |
+| `start_command` | Server start command (stdio: spawns process, HTTP: starts server in background) | Yes for stdio, optional for HTTP |
+| `server_url` | URL for HTTP transport | Required for `streamable-http` |
+| `startup_wait_ms` | Milliseconds to wait for HTTP server to start (when using `start_command`) | No (default: 2000) |
+| `pre_test_command` | Command to run before probing (alternative to `start_command` for HTTP) | No |
+| `pre_test_wait_ms` | Milliseconds to wait after `pre_test_command` | No |
+| `post_test_command` | Command to run after probing (cleanup, used with `pre_test_command`) | No |
+| `headers` | HTTP headers for this configuration | No |
 | `env_vars` | Additional environment variables | No |
+| `custom_messages` | Config-specific custom messages | No |
 
 ## How It Works
 
@@ -265,7 +271,7 @@ The default transport communicates with your server via stdin/stdout using JSON-
 
 ### Streamable HTTP Transport
 
-For servers exposing an HTTP endpoint:
+For servers exposing an HTTP endpoint, the action can automatically manage the server lifecycle. Use `start_command` and the action will spawn your server, wait for it to start, probe it, then shut it down:
 
 ```yaml
 - uses: SamMorrowDrums/mcp-conformance-action@v1
@@ -273,18 +279,37 @@ For servers exposing an HTTP endpoint:
     setup_node: true
     install_command: npm ci
     build_command: npm run build
-    start_command: node dist/http.js
-    transport: streamable-http
-    server_url: http://localhost:3000/mcp
+    configurations: |
+      [{
+        "name": "http-server",
+        "transport": "streamable-http",
+        "start_command": "node dist/http.js",
+        "server_url": "http://localhost:3000/mcp",
+        "startup_wait_ms": 2000
+      }]
 ```
 
 The action will:
 1. Start the server using `start_command`
-2. Poll the endpoint until it responds (up to `server_timeout` seconds)
+2. Wait `startup_wait_ms` (default: 2000ms) for the server to initialize
 3. Send MCP requests via HTTP POST
 4. Terminate the server after tests complete
 
-For pre-deployed servers, omit `start_command`:
+For more control, you can use `pre_test_command` and `post_test_command` to manage server lifecycle yourself:
+
+```yaml
+configurations: |
+  [{
+    "name": "http-server",
+    "transport": "streamable-http",
+    "server_url": "http://localhost:3000/mcp",
+    "pre_test_command": "node dist/http.js &",
+    "pre_test_wait_ms": 2000,
+    "post_test_command": "pkill -f 'node dist/http.js' || true"
+  }]
+```
+
+For pre-deployed servers, omit both `start_command` and `pre_test_command`:
 
 ```yaml
 - uses: SamMorrowDrums/mcp-conformance-action@v1
