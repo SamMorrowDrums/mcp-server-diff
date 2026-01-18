@@ -378,6 +378,60 @@ The action produces:
 1. **Job Summary**: Inline Markdown report in the GitHub Actions UI showing test results and diffs
 2. **Artifact**: `conformance-report` artifact containing `CONFORMANCE_REPORT.md` for download or further processing
 
+## Example Output
+
+### No Changes Detected
+
+When the MCP server's public interface hasn't changed between branches:
+
+```
+📊 Comparison:
+  Current: HEAD
+  Compare: abc1234 (v1.0.0)
+
+🧪 Running conformance tests...
+
+📊 Phase 3: Comparing results...
+📋 Configuration stdio: ✅ No changes
+
+✅ No API Changes - All configurations match the baseline.
+```
+
+### Changes Detected
+
+When changes are detected, the action shows a semantic diff with clear paths to each change:
+
+```
+📋 Configuration stdio: 3 change(s) found
+```
+
+The generated report shows exactly what changed using path notation:
+
+```diff
+--- base/tools.json
++++ branch/tools.json
+
++ tools[new_tool]: {"name": "new_tool", "description": "A newly added tool", ...}
+- tools[old_tool].inputSchema.properties.name.description: "Old description"
++ tools[old_tool].inputSchema.properties.name.description: "Updated description"
+- tools[calculator].inputSchema.properties.precision.type: "string"  
++ tools[calculator].inputSchema.properties.precision.type: "number"
+```
+
+```diff
+--- base/resources.json
++++ branch/resources.json
+
++ resources[config://settings]: {"uri": "config://settings", "name": "Settings", ...}
+```
+
+Each line shows:
+- `+` for additions (new tools, resources, or changed values)
+- `-` for removals (deleted items or previous values)
+- Full path to the change: `tools[tool_name].inputSchema.properties.param.type`
+
+This makes it easy to see exactly what changed without wading through entire JSON dumps
+
 ## Recommended Workflow
 
 ```yaml
