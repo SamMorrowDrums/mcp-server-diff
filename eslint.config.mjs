@@ -23,6 +23,13 @@ export default tseslint.config(
     },
   },
   {
+    // CLI and logger are allowed to use console
+    files: ["src/cli.ts", "src/logger.ts"],
+    rules: {
+      "no-console": "off",
+    },
+  },
+  {
     // Test files don't need the project reference and need Jest globals
     files: ["**/__tests__/**/*.ts", "**/*.test.ts"],
     languageOptions: {
@@ -39,6 +46,9 @@ export default tseslint.config(
         afterAll: "readonly",
         jest: "readonly",
       },
+    },
+    rules: {
+      "no-console": "off",
     },
   },
   {
