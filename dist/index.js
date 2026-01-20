@@ -38919,7 +38919,7 @@ var lib_core = __nccwpck_require__(7484);
 var exec = __nccwpck_require__(5236);
 ;// CONCATENATED MODULE: ./src/git.ts
 /**
- * Git utilities for conformance testing
+ * Git utilities for MCP server diff
  */
 
 
@@ -56546,7 +56546,7 @@ async function probeServer(options) {
         customResponses: new Map(),
     };
     const client = new Client({
-        name: "mcp-conformance-probe",
+        name: "mcp-server-diff-probe",
         version: "2.0.0",
     }, {
         capabilities: {},
@@ -56794,7 +56794,7 @@ function probeResultToFiles(result) {
 
 ;// CONCATENATED MODULE: ./src/runner.ts
 /**
- * Test runner for MCP conformance testing
+ * Test runner for MCP server diff
  */
 
 
@@ -57357,7 +57357,7 @@ async function probeConfig(config, workDir, envVars, headers, customMessages, us
     return { result, time: Date.now() - start };
 }
 /**
- * Run all conformance tests using the "probe all, then compare" approach
+ * Run all diff tests using the "probe all, then compare" approach
  */
 async function runAllTests(ctx) {
     const globalEnvVars = parseEnvVars(ctx.inputs.envVars);
@@ -57415,7 +57415,7 @@ async function runAllTests(ctx) {
     // PHASE 2: Probe all configs on base ref
     // ========================================
     lib_core.info(`\n🔄 Phase 2: Testing comparison ref: ${ctx.compareRef}...`);
-    const worktreePath = external_path_.join(ctx.workDir, ".conformance-base");
+    const worktreePath = external_path_.join(ctx.workDir, ".mcp-diff-base");
     let useWorktree = false;
     try {
         // Set up comparison ref
@@ -57516,7 +57516,7 @@ async function runAllTests(ctx) {
             lib_core.info(`✅ Configuration ${config.name}: no changes`);
         }
         // Save individual result
-        const resultPath = external_path_.join(ctx.workDir, ".conformance-results", `${config.name}.json`);
+        const resultPath = external_path_.join(ctx.workDir, ".mcp-diff-results", `${config.name}.json`);
         external_fs_.mkdirSync(external_path_.dirname(resultPath), { recursive: true });
         external_fs_.writeFileSync(resultPath, JSON.stringify({
             ...result,
@@ -57529,13 +57529,13 @@ async function runAllTests(ctx) {
 
 ;// CONCATENATED MODULE: ./src/reporter.ts
 /**
- * Report generator for MCP conformance testing
+ * Report generator for MCP server diff
  */
 
 
 
 /**
- * Generate a conformance report from test results
+ * Generate a diff report from test results
  */
 function generateReport(results, currentBranch, compareRef) {
     const totalBranchTime = results.reduce((sum, r) => sum + r.branchTime, 0);
@@ -57648,10 +57648,10 @@ function formatTime(ms) {
  */
 function saveReport(report, markdown, outputDir) {
     // Ensure output directory exists
-    const reportDir = external_path_.join(outputDir, "conformance-report");
+    const reportDir = external_path_.join(outputDir, "mcp-diff-report");
     external_fs_.mkdirSync(reportDir, { recursive: true });
     // Save JSON report
-    const jsonPath = external_path_.join(reportDir, "conformance-report.json");
+    const jsonPath = external_path_.join(reportDir, "mcp-diff-report.json");
     external_fs_.writeFileSync(jsonPath, JSON.stringify({
         ...report,
         results: report.results.map((r) => ({
@@ -57661,7 +57661,7 @@ function saveReport(report, markdown, outputDir) {
     }, null, 2));
     lib_core.info(`📄 JSON report saved to: ${jsonPath}`);
     // Save markdown report
-    const mdPath = external_path_.join(reportDir, "CONFORMANCE_REPORT.md");
+    const mdPath = external_path_.join(reportDir, "MCP_DIFF_REPORT.md");
     external_fs_.writeFileSync(mdPath, markdown);
     lib_core.info(`📄 Markdown report saved to: ${mdPath}`);
     // Set outputs using GITHUB_OUTPUT file (for composite actions)
@@ -57710,9 +57710,9 @@ function generatePRSummary(report) {
 
 ;// CONCATENATED MODULE: ./src/index.ts
 /**
- * MCP Conformance Action - Main Entry Point
+ * MCP Server Diff - Main Entry Point
  *
- * Tests MCP server implementations for conformance by comparing
+ * Diffs MCP server public interfaces by comparing
  * API responses between the current branch and a reference.
  */
 
@@ -57915,7 +57915,7 @@ async function run() {
         lib_core.info(`  Compare: ${compareRefDisplay}${compareRefDisplay !== compareRef ? ` (${compareRef.substring(0, 7)})` : ""}`);
         // Run all tests
         lib_core.info("");
-        lib_core.info("🧪 Running conformance tests...");
+        lib_core.info("🧪 Running diff...");
         const workDir = process.cwd();
         const results = await runAllTests({
             workDir,
@@ -57948,7 +57948,7 @@ async function run() {
             }
         }
         else {
-            lib_core.info("✅ All conformance tests passed - no API changes detected");
+            lib_core.info("✅ All tests passed - no API changes detected");
         }
     }
     catch (error) {

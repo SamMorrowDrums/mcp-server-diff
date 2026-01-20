@@ -1,9 +1,9 @@
 /**
- * Report generator for MCP conformance testing
+ * Report generator for MCP server diff
  */
 import type { TestResult, ConformanceReport } from "./types.js";
 /**
- * Generate a conformance report from test results
+ * Generate a diff report from test results
  */
 export declare function generateReport(results: TestResult[], currentBranch: string, compareRef: string): ConformanceReport;
 /**

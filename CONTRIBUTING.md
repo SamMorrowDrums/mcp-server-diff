@@ -1,6 +1,6 @@
-# Contributing to MCP Conformance Action
+# Contributing to MCP Server Diff
 
-Thank you for your interest in contributing! This document provides guidelines for contributing to the MCP Conformance Action.
+Thank you for your interest in contributing! This document provides guidelines for contributing to MCP Server Diff.
 
 ## How to Contribute
 

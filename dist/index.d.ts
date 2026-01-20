@@ -1,7 +1,7 @@
 /**
- * MCP Conformance Action - Main Entry Point
+ * MCP Server Diff - Main Entry Point
  *
- * Tests MCP server implementations for conformance by comparing
+ * Diffs MCP server public interfaces by comparing
  * API responses between the current branch and a reference.
  */
 export {};

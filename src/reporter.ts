@@ -1,5 +1,5 @@
 /**
- * Report generator for MCP conformance testing
+ * Report generator for MCP server diff
  */
 
 import * as core from "@actions/core";
@@ -8,7 +8,7 @@ import * as path from "path";
 import type { TestResult, ConformanceReport } from "./types.js";
 
 /**
- * Generate a conformance report from test results
+ * Generate a diff report from test results
  */
 export function generateReport(
   results: TestResult[],
@@ -80,7 +80,7 @@ export function generateMarkdownReport(report: ConformanceReport): string {
     lines.push(`### ${statusIcon} ${result.configName}`);
     lines.push("");
     lines.push(`- **Transport:** ${result.transport}`);
-    
+
     // Show primitive counts if available
     if (result.branchCounts) {
       const counts = result.branchCounts;
@@ -88,12 +88,13 @@ export function generateMarkdownReport(report: ConformanceReport): string {
       if (counts.tools > 0) countParts.push(`${counts.tools} tools`);
       if (counts.prompts > 0) countParts.push(`${counts.prompts} prompts`);
       if (counts.resources > 0) countParts.push(`${counts.resources} resources`);
-      if (counts.resourceTemplates > 0) countParts.push(`${counts.resourceTemplates} resource templates`);
+      if (counts.resourceTemplates > 0)
+        countParts.push(`${counts.resourceTemplates} resource templates`);
       if (countParts.length > 0) {
         lines.push(`- **Primitives:** ${countParts.join(", ")}`);
       }
     }
-    
+
     lines.push(`- **Branch Time:** ${formatTime(result.branchTime)}`);
     lines.push(`- **Base Time:** ${formatTime(result.baseTime)}`);
     lines.push("");
@@ -135,11 +136,11 @@ function formatTime(ms: number): string {
  */
 export function saveReport(report: ConformanceReport, markdown: string, outputDir: string): void {
   // Ensure output directory exists
-  const reportDir = path.join(outputDir, "conformance-report");
+  const reportDir = path.join(outputDir, "mcp-diff-report");
   fs.mkdirSync(reportDir, { recursive: true });
 
   // Save JSON report
-  const jsonPath = path.join(reportDir, "conformance-report.json");
+  const jsonPath = path.join(reportDir, "mcp-diff-report.json");
   fs.writeFileSync(
     jsonPath,
     JSON.stringify(
@@ -157,7 +158,7 @@ export function saveReport(report: ConformanceReport, markdown: string, outputDi
   core.info(`📄 JSON report saved to: ${jsonPath}`);
 
   // Save markdown report
-  const mdPath = path.join(reportDir, "CONFORMANCE_REPORT.md");
+  const mdPath = path.join(reportDir, "MCP_DIFF_REPORT.md");
   fs.writeFileSync(mdPath, markdown);
   core.info(`📄 Markdown report saved to: ${mdPath}`);
 

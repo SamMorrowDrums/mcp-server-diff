@@ -1,5 +1,5 @@
 /**
- * Test runner for MCP conformance testing
+ * Test runner for MCP server diff
  */
 import type { TestConfiguration, ActionInputs, TestResult, CustomMessage } from "./types.js";
 interface RunContext {
@@ -24,7 +24,7 @@ export declare function parseHeaders(input: string | undefined): Record<string, 
  */
 export declare function parseEnvVars(input?: string): Record<string, string>;
 /**
- * Run all conformance tests using the "probe all, then compare" approach
+ * Run all diff tests using the "probe all, then compare" approach
  */
 export declare function runAllTests(ctx: RunContext): Promise<TestResult[]>;
 export {};

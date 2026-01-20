@@ -1,10 +1,10 @@
-# MCP Conformance Action
+# MCP Server Diff
 
-[![GitHub Marketplace](https://img.shields.io/badge/Marketplace-MCP%20Conformance%20Test-blue?logo=github)](https://github.com/marketplace/actions/mcp-conformance-test)
-[![GitHub release](https://img.shields.io/github/v/release/SamMorrowDrums/mcp-conformance-action)](https://github.com/SamMorrowDrums/mcp-conformance-action/releases)
+[![GitHub Marketplace](https://img.shields.io/badge/Marketplace-MCP%20Server%20Diff-blue?logo=github)](https://github.com/marketplace/actions/mcp-server-diff)
+[![GitHub release](https://img.shields.io/github/v/release/SamMorrowDrums/mcp-server-diff)](https://github.com/SamMorrowDrums/mcp-server-diff/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A GitHub Action for detecting changes to [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server **public interfaces**. This action compares the current branch against a baseline to surface any changes to your server's exposed tools, resources, prompts, and capabilities—helping you document API evolution and catch unintended modifications.
+A GitHub Action for diffing [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server **public interfaces** between versions. This action compares the current branch against a baseline to surface any changes to your server's exposed tools, resources, prompts, and capabilities—helping you document API evolution and catch unintended modifications.
 
 ## Overview
 
@@ -19,10 +19,10 @@ This is **not** about testing internal logic or correctness—it's about visibil
 
 ## Quick Start
 
-Create `.github/workflows/conformance.yml` in your repository:
+Create `.github/workflows/mcp-diff.yml` in your repository:
 
 ```yaml
-name: Conformance Test
+name: MCP Server Diff
 
 on:
   pull_request:
@@ -35,14 +35,14 @@ permissions:
   contents: read
 
 jobs:
-  conformance:
+  mcp-diff:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - uses: SamMorrowDrums/mcp-conformance-action@v2
+      - uses: SamMorrowDrums/mcp-server-diff@v2
         with:
           setup_node: true
           install_command: npm ci
@@ -55,7 +55,7 @@ jobs:
 ### Node.js / TypeScript
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v2
+- uses: SamMorrowDrums/mcp-server-diff@v2
   with:
     setup_node: true
     node_version: '22'
@@ -67,7 +67,7 @@ jobs:
 ### Python
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v2
+- uses: SamMorrowDrums/mcp-server-diff@v2
   with:
     setup_python: true
     python_version: '3.12'
@@ -78,7 +78,7 @@ jobs:
 ### Go
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v2
+- uses: SamMorrowDrums/mcp-server-diff@v2
   with:
     setup_go: true
     install_command: go mod download
@@ -89,7 +89,7 @@ jobs:
 ### Rust
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v2
+- uses: SamMorrowDrums/mcp-server-diff@v2
   with:
     setup_rust: true
     install_command: cargo fetch
@@ -100,7 +100,7 @@ jobs:
 ### C# / .NET
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v2
+- uses: SamMorrowDrums/mcp-server-diff@v2
   with:
     setup_dotnet: true
     dotnet_version: '9.0.x'
@@ -125,7 +125,7 @@ steps:
       cache: 'npm'
       registry-url: 'https://npm.pkg.github.com'
 
-  - uses: SamMorrowDrums/mcp-conformance-action@v2
+  - uses: SamMorrowDrums/mcp-server-diff@v2
     with:
       install_command: npm ci
       build_command: npm run build
@@ -137,7 +137,7 @@ steps:
 Test both stdio and HTTP transports in a single run using the `configurations` input:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v2
+- uses: SamMorrowDrums/mcp-server-diff@v2
   with:
     setup_node: true
     install_command: npm ci
@@ -263,7 +263,7 @@ Differences appear as unified diffs in the report. Common changes include:
 The default transport communicates with your server via stdin/stdout using JSON-RPC. For stdio, each configuration spawns a fresh server process:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v2
+- uses: SamMorrowDrums/mcp-server-diff@v2
   with:
     setup_node: true
     install_command: npm ci
@@ -317,7 +317,7 @@ configurations: |
 **Pre-deployed servers**: For already-running servers (staging, production), omit lifecycle commands entirely:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v2
+- uses: SamMorrowDrums/mcp-server-diff@v2
   with:
     install_command: 'true'
     transport: streamable-http
@@ -347,7 +347,7 @@ on:
 Specify any git ref to compare against:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v2
+- uses: SamMorrowDrums/mcp-server-diff@v2
   with:
     setup_node: true
     install_command: npm ci
@@ -361,7 +361,7 @@ Specify any git ref to compare against:
 For release workflows where you want to ensure no API changes, use `fail_on_diff`:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-conformance-action@v2
+- uses: SamMorrowDrums/mcp-server-diff@v2
   with:
     setup_node: true
     install_command: npm ci
@@ -376,7 +376,7 @@ For release workflows where you want to ensure no API changes, use `fail_on_diff
 The action produces:
 
 1. **Job Summary**: Inline Markdown report in the GitHub Actions UI showing test results and diffs
-2. **Artifact**: `conformance-report` artifact containing `CONFORMANCE_REPORT.md` for download or further processing
+2. **Artifact**: `mcp-diff-report` artifact containing `MCP_DIFF_REPORT.md` for download or further processing
 
 ## Example Output
 
@@ -389,7 +389,7 @@ When the MCP server's public interface hasn't changed between branches:
   Current: HEAD
   Compare: abc1234 (v1.0.0)
 
-🧪 Running conformance tests...
+🧪 Running diff...
 
 📊 Phase 3: Comparing results...
 📋 Configuration stdio: ✅ No changes
@@ -435,7 +435,7 @@ This makes it easy to see exactly what changed without wading through entire JSO
 ## Recommended Workflow
 
 ```yaml
-name: Conformance Test
+name: MCP Server Diff
 
 on:
   workflow_dispatch:
@@ -449,14 +449,14 @@ permissions:
   contents: read
 
 jobs:
-  conformance:
+  mcp-diff:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - uses: SamMorrowDrums/mcp-conformance-action@v2
+      - uses: SamMorrowDrums/mcp-server-diff@v2
         with:
           setup_node: true
           install_command: npm ci
@@ -517,10 +517,10 @@ Working examples of this action in various languages:
 
 | Language | Repository | Workflow |
 |----------|------------|----------|
-| TypeScript | [mcp-typescript-starter](https://github.com/SamMorrowDrums/mcp-typescript-starter) | [conformance.yml](https://github.com/SamMorrowDrums/mcp-typescript-starter/blob/main/.github/workflows/conformance.yml) |
-| Python | [mcp-python-starter](https://github.com/SamMorrowDrums/mcp-python-starter) | [conformance.yml](https://github.com/SamMorrowDrums/mcp-python-starter/blob/main/.github/workflows/conformance.yml) |
-| Go | [mcp-go-starter](https://github.com/SamMorrowDrums/mcp-go-starter) | [conformance.yml](https://github.com/SamMorrowDrums/mcp-go-starter/blob/main/.github/workflows/conformance.yml) |
-| Rust | [mcp-rust-starter](https://github.com/SamMorrowDrums/mcp-rust-starter) | [conformance.yml](https://github.com/SamMorrowDrums/mcp-rust-starter/blob/main/.github/workflows/conformance.yml) |
-| C# | [mcp-csharp-starter](https://github.com/SamMorrowDrums/mcp-csharp-starter) | [conformance.yml](https://github.com/SamMorrowDrums/mcp-csharp-starter/blob/main/.github/workflows/conformance.yml) |
+| TypeScript | [mcp-typescript-starter](https://github.com/SamMorrowDrums/mcp-typescript-starter) | [mcp-diff.yml](https://github.com/SamMorrowDrums/mcp-typescript-starter/blob/main/.github/workflows/mcp-diff.yml) |
+| Python | [mcp-python-starter](https://github.com/SamMorrowDrums/mcp-python-starter) | [mcp-diff.yml](https://github.com/SamMorrowDrums/mcp-python-starter/blob/main/.github/workflows/mcp-diff.yml) |
+| Go | [mcp-go-starter](https://github.com/SamMorrowDrums/mcp-go-starter) | [mcp-diff.yml](https://github.com/SamMorrowDrums/mcp-go-starter/blob/main/.github/workflows/mcp-diff.yml) |
+| Rust | [mcp-rust-starter](https://github.com/SamMorrowDrums/mcp-rust-starter) | [mcp-diff.yml](https://github.com/SamMorrowDrums/mcp-rust-starter/blob/main/.github/workflows/mcp-diff.yml) |
+| C# | [mcp-csharp-starter](https://github.com/SamMorrowDrums/mcp-csharp-starter) | [mcp-diff.yml](https://github.com/SamMorrowDrums/mcp-csharp-starter/blob/main/.github/workflows/mcp-diff.yml) |
 
 For a production example, see [github-mcp-server](https://github.com/github/github-mcp-server).

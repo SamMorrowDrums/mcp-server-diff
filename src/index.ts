@@ -1,7 +1,7 @@
 /**
- * MCP Conformance Action - Main Entry Point
+ * MCP Server Diff - Main Entry Point
  *
- * Tests MCP server implementations for conformance by comparing
+ * Diffs MCP server public interfaces by comparing
  * API responses between the current branch and a reference.
  */
 
@@ -237,7 +237,7 @@ async function run(): Promise<void> {
 
     // Run all tests
     core.info("");
-    core.info("🧪 Running conformance tests...");
+    core.info("🧪 Running diff...");
 
     const workDir = process.cwd();
     const results = await runAllTests({
@@ -273,7 +273,7 @@ async function run(): Promise<void> {
         core.warning("Some configurations had probe errors (fail_on_error is disabled)");
       }
     } else {
-      core.info("✅ All conformance tests passed - no API changes detected");
+      core.info("✅ All tests passed - no API changes detected");
     }
   } catch (error) {
     core.setFailed(`Action failed: ${error}`);

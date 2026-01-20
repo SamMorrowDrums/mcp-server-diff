@@ -1,5 +1,5 @@
 /**
- * Git utilities for conformance testing
+ * Git utilities for MCP server diff
  */
 export interface GitInfo {
     currentBranch: string;

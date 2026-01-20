@@ -45,7 +45,7 @@ export async function probeServer(options: ProbeOptions): Promise<ProbeResult> {
 
   const client = new Client(
     {
-      name: "mcp-conformance-probe",
+      name: "mcp-server-diff-probe",
       version: "2.0.0",
     },
     {

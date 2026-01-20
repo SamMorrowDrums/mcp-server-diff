@@ -1,5 +1,5 @@
-name: 'MCP Conformance Test'
-description: 'Test MCP server conformance between versions'
+name: 'MCP Server Diff'
+description: 'Diff MCP server public interfaces between versions'
 author: 'Sam Morrow'
 branding:
   icon: 'check-circle'
@@ -134,10 +134,10 @@ inputs:
 outputs:
   status:
     description: 'Test status (passed, differences, or error)'
-    value: ${{ steps.conformance.outputs.status }}
+    value: ${{ steps.diff.outputs.status }}
   report_path:
-    description: 'Path to the conformance report'
-    value: 'conformance-report/CONFORMANCE_REPORT.md'
+    description: 'Path to the diff report'
+    value: 'mcp-diff-report/MCP_DIFF_REPORT.md'
 
 runs:
   using: 'composite'
@@ -180,8 +180,8 @@ runs:
       run: |
         echo "${{ inputs.env_vars }}" >> $GITHUB_ENV
 
-    - name: Run conformance test
-      id: conformance
+    - name: Run MCP server diff
+      id: diff
       shell: bash
       env:
         INPUT_INSTALL_COMMAND: ${{ inputs.install_command }}
@@ -214,7 +214,7 @@ runs:
     - name: Generate Job Summary
       shell: bash
       run: |
-        echo "# MCP Server Conformance Report" >> $GITHUB_STEP_SUMMARY
+        echo "# MCP Server Diff Report" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         if [ -n "${{ inputs.compare_ref }}" ]; then
           echo "Comparing against: \`${{ inputs.compare_ref }}\`" >> $GITHUB_STEP_SUMMARY
@@ -225,8 +225,8 @@ runs:
         fi
         echo "" >> $GITHUB_STEP_SUMMARY
         
-        if [ -f conformance-report/CONFORMANCE_REPORT.md ]; then
-          tail -n +5 conformance-report/CONFORMANCE_REPORT.md >> $GITHUB_STEP_SUMMARY
+        if [ -f mcp-diff-report/MCP_DIFF_REPORT.md ]; then
+          tail -n +5 mcp-diff-report/MCP_DIFF_REPORT.md >> $GITHUB_STEP_SUMMARY
         else
           echo "Report file not found - check the workflow logs for errors" >> $GITHUB_STEP_SUMMARY
         fi
@@ -235,16 +235,16 @@ runs:
         echo "---" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         
-        if [ "${{ steps.conformance.outputs.status }}" = "passed" ]; then
+        if [ "${{ steps.diff.outputs.status }}" = "passed" ]; then
           echo "**No API changes detected** between the branches." >> $GITHUB_STEP_SUMMARY
         else
           echo "**API changes detected** — review above to confirm they are expected." >> $GITHUB_STEP_SUMMARY
         fi
 
-    - name: Upload conformance report
+    - name: Upload diff report
       if: always()
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       with:
-        name: conformance-report
-        path: conformance-report/
+        name: mcp-diff-report
+        path: mcp-diff-report/
         if-no-files-found: ignore

@@ -1,5 +1,5 @@
 /**
- * Test runner for MCP conformance testing
+ * Test runner for MCP server diff
  */
 
 import * as exec from "@actions/exec";
@@ -683,7 +683,7 @@ async function probeConfig(
 }
 
 /**
- * Run all conformance tests using the "probe all, then compare" approach
+ * Run all diff tests using the "probe all, then compare" approach
  */
 export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
   const globalEnvVars = parseEnvVars(ctx.inputs.envVars);
@@ -758,7 +758,7 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
   // ========================================
   core.info(`\n🔄 Phase 2: Testing comparison ref: ${ctx.compareRef}...`);
 
-  const worktreePath = path.join(ctx.workDir, ".conformance-base");
+  const worktreePath = path.join(ctx.workDir, ".mcp-diff-base");
   let useWorktree = false;
 
   try {
@@ -881,7 +881,7 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
     }
 
     // Save individual result
-    const resultPath = path.join(ctx.workDir, ".conformance-results", `${config.name}.json`);
+    const resultPath = path.join(ctx.workDir, ".mcp-diff-results", `${config.name}.json`);
     fs.mkdirSync(path.dirname(resultPath), { recursive: true });
     fs.writeFileSync(
       resultPath,

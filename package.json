@@ -1,7 +1,7 @@
 {
-  "name": "mcp-conformance-action",
+  "name": "mcp-server-diff",
   "version": "2.0.0",
-  "description": "GitHub Action for testing MCP server conformance between versions",
+  "description": "GitHub Action for diffing MCP server public interfaces between versions",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
@@ -18,14 +18,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/SamMorrowDrums/mcp-conformance-action.git"
+    "url": "git+https://github.com/SamMorrowDrums/mcp-server-diff.git"
   },
   "keywords": [
     "github-action",
     "mcp",
     "model-context-protocol",
-    "conformance",
-    "testing"
+    "diff",
+    "api-changes"
   ],
   "author": "Sam Morrow",
   "license": "MIT",
