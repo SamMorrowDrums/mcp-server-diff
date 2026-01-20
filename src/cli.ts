@@ -7,6 +7,7 @@
 
 import { parseArgs } from "node:util";
 import * as fs from "fs";
+import * as readline from "readline";
 import { probeServer } from "./probe.js";
 import { compareProbeResults, extractCounts, type DiffResult } from "./diff.js";
 import { ConsoleLogger, QuietLogger, setLogger, log } from "./logger.js";
@@ -75,6 +76,8 @@ OPTIONS:
   -b, --base <command>     Base server command (stdio) or URL (http)
   -t, --target <command>   Target server command (stdio) or URL (http)
   -H, --header <header>    HTTP header (can be repeated, e.g. -H "Authorization: Bearer ...")
+                           Use env:VAR_NAME to read value from environment variable
+                           Use secret: to prompt for value securely (hidden input)
   -c, --config <file>      Config file with base and targets
   -o, --output <format>    Output format: diff, json, markdown, summary (default: summary)
   -v, --verbose            Verbose output
@@ -120,6 +123,14 @@ EXAMPLES:
   # Compare with HTTP headers (for authenticated endpoints)
   mcp-server-diff -b "go run ./cmd/server stdio" -t "https://api.example.com/mcp" \\
     -H "Authorization: Bearer token" -o diff
+
+  # Use environment variable for secret (keeps token out of shell history)
+  mcp-server-diff -b "./server" -t "https://api.example.com/mcp" \\
+    -H "Authorization: env:MY_API_TOKEN"
+
+  # Prompt for secret interactively (hidden input)
+  mcp-server-diff -b "./server" -t "https://api.example.com/mcp" \\
+    -H "Authorization: secret:"
 `);
 }
 
@@ -167,8 +178,13 @@ function commandToConfig(
 /**
  * Parse header strings into a record
  * Accepts formats: "Header: value" or "Header=value"
+ * Values starting with "env:" read from environment variables
+ * Values starting with "secret:" will be prompted (collected separately)
  */
-function parseHeaders(headerStrings?: string[]): Record<string, string> {
+function parseHeaders(
+  headerStrings?: string[],
+  secretValues?: Map<string, string>
+): Record<string, string> {
   const headers: Record<string, string> = {};
   if (!headerStrings) return headers;
 
@@ -179,11 +195,114 @@ function parseHeaders(headerStrings?: string[]): Record<string, string> {
 
     if (sepIdx > 0) {
       const key = h.substring(0, sepIdx).trim();
-      const value = h.substring(sepIdx + 1).trim();
+      let value = h.substring(sepIdx + 1).trim();
+
+      // Check for env: prefix to read from environment variable
+      if (value.startsWith("env:")) {
+        const envVar = value.substring(4);
+        const envValue = process.env[envVar];
+        if (!envValue) {
+          throw new Error(`Environment variable ${envVar} not set (referenced in header ${key})`);
+        }
+        value = envValue;
+      } else if (value.startsWith("secret:")) {
+        // Use prompted secret value
+        const secretKey = `${key}`;
+        if (secretValues?.has(secretKey)) {
+          value = secretValues.get(secretKey)!;
+        } else {
+          throw new Error(`Secret value for header ${key} not collected`);
+        }
+      }
+
       headers[key] = value;
     }
   }
   return headers;
+}
+
+/**
+ * Find headers that need secret prompts
+ */
+function findSecretHeaders(headerStrings?: string[]): string[] {
+  const secrets: string[] = [];
+  if (!headerStrings) return secrets;
+
+  for (const h of headerStrings) {
+    const colonIdx = h.indexOf(":");
+    const eqIdx = h.indexOf("=");
+    const sepIdx = colonIdx > 0 ? colonIdx : eqIdx;
+
+    if (sepIdx > 0) {
+      const key = h.substring(0, sepIdx).trim();
+      const value = h.substring(sepIdx + 1).trim();
+      if (value.startsWith("secret:")) {
+        secrets.push(key);
+      }
+    }
+  }
+  return secrets;
+}
+
+/**
+ * Prompt for a secret value with hidden input
+ */
+async function promptSecret(prompt: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    // Hide input by using raw mode if available
+    if (process.stdin.isTTY) {
+      process.stdout.write(`${prompt}: `);
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+
+      let value = "";
+      const onData = (char: Buffer) => {
+        const c = char.toString();
+        if (c === "\n" || c === "\r") {
+          process.stdin.setRawMode(false);
+          process.stdin.removeListener("data", onData);
+          rl.close();
+          process.stdout.write("\n");
+          resolve(value);
+        } else if (c === "\u0003") {
+          // Ctrl+C
+          process.exit(1);
+        } else if (c === "\u007F" || c === "\b") {
+          // Backspace
+          if (value.length > 0) {
+            value = value.slice(0, -1);
+          }
+        } else {
+          value += c;
+        }
+      };
+      process.stdin.on("data", onData);
+    } else {
+      // Non-TTY: just read the line (won't be hidden)
+      rl.question(`${prompt}: `, (answer) => {
+        rl.close();
+        resolve(answer);
+      });
+    }
+  });
+}
+
+/**
+ * Prompt for secret values with hidden input
+ */
+async function promptSecrets(headerNames: string[]): Promise<Map<string, string>> {
+  const secrets = new Map<string, string>();
+  if (headerNames.length === 0) return secrets;
+
+  for (const name of headerNames) {
+    secrets.set(name, await promptSecret(`Enter value for header "${name}"`));
+  }
+  return secrets;
 }
 
 /**
@@ -437,7 +556,11 @@ async function main(): Promise<void> {
   if (values.config) {
     config = loadConfig(values.config);
   } else if (values.base && values.target) {
-    const headers = parseHeaders(values.header as string[] | undefined);
+    const headerStrings = values.header as string[] | undefined;
+    // Prompt for any secret: values before parsing
+    const secretHeaderNames = findSecretHeaders(headerStrings);
+    const secretValues = await promptSecrets(secretHeaderNames);
+    const headers = parseHeaders(headerStrings, secretValues);
     config = {
       base: commandToConfig(values.base, "base"),
       targets: [commandToConfig(values.target, "target", headers)],

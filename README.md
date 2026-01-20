@@ -5,71 +5,11 @@
 [![GitHub release](https://img.shields.io/github/v/release/SamMorrowDrums/mcp-server-diff)](https://github.com/SamMorrowDrums/mcp-server-diff/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Diff [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server **public interfaces**. Available as both a CLI tool and GitHub Action.
+A GitHub Action for diffing [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server **public interfaces** between versions. Compares the current branch against a baseline to surface any changes to your server's exposed tools, resources, prompts, and capabilities.
 
-## CLI Usage
+> **Also available as a standalone CLI** — see [CLI Documentation](#cli-tool) or install with `npx mcp-server-diff`
 
-Compare any two MCP servers directly from your terminal:
-
-```bash
-# Compare two local servers
-npx mcp-server-diff -b "python -m mcp_server" -t "node dist/stdio.js"
-
-# Compare local vs remote HTTP server
-npx mcp-server-diff -b "go run ./cmd/server stdio" -t "https://mcp.example.com/api"
-
-# Compare with different output formats
-npx mcp-server-diff -b "..." -t "..." -o diff      # Raw diff output
-npx mcp-server-diff -b "..." -t "..." -o json      # JSON with full details
-npx mcp-server-diff -b "..." -t "..." -o markdown  # Formatted report
-npx mcp-server-diff -b "..." -t "..." -o summary   # One-line summary (default)
-
-# Use config file for multiple comparisons
-npx mcp-server-diff -c servers.json -o diff
-```
-
-### Config File Format
-
-```json
-{
-  "base": {
-    "name": "python-server",
-    "transport": "stdio",
-    "start_command": "python -m mcp_server"
-  },
-  "targets": [
-    {
-      "name": "typescript-server",
-      "transport": "stdio",
-      "start_command": "node dist/stdio.js"
-    },
-    {
-      "name": "remote-server",
-      "transport": "streamable-http",
-      "server_url": "https://mcp.example.com/api"
-    }
-  ]
-}
-```
-
-### CLI Options
-
-| Option | Description |
-|--------|-------------|
-| `-b, --base` | Base server command (stdio) or URL (http) |
-| `-t, --target` | Target server command (stdio) or URL (http) |
-| `-c, --config` | Config file with base and targets |
-| `-o, --output` | Output format: `diff`, `json`, `markdown`, `summary` |
-| `-v, --verbose` | Verbose output |
-| `-q, --quiet` | Quiet mode (suppress progress, only output result) |
-
----
-
-## GitHub Action
-
-A GitHub Action for diffing MCP server public interfaces between versions. Compares the current branch against a baseline to surface any changes to your server's exposed tools, resources, prompts, and capabilities.
-
-### Overview
+## Overview
 
 MCP servers expose a **public interface** to AI assistants: tools (with their input schemas), resources, prompts, and server capabilities. As your server evolves, changes to this interface are worth tracking. This action automates public interface comparison by:
 
@@ -80,7 +20,7 @@ MCP servers expose a **public interface** to AI assistants: tools (with their in
 
 This is **not** about testing internal logic or correctness—it's about visibility into what your server _advertises_ to clients.
 
-### Quick Start
+## Quick Start
 
 Create `.github/workflows/mcp-diff.yml` in your repository:
 
@@ -558,6 +498,110 @@ jobs:
 - Verify `server_url` matches your server's listen address
 - Ensure the server binds to `0.0.0.0` or `127.0.0.1`, not just `localhost` on some systems
 - Check firewall or container networking if running in Docker
+
+---
+
+## CLI Tool
+
+The CLI lets you diff any two MCP servers directly from your terminal—useful for local development, CI pipelines, or comparing servers across different implementations.
+
+### Installation
+
+```bash
+# Run directly with npx (no install required)
+npx mcp-server-diff --help
+
+# Or install globally
+npm install -g mcp-server-diff
+```
+
+### Basic Usage
+
+```bash
+# Compare two local stdio servers
+npx mcp-server-diff -b "python -m mcp_server" -t "node dist/stdio.js"
+
+# Compare local server vs remote HTTP endpoint
+npx mcp-server-diff -b "go run ./cmd/server stdio" -t "https://mcp.example.com/api"
+
+# Output formats
+npx mcp-server-diff -b "..." -t "..." -o diff      # Raw diff hunks only
+npx mcp-server-diff -b "..." -t "..." -o json      # Full JSON with details
+npx mcp-server-diff -b "..." -t "..." -o markdown  # Formatted report
+npx mcp-server-diff -b "..." -t "..." -o summary   # One-line summary (default)
+```
+
+### HTTP Headers & Authentication
+
+For authenticated HTTP endpoints, pass headers with `-H`:
+
+```bash
+# Direct header value
+npx mcp-server-diff -b "./server" -t "https://api.example.com/mcp" \
+  -H "Authorization: Bearer your-token-here"
+
+# Read from environment variable (keeps secrets out of shell history)
+export MCP_TOKEN="your-secret-token"
+npx mcp-server-diff -b "./server" -t "https://api.example.com/mcp" \
+  -H "Authorization: env:MCP_TOKEN"
+
+# Prompt for secret interactively (hidden input)
+npx mcp-server-diff -b "./server" -t "https://api.example.com/mcp" \
+  -H "Authorization: secret:"
+
+# Multiple headers
+npx mcp-server-diff -b "./server" -t "https://api.example.com/mcp" \
+  -H "Authorization: env:TOKEN" -H "X-Custom-Header: value"
+```
+
+### Config File
+
+For complex comparisons or multiple targets, use a config file:
+
+```bash
+npx mcp-server-diff -c servers.json -o diff
+```
+
+```json
+{
+  "base": {
+    "name": "python-server",
+    "transport": "stdio",
+    "start_command": "python -m mcp_server"
+  },
+  "targets": [
+    {
+      "name": "typescript-server",
+      "transport": "stdio",
+      "start_command": "node dist/stdio.js"
+    },
+    {
+      "name": "remote-server",
+      "transport": "streamable-http",
+      "server_url": "https://mcp.example.com/api",
+      "headers": {
+        "Authorization": "Bearer token"
+      }
+    }
+  ]
+}
+```
+
+### CLI Options Reference
+
+| Option | Description |
+|--------|-------------|
+| `-b, --base <cmd\|url>` | Base server command (stdio) or URL (http) |
+| `-t, --target <cmd\|url>` | Target server command (stdio) or URL (http) |
+| `-H, --header <header>` | HTTP header (repeatable). Use `env:VAR` or `secret:` for values |
+| `-c, --config <file>` | Config file with base and targets |
+| `-o, --output <format>` | Output: `diff`, `json`, `markdown`, `summary` (default) |
+| `-v, --verbose` | Verbose output |
+| `-q, --quiet` | Quiet mode (only output result) |
+| `-h, --help` | Show help |
+| `--version` | Show version |
+
+---
 
 ## License
 

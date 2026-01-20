@@ -1,11 +1,16 @@
 {
   "name": "mcp-server-diff",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "description": "Diff MCP server public interfaces - CLI tool and GitHub Action",
   "main": "dist/index.js",
   "bin": {
     "mcp-server-diff": "dist/cli/index.js"
   },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
   "type": "module",
   "scripts": {
     "build": "npm run build:action && npm run build:cli",
