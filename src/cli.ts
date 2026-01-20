@@ -74,7 +74,7 @@ OPTIONS:
   -b, --base <command>     Base server command (stdio) or URL (http)
   -t, --target <command>   Target server command (stdio) or URL (http)
   -c, --config <file>      Config file with base and targets
-  -o, --output <format>    Output format: json, markdown, summary (default: summary)
+  -o, --output <format>    Output format: diff, json, markdown, summary (default: summary)
   -v, --verbose            Verbose output
   -q, --quiet              Quiet mode (only output diffs)
   -h, --help               Show this help
@@ -97,6 +97,7 @@ CONFIG FILE FORMAT:
   }
 
 OUTPUT FORMATS:
+  diff      - Raw diff output only
   summary   - One line per comparison (default)
   json      - Raw JSON with full diff details
   markdown  - Formatted markdown report
@@ -250,6 +251,24 @@ async function runComparisons(config: DiffConfig): Promise<ComparisonResult[]> {
 }
 
 /**
+ * Output raw diff only
+ */
+function outputDiff(results: ComparisonResult[]): void {
+  for (const result of results) {
+    if (result.diffs.length > 0) {
+      if (results.length > 1) {
+        console.log(`# ${result.target}`);
+      }
+      for (const { endpoint, diff } of result.diffs) {
+        console.log(`## ${endpoint}`);
+        console.log(diff);
+        console.log("");
+      }
+    }
+  }
+}
+
+/**
  * Output results in summary format
  */
 function outputSummary(results: ComparisonResult[]): void {
@@ -369,7 +388,7 @@ async function main(): Promise<void> {
   }
 
   if (values.version) {
-    console.log("mcp-server-diff v2.1.0");
+    console.log("mcp-server-diff v2.1.1");
     process.exit(0);
   }
 
@@ -399,6 +418,9 @@ async function main(): Promise<void> {
 
   const outputFormat = values.output || "summary";
   switch (outputFormat) {
+    case "diff":
+      outputDiff(results);
+      break;
     case "json":
       outputJson(results);
       break;

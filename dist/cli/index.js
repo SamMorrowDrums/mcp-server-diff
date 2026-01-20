@@ -56867,7 +56867,7 @@ OPTIONS:
   -b, --base <command>     Base server command (stdio) or URL (http)
   -t, --target <command>   Target server command (stdio) or URL (http)
   -c, --config <file>      Config file with base and targets
-  -o, --output <format>    Output format: json, markdown, summary (default: summary)
+  -o, --output <format>    Output format: diff, json, markdown, summary (default: summary)
   -v, --verbose            Verbose output
   -q, --quiet              Quiet mode (only output diffs)
   -h, --help               Show this help
@@ -56890,6 +56890,7 @@ CONFIG FILE FORMAT:
   }
 
 OUTPUT FORMATS:
+  diff      - Raw diff output only
   summary   - One line per comparison (default)
   json      - Raw JSON with full diff details
   markdown  - Formatted markdown report
@@ -57028,6 +57029,23 @@ async function runComparisons(config) {
     return results;
 }
 /**
+ * Output raw diff only
+ */
+function outputDiff(results) {
+    for (const result of results) {
+        if (result.diffs.length > 0) {
+            if (results.length > 1) {
+                console.log(`# ${result.target}`);
+            }
+            for (const { endpoint, diff } of result.diffs) {
+                console.log(`## ${endpoint}`);
+                console.log(diff);
+                console.log("");
+            }
+        }
+    }
+}
+/**
  * Output results in summary format
  */
 function outputSummary(results) {
@@ -57133,7 +57151,7 @@ async function main() {
         process.exit(0);
     }
     if (values.version) {
-        console.log("mcp-server-diff v2.1.0");
+        console.log("mcp-server-diff v2.1.1");
         process.exit(0);
     }
     // Set up logger - CLI uses console logger by default
@@ -57161,6 +57179,9 @@ async function main() {
     const results = await runComparisons(config);
     const outputFormat = values.output || "summary";
     switch (outputFormat) {
+        case "diff":
+            outputDiff(results);
+            break;
         case "json":
             outputJson(results);
             break;
