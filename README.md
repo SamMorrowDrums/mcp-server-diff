@@ -595,8 +595,8 @@ npx mcp-server-diff -c servers.json -o diff
 | `-b, --base <cmd\|url>` | Base server command (stdio) or URL (http) |
 | `-t, --target <cmd\|url>` | Target server command (stdio) or URL (http) |
 | `-H, --header <header>` | HTTP header for target (repeatable) |
-| `--base-header <header>` | HTTP header for base server (repeatable) |
-| `--target-header <header>` | HTTP header for target (same as `-H`) |
+| `-B, --base-header <header>` | HTTP header for base server (repeatable) |
+| `-T, --target-header <header>` | HTTP header for target (same as `-H`) |
 | `-c, --config <file>` | Config file with base and targets |
 | `-o, --output <format>` | Output: `diff`, `json`, `markdown`, `summary` (default) |
 | `-v, --verbose` | Verbose output |

@@ -56870,8 +56870,8 @@ function parseCliArgs() {
             base: { type: "string", short: "b" },
             target: { type: "string", short: "t" },
             header: { type: "string", short: "H", multiple: true },
-            "base-header": { type: "string", multiple: true },
-            "target-header": { type: "string", multiple: true },
+            "base-header": { type: "string", short: "B", multiple: true },
+            "target-header": { type: "string", short: "T", multiple: true },
             config: { type: "string", short: "c" },
             output: { type: "string", short: "o", default: "summary" },
             verbose: { type: "boolean", short: "v", default: false },
@@ -56900,8 +56900,8 @@ OPTIONS:
   -b, --base <command>       Base server command (stdio) or URL (http)
   -t, --target <command>     Target server command (stdio) or URL (http)
   -H, --header <header>      HTTP header for target (repeatable)
-      --base-header <header> HTTP header for base server (repeatable)
-      --target-header <hdr>  HTTP header for target server (repeatable, same as -H)
+  -B, --base-header <header> HTTP header for base server (repeatable)
+  -T, --target-header <hdr>  HTTP header for target server (repeatable, same as -H)
                              Values support: env:VAR_NAME, secret:name, "Bearer secret:token"
   -c, --config <file>        Config file with base and targets
   -o, --output <format>      Output format: diff, json, markdown, summary (default: summary)
