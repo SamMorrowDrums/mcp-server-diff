@@ -57060,44 +57060,46 @@ function findSecrets(headerStrings) {
  */
 async function promptSecret(prompt) {
     return new Promise((resolve) => {
-        const rl = external_readline_namespaceObject.createInterface({
-            input: process.stdin,
-            output: process.stdout,
-        });
+        process.stdout.write(`${prompt}: `);
         // Hide input by using raw mode if available
-        if (process.stdin.isTTY) {
-            process.stdout.write(`${prompt}: `);
+        if (process.stdin.isTTY && process.stdin.setRawMode) {
             process.stdin.setRawMode(true);
             process.stdin.resume();
+            process.stdin.setEncoding("utf8");
             let value = "";
             const onData = (char) => {
-                const c = char.toString();
-                if (c === "\n" || c === "\r") {
+                if (char === "\n" || char === "\r" || char === "\u0004") {
                     process.stdin.setRawMode(false);
+                    process.stdin.pause();
                     process.stdin.removeListener("data", onData);
-                    rl.close();
                     process.stdout.write("\n");
                     resolve(value);
                 }
-                else if (c === "\u0003") {
+                else if (char === "\u0003") {
                     // Ctrl+C
+                    process.stdin.setRawMode(false);
+                    process.stdout.write("\n");
                     process.exit(1);
                 }
-                else if (c === "\u007F" || c === "\b") {
+                else if (char === "\u007F" || char === "\b") {
                     // Backspace
                     if (value.length > 0) {
                         value = value.slice(0, -1);
                     }
                 }
                 else {
-                    value += c;
+                    value += char;
                 }
             };
             process.stdin.on("data", onData);
         }
         else {
-            // Non-TTY: just read the line (won't be hidden)
-            rl.question(`${prompt}: `, (answer) => {
+            // Non-TTY: use readline (won't be hidden)
+            const rl = external_readline_namespaceObject.createInterface({
+                input: process.stdin,
+                output: process.stdout,
+            });
+            rl.question("", (answer) => {
                 rl.close();
                 resolve(answer);
             });
