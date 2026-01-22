@@ -138,6 +138,21 @@ outputs:
   report_path:
     description: 'Path to the diff report'
     value: 'mcp-diff-report/MCP_DIFF_REPORT.md'
+  json_report_path:
+    description: 'Path to the JSON report'
+    value: ${{ steps.diff.outputs.json_report_path }}
+  has_differences:
+    description: 'Whether any differences were detected (true/false)'
+    value: ${{ steps.diff.outputs.has_differences }}
+  passed_count:
+    description: 'Number of configurations that passed (no differences)'
+    value: ${{ steps.diff.outputs.passed_count }}
+  diff_count:
+    description: 'Number of configurations with differences'
+    value: ${{ steps.diff.outputs.diff_count }}
+  total_configs:
+    description: 'Total number of configurations tested'
+    value: ${{ steps.diff.outputs.total_configs }}
 
 runs:
   using: 'composite'

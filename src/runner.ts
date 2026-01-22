@@ -288,6 +288,8 @@ async function runPostTestCommand(config: TestConfiguration, workDir: string): P
 /**
  * Probe a server with a specific configuration
  * @param useSharedServer - If true, skip starting per-config HTTP server (shared server is already running)
+ * @param overrideCommand - If provided, use this command instead of config.start_command (for base_start_command)
+ * @param overrideUrl - If provided, use this URL instead of config.server_url (for base_server_url)
  */
 async function probeWithConfig(
   config: TestConfiguration,
@@ -295,7 +297,9 @@ async function probeWithConfig(
   globalEnvVars: Record<string, string>,
   globalHeaders: Record<string, string>,
   globalCustomMessages: CustomMessage[],
-  useSharedServer: boolean = false
+  useSharedServer: boolean = false,
+  overrideCommand?: string,
+  overrideUrl?: string
 ): Promise<ProbeResult> {
   const configEnvVars = parseEnvVars(config.env_vars);
   const envVars = { ...globalEnvVars, ...configEnvVars };
@@ -306,13 +310,13 @@ async function probeWithConfig(
   await runPreTestCommand(config, workDir);
 
   if (config.transport === "stdio") {
-    const command = config.start_command || "";
+    const command = overrideCommand || config.start_command || "";
     const parts = command.split(/\s+/);
     const cmd = parts[0];
     const args = parts.slice(1);
 
-    // Also parse additional args if provided
-    if (config.args) {
+    // Also parse additional args if provided (only when not using override)
+    if (!overrideCommand && config.args) {
       args.push(...config.args.split(/\s+/));
     }
 
@@ -328,14 +332,18 @@ async function probeWithConfig(
     // For HTTP transport, optionally start the server if start_command is provided
     // Skip if using shared server
     let serverProcess: ChildProcess | null = null;
+    const serverUrl = overrideUrl || config.server_url;
     try {
-      if (config.start_command && !useSharedServer) {
-        serverProcess = await startHttpServer(config, workDir, envVars);
+      const startCmd = overrideCommand || config.start_command;
+      if (startCmd && !useSharedServer) {
+        // Create a temporary config for the override
+        const tempConfig = { ...config, start_command: startCmd };
+        serverProcess = await startHttpServer(tempConfig, workDir, envVars);
       }
 
       return await probeServer({
         transport: "streamable-http",
-        url: config.server_url,
+        url: serverUrl,
         headers,
         envVars,
         customMessages,
@@ -655,6 +663,8 @@ async function startSharedHttpServer(
 
 /**
  * Probe a single configuration (without comparison)
+ * @param overrideCommand - If provided, use this command instead of config.start_command
+ * @param overrideUrl - If provided, use this URL instead of config.server_url
  */
 async function probeConfig(
   config: TestConfiguration,
@@ -662,9 +672,14 @@ async function probeConfig(
   envVars: Record<string, string>,
   headers: Record<string, string>,
   customMessages: CustomMessage[],
-  useSharedServer: boolean
+  useSharedServer: boolean,
+  overrideCommand?: string,
+  overrideUrl?: string
 ): Promise<{ result: ProbeResult; time: number }> {
-  core.info(`  📋 Probing: ${config.name} (${config.transport})`);
+  const displayName = overrideCommand
+    ? `${config.name} (base: ${overrideCommand.slice(0, 50)}${overrideCommand.length > 50 ? "..." : ""})`
+    : config.name;
+  core.info(`  📋 Probing: ${displayName} (${config.transport})`);
   const start = Date.now();
   let result: ProbeResult;
   try {
@@ -674,7 +689,9 @@ async function probeConfig(
       envVars,
       headers,
       customMessages,
-      useSharedServer
+      useSharedServer,
+      overrideCommand,
+      overrideUrl
     );
   } finally {
     await runPostTestCommand(config, workDir);
@@ -734,6 +751,7 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
         branchResults.set(config.name, {
           result: {
             initialize: null,
+            instructions: null,
             tools: null,
             prompts: null,
             resources: null,
@@ -754,79 +772,126 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
   }
 
   // ========================================
-  // PHASE 2: Probe all configs on base ref
+  // PHASE 2: Probe all configs for base comparison
   // ========================================
-  core.info(`\n🔄 Phase 2: Testing comparison ref: ${ctx.compareRef}...`);
+  // Split configs: those with base_start_command use direct probing,
+  // those without need git checkout/worktree
+  const configsWithBaseCommand = ctx.inputs.configurations.filter((c) => c.base_start_command);
+  const configsNeedingGit = ctx.inputs.configurations.filter((c) => !c.base_start_command);
 
-  const worktreePath = path.join(ctx.workDir, ".mcp-diff-base");
-  let useWorktree = false;
+  // PHASE 2a: Probe configs with base_start_command directly (no git operations)
+  if (configsWithBaseCommand.length > 0) {
+    core.info(`\n🔄 Phase 2a: Testing ${configsWithBaseCommand.length} config(s) with explicit base commands...`);
 
-  try {
-    // Set up comparison ref
-    useWorktree = await createWorktree(ctx.compareRef, worktreePath);
-    if (!useWorktree) {
-      core.info("  Worktree not available, using checkout");
-      await checkout(ctx.compareRef);
-    }
-
-    const baseWorkDir = useWorktree ? worktreePath : ctx.workDir;
-
-    // Build on base
-    core.info("🔨 Building on comparison ref...");
-    await runBuild(baseWorkDir, ctx.inputs);
-
-    let baseServerProcess: ChildProcess | null = null;
-    try {
-      // Start HTTP server for base ref if needed
-      if (useSharedServer) {
-        baseServerProcess = await startSharedHttpServer(
-          httpStartCommand,
-          baseWorkDir,
-          httpStartupWaitMs,
-          globalEnvVars
+    for (const config of configsWithBaseCommand) {
+      try {
+        // Use base_start_command/base_server_url for comparison
+        const probeData = await probeConfig(
+          config,
+          ctx.workDir, // Use current workdir since we're not checking out
+          globalEnvVars,
+          globalHeaders,
+          globalCustomMessages,
+          false, // Don't use shared server for base commands
+          config.base_start_command,
+          config.base_server_url
         );
+        baseResults.set(config.name, probeData);
+      } catch (error) {
+        core.error(`Failed to probe ${config.name} with base command: ${error}`);
+        baseResults.set(config.name, {
+          result: {
+            initialize: null,
+            instructions: null,
+            tools: null,
+            prompts: null,
+            resources: null,
+            resourceTemplates: null,
+            customResponses: new Map(),
+            error: String(error),
+          },
+          time: 0,
+        });
+      }
+    }
+  }
+
+  // PHASE 2b: Probe configs needing git checkout
+  if (configsNeedingGit.length > 0) {
+    core.info(`\n🔄 Phase 2b: Testing comparison ref: ${ctx.compareRef}...`);
+
+    const worktreePath = path.join(ctx.workDir, ".mcp-diff-base");
+    let useWorktree = false;
+
+    try {
+      // Set up comparison ref
+      useWorktree = await createWorktree(ctx.compareRef, worktreePath);
+      if (!useWorktree) {
+        core.info("  Worktree not available, using checkout");
+        await checkout(ctx.compareRef);
       }
 
-      for (const config of ctx.inputs.configurations) {
-        const configUsesSharedServer = useSharedServer && config.transport === "streamable-http";
-        try {
-          const probeData = await probeConfig(
-            config,
+      const baseWorkDir = useWorktree ? worktreePath : ctx.workDir;
+
+      // Build on base
+      core.info("🔨 Building on comparison ref...");
+      await runBuild(baseWorkDir, ctx.inputs);
+
+      let baseServerProcess: ChildProcess | null = null;
+      try {
+        // Start HTTP server for base ref if needed
+        if (useSharedServer) {
+          baseServerProcess = await startSharedHttpServer(
+            httpStartCommand,
             baseWorkDir,
-            globalEnvVars,
-            globalHeaders,
-            globalCustomMessages,
-            configUsesSharedServer
+            httpStartupWaitMs,
+            globalEnvVars
           );
-          baseResults.set(config.name, probeData);
-        } catch (error) {
-          core.error(`Failed to probe ${config.name} on base ref: ${error}`);
-          baseResults.set(config.name, {
-            result: {
-              initialize: null,
-              tools: null,
-              prompts: null,
-              resources: null,
-              resourceTemplates: null,
-              customResponses: new Map(),
-              error: String(error),
-            },
-            time: 0,
-          });
+        }
+
+        for (const config of configsNeedingGit) {
+          const configUsesSharedServer =
+            useSharedServer && config.transport === "streamable-http";
+          try {
+            const probeData = await probeConfig(
+              config,
+              baseWorkDir,
+              globalEnvVars,
+              globalHeaders,
+              globalCustomMessages,
+              configUsesSharedServer
+            );
+            baseResults.set(config.name, probeData);
+          } catch (error) {
+            core.error(`Failed to probe ${config.name} on base ref: ${error}`);
+            baseResults.set(config.name, {
+              result: {
+                initialize: null,
+                instructions: null,
+                tools: null,
+                prompts: null,
+                resources: null,
+                resourceTemplates: null,
+                customResponses: new Map(),
+                error: String(error),
+              },
+              time: 0,
+            });
+          }
+        }
+      } finally {
+        if (baseServerProcess) {
+          core.info("🛑 Stopping base ref HTTP server...");
+          stopHttpServer(baseServerProcess);
         }
       }
     } finally {
-      if (baseServerProcess) {
-        core.info("🛑 Stopping base ref HTTP server...");
-        stopHttpServer(baseServerProcess);
+      // Clean up
+      if (useWorktree) {
+        await removeWorktree(worktreePath);
+      } else {
+        await checkoutPrevious();
       }
-    }
-  } finally {
-    // Clean up
-    if (useWorktree) {
-      await removeWorktree(worktreePath);
-    } else {
-      await checkoutPrevious();
     }
   }
 

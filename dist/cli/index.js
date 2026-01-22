@@ -56368,6 +56368,7 @@ function isMethodNotFound(error) {
 async function probeServer(options) {
     const result = {
         initialize: null,
+        instructions: null,
         tools: null,
         prompts: null,
         resources: null,
@@ -56426,6 +56427,12 @@ async function probeServer(options) {
             serverInfo,
             capabilities: serverCapabilities,
         };
+        // Get server instructions
+        const instructions = client.getInstructions();
+        if (instructions) {
+            result.instructions = instructions;
+            log.info(`  Got server instructions (${instructions.length} chars)`);
+        }
         // Probe tools if supported
         if (serverCapabilities?.tools) {
             try {
@@ -56622,6 +56629,9 @@ function probeResultToFiles(result) {
     const files = new Map();
     if (result.initialize) {
         files.set("initialize", JSON.stringify(normalizeProbeResult(result.initialize), null, 2));
+    }
+    if (result.instructions) {
+        files.set("instructions", result.instructions);
     }
     if (result.tools) {
         files.set("tools", JSON.stringify(normalizeProbeResult(result.tools), null, 2));

@@ -172,6 +172,7 @@ export function saveReport(report: ConformanceReport, markdown: string, outputDi
     fs.appendFileSync(githubOutput, `has_differences=${report.diffCount > 0}\n`);
     fs.appendFileSync(githubOutput, `passed_count=${report.passedCount}\n`);
     fs.appendFileSync(githubOutput, `diff_count=${report.diffCount}\n`);
+    fs.appendFileSync(githubOutput, `total_configs=${report.results.length}\n`);
   }
 
   // Also set via core for compatibility
@@ -180,6 +181,7 @@ export function saveReport(report: ConformanceReport, markdown: string, outputDi
   core.setOutput("has_differences", report.diffCount > 0);
   core.setOutput("passed_count", report.passedCount);
   core.setOutput("diff_count", report.diffCount);
+  core.setOutput("total_configs", report.results.length);
 }
 
 /**

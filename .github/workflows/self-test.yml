@@ -1,0 +1,64 @@
+name: Self Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pull GitHub MCP Server images
+        run: |
+          docker pull ghcr.io/github/github-mcp-server:v0.26.0
+          docker pull ghcr.io/github/github-mcp-server:v0.29.0
+
+      - name: Run MCP Conformance Action (self-test)
+        id: conformance
+        uses: ./
+        with:
+          transport: stdio
+          configurations: |
+            [
+              {
+                "name": "github-mcp-server-versions",
+                "start_command": "docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server:v0.29.0",
+                "base_start_command": "docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server:v0.26.0"
+              }
+            ]
+          fail_on_error: true
+          fail_on_diff: false
+
+      - name: Verify diff was detected
+        run: |
+          DIFF_COUNT="${{ steps.conformance.outputs.diff_count }}"
+          if [ "$DIFF_COUNT" = "0" ]; then
+            echo "❌ Expected diffs between v0.26.0 and v0.29.0 but found none!"
+            echo "This suggests the action may not be working correctly."
+            exit 1
+          fi
+          echo "✅ Detected $DIFF_COUNT configuration(s) with differences (expected)"
+
+      - name: Show test results
+        run: |
+          echo "## Self-Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Configurations tested:** ${{ steps.conformance.outputs.total_configs }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Configurations with diffs:** ${{ steps.conformance.outputs.diff_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Passed (no unexpected errors):** ${{ steps.conformance.outputs.passed_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Testing GitHub MCP Server v0.26.0 vs v0.29.0 to verify diff detection." >> $GITHUB_STEP_SUMMARY

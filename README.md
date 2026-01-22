@@ -223,6 +223,46 @@ When using `configurations`, each object supports:
 | `headers` | HTTP headers for this configuration | No |
 | `env_vars` | Additional environment variables | No |
 | `custom_messages` | Config-specific custom messages | No |
+| `base_start_command` | Command for baseline comparison (skips git checkout for this config) | No |
+| `base_server_url` | URL for baseline HTTP server (used with `base_start_command`) | No |
+
+### Comparing Against External Servers
+
+When comparing against external servers (e.g., Docker images, remote services), use `base_start_command` to specify a different command for the baseline. This skips git checkout for that configuration and probes the specified server directly:
+
+```yaml
+configurations: |
+  [
+    {
+      "name": "compare-versions",
+      "transport": "stdio",
+      "start_command": "docker run -i ghcr.io/example/mcp-server:v2.0.0",
+      "base_start_command": "docker run -i ghcr.io/example/mcp-server:v1.0.0"
+    }
+  ]
+```
+
+This is useful for:
+- **Version comparison**: Compare a new release against the previous version
+- **Golden reference testing**: Compare your local code against a known-good reference
+- **Cross-implementation testing**: Compare different implementations of the same server
+- **Self-testing CI**: Verify the action detects diffs by comparing two known-different servers
+
+For HTTP transport, use `base_server_url` alongside `base_start_command`:
+
+```yaml
+configurations: |
+  [
+    {
+      "name": "http-comparison",
+      "transport": "streamable-http",
+      "start_command": "docker run -p 3000:3000 myserver:latest",
+      "server_url": "http://localhost:3000/mcp",
+      "base_start_command": "docker run -p 3001:3000 myserver:v1.0.0",
+      "base_server_url": "http://localhost:3001/mcp"
+    }
+  ]
+```
 
 ## How It Works
 

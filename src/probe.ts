@@ -44,6 +44,7 @@ function isMethodNotFound(error: unknown): boolean {
 export async function probeServer(options: ProbeOptions): Promise<ProbeResult> {
   const result: ProbeResult = {
     initialize: null,
+    instructions: null,
     tools: null,
     prompts: null,
     resources: null,
@@ -114,6 +115,13 @@ export async function probeServer(options: ProbeOptions): Promise<ProbeResult> {
       serverInfo,
       capabilities: serverCapabilities,
     } as InitializeInfo;
+
+    // Get server instructions
+    const instructions = client.getInstructions();
+    if (instructions) {
+      result.instructions = instructions;
+      log.info(`  Got server instructions (${instructions.length} chars)`);
+    }
 
     // Probe tools if supported
     if (serverCapabilities?.tools) {
@@ -326,6 +334,9 @@ export function probeResultToFiles(result: ProbeResult): Map<string, string> {
 
   if (result.initialize) {
     files.set("initialize", JSON.stringify(normalizeProbeResult(result.initialize), null, 2));
+  }
+  if (result.instructions) {
+    files.set("instructions", result.instructions);
   }
   if (result.tools) {
     files.set("tools", JSON.stringify(normalizeProbeResult(result.tools), null, 2));

@@ -18,6 +18,14 @@ export interface TestConfiguration {
     startup_wait_ms?: number;
     /** Command to run after stopping the MCP server for this config (cleanup) */
     post_test_command?: string;
+    /**
+     * Command to use for the base/comparison server instead of checking out a git ref.
+     * When set, skips git operations and uses this command directly for comparison.
+     * Useful for comparing against external servers (e.g., docker images of previous releases).
+     */
+    base_start_command?: string;
+    /** Server URL for base comparison (for HTTP transport with base_start_command) */
+    base_server_url?: string;
 }
 export interface CustomMessage {
     id: number;
@@ -53,6 +61,7 @@ export interface ActionInputs {
 }
 export interface ProbeResult {
     initialize: InitializeInfo | null;
+    instructions: string | null;
     tools: ToolsResult | null;
     prompts: PromptsResult | null;
     resources: ResourcesResult | null;

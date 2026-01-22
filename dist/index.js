@@ -56618,6 +56618,7 @@ function isMethodNotFound(error) {
 async function probeServer(options) {
     const result = {
         initialize: null,
+        instructions: null,
         tools: null,
         prompts: null,
         resources: null,
@@ -56676,6 +56677,12 @@ async function probeServer(options) {
             serverInfo,
             capabilities: serverCapabilities,
         };
+        // Get server instructions
+        const instructions = client.getInstructions();
+        if (instructions) {
+            result.instructions = instructions;
+            log.info(`  Got server instructions (${instructions.length} chars)`);
+        }
         // Probe tools if supported
         if (serverCapabilities?.tools) {
             try {
@@ -56872,6 +56879,9 @@ function probeResultToFiles(result) {
     const files = new Map();
     if (result.initialize) {
         files.set("initialize", JSON.stringify(normalizeProbeResult(result.initialize), null, 2));
+    }
+    if (result.instructions) {
+        files.set("instructions", result.instructions);
     }
     if (result.tools) {
         files.set("tools", JSON.stringify(normalizeProbeResult(result.tools), null, 2));
@@ -57133,8 +57143,10 @@ async function runPostTestCommand(config, workDir) {
 /**
  * Probe a server with a specific configuration
  * @param useSharedServer - If true, skip starting per-config HTTP server (shared server is already running)
+ * @param overrideCommand - If provided, use this command instead of config.start_command (for base_start_command)
+ * @param overrideUrl - If provided, use this URL instead of config.server_url (for base_server_url)
  */
-async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, globalCustomMessages, useSharedServer = false) {
+async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, globalCustomMessages, useSharedServer = false, overrideCommand, overrideUrl) {
     const configEnvVars = parseEnvVars(config.env_vars);
     const envVars = { ...globalEnvVars, ...configEnvVars };
     const headers = { ...globalHeaders, ...config.headers };
@@ -57142,12 +57154,12 @@ async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, gl
     // Run pre-test command before probing
     await runPreTestCommand(config, workDir);
     if (config.transport === "stdio") {
-        const command = config.start_command || "";
+        const command = overrideCommand || config.start_command || "";
         const parts = command.split(/\s+/);
         const cmd = parts[0];
         const args = parts.slice(1);
-        // Also parse additional args if provided
-        if (config.args) {
+        // Also parse additional args if provided (only when not using override)
+        if (!overrideCommand && config.args) {
             args.push(...config.args.split(/\s+/));
         }
         return await probeServer({
@@ -57163,13 +57175,17 @@ async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, gl
         // For HTTP transport, optionally start the server if start_command is provided
         // Skip if using shared server
         let serverProcess = null;
+        const serverUrl = overrideUrl || config.server_url;
         try {
-            if (config.start_command && !useSharedServer) {
-                serverProcess = await startHttpServer(config, workDir, envVars);
+            const startCmd = overrideCommand || config.start_command;
+            if (startCmd && !useSharedServer) {
+                // Create a temporary config for the override
+                const tempConfig = { ...config, start_command: startCmd };
+                serverProcess = await startHttpServer(tempConfig, workDir, envVars);
             }
             return await probeServer({
                 transport: "streamable-http",
-                url: config.server_url,
+                url: serverUrl,
                 headers,
                 envVars,
                 customMessages,
@@ -57442,13 +57458,18 @@ async function startSharedHttpServer(command, workDir, waitMs, envVars) {
 }
 /**
  * Probe a single configuration (without comparison)
+ * @param overrideCommand - If provided, use this command instead of config.start_command
+ * @param overrideUrl - If provided, use this URL instead of config.server_url
  */
-async function probeConfig(config, workDir, envVars, headers, customMessages, useSharedServer) {
-    lib_core.info(`  📋 Probing: ${config.name} (${config.transport})`);
+async function probeConfig(config, workDir, envVars, headers, customMessages, useSharedServer, overrideCommand, overrideUrl) {
+    const displayName = overrideCommand
+        ? `${config.name} (base: ${overrideCommand.slice(0, 50)}${overrideCommand.length > 50 ? "..." : ""})`
+        : config.name;
+    lib_core.info(`  📋 Probing: ${displayName} (${config.transport})`);
     const start = Date.now();
     let result;
     try {
-        result = await probeWithConfig(config, workDir, envVars, headers, customMessages, useSharedServer);
+        result = await probeWithConfig(config, workDir, envVars, headers, customMessages, useSharedServer, overrideCommand, overrideUrl);
     }
     finally {
         await runPostTestCommand(config, workDir);
@@ -57491,6 +57512,7 @@ async function runAllTests(ctx) {
                 branchResults.set(config.name, {
                     result: {
                         initialize: null,
+                        instructions: null,
                         tools: null,
                         prompts: null,
                         resources: null,
@@ -57511,65 +57533,102 @@ async function runAllTests(ctx) {
         }
     }
     // ========================================
-    // PHASE 2: Probe all configs on base ref
+    // PHASE 2: Probe all configs for base comparison
     // ========================================
-    lib_core.info(`\n🔄 Phase 2: Testing comparison ref: ${ctx.compareRef}...`);
-    const worktreePath = external_path_.join(ctx.workDir, ".mcp-diff-base");
-    let useWorktree = false;
-    try {
-        // Set up comparison ref
-        useWorktree = await createWorktree(ctx.compareRef, worktreePath);
-        if (!useWorktree) {
-            lib_core.info("  Worktree not available, using checkout");
-            await checkout(ctx.compareRef);
-        }
-        const baseWorkDir = useWorktree ? worktreePath : ctx.workDir;
-        // Build on base
-        lib_core.info("🔨 Building on comparison ref...");
-        await runBuild(baseWorkDir, ctx.inputs);
-        let baseServerProcess = null;
-        try {
-            // Start HTTP server for base ref if needed
-            if (useSharedServer) {
-                baseServerProcess = await startSharedHttpServer(httpStartCommand, baseWorkDir, httpStartupWaitMs, globalEnvVars);
+    // Split configs: those with base_start_command use direct probing,
+    // those without need git checkout/worktree
+    const configsWithBaseCommand = ctx.inputs.configurations.filter((c) => c.base_start_command);
+    const configsNeedingGit = ctx.inputs.configurations.filter((c) => !c.base_start_command);
+    // PHASE 2a: Probe configs with base_start_command directly (no git operations)
+    if (configsWithBaseCommand.length > 0) {
+        lib_core.info(`\n🔄 Phase 2a: Testing ${configsWithBaseCommand.length} config(s) with explicit base commands...`);
+        for (const config of configsWithBaseCommand) {
+            try {
+                // Use base_start_command/base_server_url for comparison
+                const probeData = await probeConfig(config, ctx.workDir, // Use current workdir since we're not checking out
+                globalEnvVars, globalHeaders, globalCustomMessages, false, // Don't use shared server for base commands
+                config.base_start_command, config.base_server_url);
+                baseResults.set(config.name, probeData);
             }
-            for (const config of ctx.inputs.configurations) {
-                const configUsesSharedServer = useSharedServer && config.transport === "streamable-http";
-                try {
-                    const probeData = await probeConfig(config, baseWorkDir, globalEnvVars, globalHeaders, globalCustomMessages, configUsesSharedServer);
-                    baseResults.set(config.name, probeData);
+            catch (error) {
+                lib_core.error(`Failed to probe ${config.name} with base command: ${error}`);
+                baseResults.set(config.name, {
+                    result: {
+                        initialize: null,
+                        instructions: null,
+                        tools: null,
+                        prompts: null,
+                        resources: null,
+                        resourceTemplates: null,
+                        customResponses: new Map(),
+                        error: String(error),
+                    },
+                    time: 0,
+                });
+            }
+        }
+    }
+    // PHASE 2b: Probe configs needing git checkout
+    if (configsNeedingGit.length > 0) {
+        lib_core.info(`\n🔄 Phase 2b: Testing comparison ref: ${ctx.compareRef}...`);
+        const worktreePath = external_path_.join(ctx.workDir, ".mcp-diff-base");
+        let useWorktree = false;
+        try {
+            // Set up comparison ref
+            useWorktree = await createWorktree(ctx.compareRef, worktreePath);
+            if (!useWorktree) {
+                lib_core.info("  Worktree not available, using checkout");
+                await checkout(ctx.compareRef);
+            }
+            const baseWorkDir = useWorktree ? worktreePath : ctx.workDir;
+            // Build on base
+            lib_core.info("🔨 Building on comparison ref...");
+            await runBuild(baseWorkDir, ctx.inputs);
+            let baseServerProcess = null;
+            try {
+                // Start HTTP server for base ref if needed
+                if (useSharedServer) {
+                    baseServerProcess = await startSharedHttpServer(httpStartCommand, baseWorkDir, httpStartupWaitMs, globalEnvVars);
                 }
-                catch (error) {
-                    lib_core.error(`Failed to probe ${config.name} on base ref: ${error}`);
-                    baseResults.set(config.name, {
-                        result: {
-                            initialize: null,
-                            tools: null,
-                            prompts: null,
-                            resources: null,
-                            resourceTemplates: null,
-                            customResponses: new Map(),
-                            error: String(error),
-                        },
-                        time: 0,
-                    });
+                for (const config of configsNeedingGit) {
+                    const configUsesSharedServer = useSharedServer && config.transport === "streamable-http";
+                    try {
+                        const probeData = await probeConfig(config, baseWorkDir, globalEnvVars, globalHeaders, globalCustomMessages, configUsesSharedServer);
+                        baseResults.set(config.name, probeData);
+                    }
+                    catch (error) {
+                        lib_core.error(`Failed to probe ${config.name} on base ref: ${error}`);
+                        baseResults.set(config.name, {
+                            result: {
+                                initialize: null,
+                                instructions: null,
+                                tools: null,
+                                prompts: null,
+                                resources: null,
+                                resourceTemplates: null,
+                                customResponses: new Map(),
+                                error: String(error),
+                            },
+                            time: 0,
+                        });
+                    }
+                }
+            }
+            finally {
+                if (baseServerProcess) {
+                    lib_core.info("🛑 Stopping base ref HTTP server...");
+                    stopHttpServer(baseServerProcess);
                 }
             }
         }
         finally {
-            if (baseServerProcess) {
-                lib_core.info("🛑 Stopping base ref HTTP server...");
-                stopHttpServer(baseServerProcess);
+            // Clean up
+            if (useWorktree) {
+                await removeWorktree(worktreePath);
             }
-        }
-    }
-    finally {
-        // Clean up
-        if (useWorktree) {
-            await removeWorktree(worktreePath);
-        }
-        else {
-            await checkoutPrevious();
+            else {
+                await checkoutPrevious();
+            }
         }
     }
     // ========================================
@@ -57773,6 +57832,7 @@ function saveReport(report, markdown, outputDir) {
         external_fs_.appendFileSync(githubOutput, `has_differences=${report.diffCount > 0}\n`);
         external_fs_.appendFileSync(githubOutput, `passed_count=${report.passedCount}\n`);
         external_fs_.appendFileSync(githubOutput, `diff_count=${report.diffCount}\n`);
+        external_fs_.appendFileSync(githubOutput, `total_configs=${report.results.length}\n`);
     }
     // Also set via core for compatibility
     lib_core.setOutput("report_path", mdPath);
@@ -57780,6 +57840,7 @@ function saveReport(report, markdown, outputDir) {
     lib_core.setOutput("has_differences", report.diffCount > 0);
     lib_core.setOutput("passed_count", report.passedCount);
     lib_core.setOutput("diff_count", report.diffCount);
+    lib_core.setOutput("total_configs", report.results.length);
 }
 /**
  * Write a simple summary for PR comments
