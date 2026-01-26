@@ -55,3 +55,34 @@ jobs:
 
       - name: Publish to npm
         run: npm publish
+
+  # Update major version tag (e.g., v2) to point to this release
+  # Only runs for stable releases (no prerelease suffix)
+  update-major-tag:
+    runs-on: ubuntu-latest
+    needs: release
+    # Only run for stable semver tags (v1.2.3, not v1.2.3-beta)
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Update major version tag
+        run: |
+          # Extract version components from tag (e.g., v2.3.5 -> major=2)
+          TAG="${GITHUB_REF#refs/tags/}"
+          MAJOR=$(echo "$TAG" | sed -E 's/^v([0-9]+)\..*/\1/')
+          MAJOR_TAG="v${MAJOR}"
+          
+          echo "📦 Release tag: $TAG"
+          echo "🏷️  Major tag to update: $MAJOR_TAG"
+          
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Force update major tag to point to current commit
+          git tag -f "$MAJOR_TAG" "${{ github.sha }}"
+          git push origin "$MAJOR_TAG" --force
+          
+          echo "✅ Updated $MAJOR_TAG to point to $TAG (${{ github.sha }})"
