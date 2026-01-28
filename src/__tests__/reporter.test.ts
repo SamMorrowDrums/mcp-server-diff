@@ -163,7 +163,6 @@ describe("generateMarkdownReport", () => {
         baseTime: 0,
         hasDifferences: true,
         diffs: new Map([["error", "Failed to start server"]]),
-        error: "Failed to start server",
       },
     ];
 
@@ -184,6 +183,8 @@ describe("generateMarkdownReport", () => {
     expect(markdown).toContain("- passing-config");
     expect(markdown).toContain("**❌ Configurations with errors:**");
     expect(markdown).toContain("- error-config");
+    // Error configs should not be in the changes section
+    expect(markdown).not.toContain("error-config (see diff below)");
   });
 
   it("does not show empty sections", () => {
@@ -344,5 +345,56 @@ describe("generatePRSummary", () => {
 
     expect(summary).not.toContain("**✅ Passing configurations");
     expect(summary).toContain("**⚠️ Changed configurations:**");
+  });
+
+  it("shows error configurations separately in PR summary", () => {
+    const results: TestResult[] = [
+      {
+        configName: "passing-config",
+        transport: "stdio",
+        branchTime: 100,
+        baseTime: 90,
+        hasDifferences: false,
+        diffs: new Map(),
+      },
+      {
+        configName: "changed-config",
+        transport: "stdio",
+        branchTime: 120,
+        baseTime: 110,
+        hasDifferences: true,
+        diffs: new Map([["tools", "diff content"]]),
+      },
+      {
+        configName: "error-config",
+        transport: "stdio",
+        branchTime: 0,
+        baseTime: 0,
+        hasDifferences: true,
+        diffs: new Map([["error", "Failed to start server"]]),
+      },
+    ];
+
+    const report: ConformanceReport = {
+      generatedAt: "2024-01-01T00:00:00.000Z",
+      currentBranch: "main",
+      compareRef: "v1.0.0",
+      results,
+      totalBranchTime: 220,
+      totalBaseTime: 200,
+      passedCount: 1,
+      diffCount: 2,
+    };
+
+    const summary = generatePRSummary(report);
+
+    expect(summary).toContain("**✅ Passing configurations (no changes):**");
+    expect(summary).toContain("- passing-config");
+    expect(summary).toContain("**⚠️ Changed configurations:**");
+    expect(summary).toContain("- **changed-config:** tools");
+    expect(summary).toContain("**❌ Configurations with errors:**");
+    expect(summary).toContain("- error-config");
+    // Error configs should not be in the changed section
+    expect(summary).not.toContain("**error-config:**");
   });
 });

@@ -57741,7 +57741,7 @@ function generateMarkdownReport(report) {
         lines.push("");
         lines.push("**✅ Passing configurations (no changes detected):**");
         for (const result of report.results) {
-            if (!result.error && !result.hasDifferences) {
+            if (!result.error && !result.diffs.has("error") && !result.hasDifferences) {
                 lines.push(`- ${result.configName}`);
             }
         }
@@ -57750,7 +57750,7 @@ function generateMarkdownReport(report) {
         lines.push("## 📋 API Changes Detected");
         lines.push("");
         // List passing configurations first
-        const passingConfigs = report.results.filter((r) => !r.error && !r.hasDifferences);
+        const passingConfigs = report.results.filter((r) => !r.error && !r.diffs.has("error") && !r.hasDifferences);
         if (passingConfigs.length > 0) {
             lines.push("**✅ Passing configurations (no changes detected):**");
             for (const result of passingConfigs) {
@@ -57758,15 +57758,18 @@ function generateMarkdownReport(report) {
             }
             lines.push("");
         }
-        // List configurations with changes
-        lines.push("**⚠️ Configurations with changes:**");
-        for (const result of report.results.filter((r) => r.hasDifferences && !r.error)) {
-            lines.push(`- ${result.configName} (see diff below)`);
+        // List configurations with changes (excluding errors)
+        const changedConfigs = report.results.filter((r) => r.hasDifferences && !r.error && !r.diffs.has("error"));
+        if (changedConfigs.length > 0) {
+            lines.push("**⚠️ Configurations with changes:**");
+            for (const result of changedConfigs) {
+                lines.push(`- ${result.configName} (see diff below)`);
+            }
+            lines.push("");
         }
         // List configurations with errors if any
         const errorConfigs = report.results.filter((r) => r.error || r.diffs.has("error"));
         if (errorConfigs.length > 0) {
-            lines.push("");
             lines.push("**❌ Configurations with errors:**");
             for (const result of errorConfigs) {
                 lines.push(`- ${result.configName}`);
@@ -57882,7 +57885,7 @@ function generatePRSummary(report) {
         lines.push(`Tested ${report.results.length} configuration(s) - no API changes detected.`);
         lines.push("");
         lines.push("**✅ Passing configurations:**");
-        for (const result of report.results.filter((r) => !r.error && !r.hasDifferences)) {
+        for (const result of report.results.filter((r) => !r.error && !r.diffs.has("error") && !r.hasDifferences)) {
             lines.push(`- ${result.configName}`);
         }
     }
@@ -57892,7 +57895,7 @@ function generatePRSummary(report) {
         lines.push(`**${report.diffCount}** of ${report.results.length} configuration(s) have changes.`);
         lines.push("");
         // List passing configurations
-        const passingConfigs = report.results.filter((r) => !r.error && !r.hasDifferences);
+        const passingConfigs = report.results.filter((r) => !r.error && !r.diffs.has("error") && !r.hasDifferences);
         if (passingConfigs.length > 0) {
             lines.push("**✅ Passing configurations (no changes):**");
             for (const result of passingConfigs) {
@@ -57900,11 +57903,24 @@ function generatePRSummary(report) {
             }
             lines.push("");
         }
-        lines.push("**⚠️ Changed configurations:**");
-        for (const result of report.results.filter((r) => r.hasDifferences)) {
-            lines.push(`- **${result.configName}:** ${Array.from(result.diffs.keys()).join(", ")}`);
+        // List configurations with changes (excluding errors)
+        const changedConfigs = report.results.filter((r) => r.hasDifferences && !r.error && !r.diffs.has("error"));
+        if (changedConfigs.length > 0) {
+            lines.push("**⚠️ Changed configurations:**");
+            for (const result of changedConfigs) {
+                lines.push(`- **${result.configName}:** ${Array.from(result.diffs.keys()).join(", ")}`);
+            }
+            lines.push("");
         }
-        lines.push("");
+        // List configurations with errors if any
+        const errorConfigs = report.results.filter((r) => r.error || r.diffs.has("error"));
+        if (errorConfigs.length > 0) {
+            lines.push("**❌ Configurations with errors:**");
+            for (const result of errorConfigs) {
+                lines.push(`- ${result.configName}`);
+            }
+            lines.push("");
+        }
         lines.push("See the full report in the job summary for details.");
     }
     return lines.join("\n");
