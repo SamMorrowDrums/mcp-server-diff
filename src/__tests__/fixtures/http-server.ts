@@ -10,53 +10,57 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as http from "http";
 
-const server = new Server(
-  {
-    name: "test-http-server",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
+// SDK 1.26.0 (CVE fix): stateless mode requires a new Server+Transport per request.
+// Extract server construction into a factory so each request gets its own instance.
+function createServer(): Server {
+  const server = new Server(
+    {
+      name: "test-http-server",
+      version: "1.0.0",
     },
-  }
-);
-
-// Define tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "echo",
-        description: "Echoes back the input",
-        inputSchema: {
-          type: "object" as const,
-          properties: {
-            message: { type: "string", description: "Message to echo" },
-          },
-          required: ["message"],
-        },
+    {
+      capabilities: {
+        tools: {},
       },
-    ],
-  };
-});
+    }
+  );
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-
-  if (name === "echo") {
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
-      content: [{ type: "text", text: (args as { message: string }).message }],
+      tools: [
+        {
+          name: "echo",
+          description: "Echoes back the input",
+          inputSchema: {
+            type: "object" as const,
+            properties: {
+              message: { type: "string", description: "Message to echo" },
+            },
+            required: ["message"],
+          },
+        },
+      ],
     };
-  }
+  });
 
-  throw new Error(`Unknown tool: ${name}`);
-});
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+
+    if (name === "echo") {
+      return {
+        content: [{ type: "text", text: (args as { message: string }).message }],
+      };
+    }
+
+    throw new Error(`Unknown tool: ${name}`);
+  });
+
+  return server;
+}
 
 // Create HTTP server with streamable transport
 async function main() {
   const httpServer = http.createServer();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
   httpServer.on("request", async (req, res) => {
     // Simple CORS support
@@ -71,14 +75,20 @@ async function main() {
     }
 
     if (req.url === "/mcp" || req.url?.startsWith("/mcp?")) {
+      // Create a fresh server+transport per request (required by SDK 1.26.0 in stateless mode)
+      const server = createServer();
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      await server.connect(transport);
+      res.on("close", () => {
+        transport.close();
+        server.close();
+      });
       await transport.handleRequest(req, res);
     } else {
       res.writeHead(404);
       res.end("Not found");
     }
   });
-
-  await server.connect(transport);
 
   // Use port 0 to let the OS assign a free port, unless specific port given
   const requestedPort = parseInt(process.argv[2] || "0", 10);

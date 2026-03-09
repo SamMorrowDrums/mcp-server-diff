@@ -48236,6 +48236,9 @@ class Protocol {
      * The Protocol object assumes ownership of the Transport, replacing any callbacks that have already been set, and expects that it is the only user of the Transport instance going forward.
      */
     async connect(transport) {
+        if (this._transport) {
+            throw new Error('Already connected to a transport. Call close() before connecting to a new transport, or use a separate Protocol instance per connection.');
+        }
         this._transport = transport;
         const _onclose = this.transport?.onclose;
         this._transport.onclose = () => {
@@ -48271,6 +48274,11 @@ class Protocol {
         this._progressHandlers.clear();
         this._taskProgressTokens.clear();
         this._pendingDebouncedNotifications.clear();
+        // Abort all in-flight request handlers so they stop sending messages
+        for (const controller of this._requestHandlerAbortControllers.values()) {
+            controller.abort();
+        }
+        this._requestHandlerAbortControllers.clear();
         const error = McpError.fromError(ErrorCode.ConnectionClosed, 'Connection closed');
         this._transport = undefined;
         this.onclose?.();
@@ -48331,6 +48339,8 @@ class Protocol {
             sessionId: capturedTransport?.sessionId,
             _meta: request.params?._meta,
             sendNotification: async (notification) => {
+                if (abortController.signal.aborted)
+                    return;
                 // Include related-task metadata if this request is part of a task
                 const notificationOptions = { relatedRequestId: request.id };
                 if (relatedTaskId) {
@@ -48339,6 +48349,9 @@ class Protocol {
                 await this.notification(notification, notificationOptions);
             },
             sendRequest: async (r, resultSchema, options) => {
+                if (abortController.signal.aborted) {
+                    throw new McpError(ErrorCode.ConnectionClosed, 'Request was cancelled');
+                }
                 // Include related-task metadata if this request is part of a task
                 const requestOptions = { ...options, relatedRequestId: request.id };
                 if (relatedTaskId && !requestOptions.relatedTask) {
@@ -49713,8 +49726,10 @@ class Client extends Protocol {
                     }
                     return taskValidationResult.data;
                 }
-                // For non-task requests, validate against CreateMessageResultSchema
-                const validationResult = zod_compat_safeParse(CreateMessageResultSchema, result);
+                // For non-task requests, validate against appropriate schema based on tools presence
+                const hasTools = params.tools || params.toolChoice;
+                const resultSchema = hasTools ? CreateMessageResultWithToolsSchema : CreateMessageResultSchema;
+                const validationResult = zod_compat_safeParse(resultSchema, result);
                 if (!validationResult.success) {
                     const errorMessage = validationResult.error instanceof Error ? validationResult.error.message : String(validationResult.error);
                     throw new McpError(ErrorCode.InvalidParams, `Invalid sampling result: ${errorMessage}`);
