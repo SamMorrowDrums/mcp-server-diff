@@ -8973,6 +8973,7 @@ exports["default"] = def;
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 const code_1 = __nccwpck_require__(8484);
+const util_1 = __nccwpck_require__(4464);
 const codegen_1 = __nccwpck_require__(1436);
 const error = {
     message: ({ schemaCode }) => (0, codegen_1.str) `must match pattern "${schemaCode}"`,
@@ -8985,11 +8986,19 @@ const def = {
     $data: true,
     error,
     code(cxt) {
-        const { data, $data, schema, schemaCode, it } = cxt;
-        // TODO regexp should be wrapped in try/catchs
+        const { gen, data, $data, schema, schemaCode, it } = cxt;
         const u = it.opts.unicodeRegExp ? "u" : "";
-        const regExp = $data ? (0, codegen_1._) `(new RegExp(${schemaCode}, ${u}))` : (0, code_1.usePattern)(cxt, schema);
-        cxt.fail$data((0, codegen_1._) `!${regExp}.test(${data})`);
+        if ($data) {
+            const { regExp } = it.opts.code;
+            const regExpCode = regExp.code === "new RegExp" ? (0, codegen_1._) `new RegExp` : (0, util_1.useFunc)(gen, regExp);
+            const valid = gen.let("valid");
+            gen.try(() => gen.assign(valid, (0, codegen_1._) `${regExpCode}(${schemaCode}, ${u}).test(${data})`), () => gen.assign(valid, false));
+            cxt.fail$data((0, codegen_1._) `!${valid}`);
+        }
+        else {
+            const regExp = (0, code_1.usePattern)(cxt, schema);
+            cxt.fail$data((0, codegen_1._) `!${regExp}.test(${data})`);
+        }
     },
 };
 exports["default"] = def;
