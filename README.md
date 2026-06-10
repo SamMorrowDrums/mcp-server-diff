@@ -651,6 +651,28 @@ npx mcp-server-diff -c servers.json -o diff
 
 ---
 
+## Migration to 3.0
+
+Version 3.0 is a maintenance release that refreshes the dependency tree and prepares the probe for the upcoming MCP draft spec.
+
+**Dependency upgrades (breaking only at the install layer)**
+
+- `zod` v3 → v4 (signature of `z.record` now requires explicit key + value schemas)
+- `undici` v6 → v8 (also updates the `overrides` block, resolving the v6 WebSocket advisories)
+- `diff` v8 → v9
+- `@actions/core`, `@actions/exec`, `@actions/io` v1 → v3
+- `eslint` / `@eslint/js` v9 → v10, `typescript` v5 → v6, `jest` / `@types/jest` v29 → v30
+- `@types/node` v22 → v24 (the action and CLI are still tested on Node 20 + 22)
+- `@vercel/ncc` 0.38 → 0.44
+
+If you consume `mcp-server-diff` as a GitHub Action or via `npx`, nothing in your workflow should change.
+
+**MCP draft-spec forward-compat**
+
+The probe now strips the `ttlMs` and `cacheScope` cache hints (CacheableResult, [SEP-2461](https://modelcontextprotocol.io/specification/draft/changelog)) from the top level of `tools/list`, `prompts/list`, `resources/list`, and `resources/templates/list` results before snapshotting. These freshness hints are intended to vary between runs, so stripping them keeps diffs focused on real interface changes. Nested `ttlMs` / `cacheScope` fields (e.g. inside a tool description) are preserved.
+
+The `initialize` snapshot is unchanged. The draft renames it to `server/discover` ([SEP-2575](https://modelcontextprotocol.io/specification/draft/changelog)), but we will adopt the new method name in a follow-up release once `@modelcontextprotocol/sdk` v2 ships.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
