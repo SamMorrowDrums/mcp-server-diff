@@ -88,6 +88,8 @@ export interface InitializeInfo {
     name: string;
     version: string;
   };
+  // Open-ended record so we capture forward-compat additions like the MCP
+  // draft spec's `capabilities.extensions` (SEP-2589) without code changes.
   capabilities?: Record<string, unknown>;
 }
 
