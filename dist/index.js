@@ -65449,18 +65449,33 @@ function getSortKey(item) {
  * these from `_meta` everywhere they appear so spec-version churn doesn't
  * masquerade as an API change.
  *
- * - `io.modelcontextprotocol/*` — MCP-reserved prefix added in the draft for
- *   protocol-level annotations (clientInfo, clientCapabilities,
- *   protocolVersion, subscriptionId, logLevel, …)
- * - `traceparent` / `tracestate` / `baggage` — W3C trace context that some
- *   transports inject for OTel propagation
+ * IMPORTANT: this is an *exact-key* denylist, not a prefix denylist. The
+ * `io.modelcontextprotocol/*` namespace is reserved by the spec but is also
+ * where official extensions live (MCP Apps' `io.modelcontextprotocol/ui`,
+ * Tasks' `io.modelcontextprotocol/related-task`, etc.). Stripping by prefix
+ * would silently delete those extension surfaces from the snapshot, which
+ * defeats the entire purpose of this tool. Only the specific transport-level
+ * plumbing keys go here.
+ *
+ * - `io.modelcontextprotocol/protocolVersion` — negotiated spec revision
+ * - `io.modelcontextprotocol/clientInfo` — client's name+version
+ * - `io.modelcontextprotocol/clientCapabilities` — what the client supports
+ * - `io.modelcontextprotocol/subscriptionId` — per-stream subscription handle
+ * - `io.modelcontextprotocol/logLevel` — runtime log level
+ * - `traceparent` / `tracestate` / `baggage` — W3C trace context (OTel)
  */
-const PROTOCOL_NOISE_META_PREFIXES = ["io.modelcontextprotocol/"];
-const PROTOCOL_NOISE_META_EXACT = new Set(["traceparent", "tracestate", "baggage"]);
+const PROTOCOL_NOISE_META_KEYS = new Set([
+    "io.modelcontextprotocol/protocolVersion",
+    "io.modelcontextprotocol/clientInfo",
+    "io.modelcontextprotocol/clientCapabilities",
+    "io.modelcontextprotocol/subscriptionId",
+    "io.modelcontextprotocol/logLevel",
+    "traceparent",
+    "tracestate",
+    "baggage",
+]);
 function isProtocolNoiseMetaKey(key) {
-    if (PROTOCOL_NOISE_META_EXACT.has(key))
-        return true;
-    return PROTOCOL_NOISE_META_PREFIXES.some((p) => key.startsWith(p));
+    return PROTOCOL_NOISE_META_KEYS.has(key);
 }
 /**
  * Strip protocol-noise keys from a `_meta` object. Returns undefined if the
@@ -65488,11 +65503,14 @@ function cleanMetaObject(meta) {
  * - Embedded JSON in "text" fields: parsed, normalized, and re-serialized
  *
  * Cross-version noise stripping (always on):
- * - Recursively cleans `_meta` objects by dropping `io.modelcontextprotocol/*`
- *   keys (protocol plumbing introduced in the draft: protocolVersion,
- *   clientInfo, clientCapabilities, subscriptionId, logLevel) and W3C trace
- *   context (`traceparent`, `tracestate`, `baggage`). An emptied `_meta` is
- *   dropped entirely.
+ * - Recursively cleans `_meta` objects by dropping the specific
+ *   transport-plumbing keys listed in PROTOCOL_NOISE_META_KEYS (negotiated
+ *   protocol version, client info/capabilities, subscription IDs, log level,
+ *   plus W3C trace context). Crucially this is an *exact-key* denylist so
+ *   official extension surfaces under `io.modelcontextprotocol/*` (MCP Apps'
+ *   `_meta.ui`, Tasks' `_meta.io.modelcontextprotocol/related-task`, etc.)
+ *   are preserved — those are exactly what this tool exists to diff. An
+ *   emptied `_meta` is dropped entirely.
  *
  * Cache-hint stripping (opt-in via `stripCacheHints`):
  * - The draft spec adds `ttlMs` and `cacheScope` (CacheableResult, SEP-2461)

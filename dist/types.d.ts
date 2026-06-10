@@ -79,13 +79,15 @@ export interface InitializeInfo {
     capabilities?: Record<string, unknown>;
 }
 export interface ToolsResult {
+    [key: string]: unknown;
     tools: Array<{
         name: string;
         description?: string;
         inputSchema?: Record<string, unknown>;
-    }>;
+    } & Record<string, unknown>>;
 }
 export interface PromptsResult {
+    [key: string]: unknown;
     prompts: Array<{
         name: string;
         description?: string;
@@ -94,23 +96,25 @@ export interface PromptsResult {
             description?: string;
             required?: boolean;
         }>;
-    }>;
+    } & Record<string, unknown>>;
 }
 export interface ResourcesResult {
+    [key: string]: unknown;
     resources: Array<{
         uri: string;
         name: string;
         description?: string;
         mimeType?: string;
-    }>;
+    } & Record<string, unknown>>;
 }
 export interface ResourceTemplatesResult {
+    [key: string]: unknown;
     resourceTemplates: Array<{
         uriTemplate: string;
         name: string;
         description?: string;
         mimeType?: string;
-    }>;
+    } & Record<string, unknown>>;
 }
 /** Counts of MCP primitives discovered */
 export interface PrimitiveCounts {
