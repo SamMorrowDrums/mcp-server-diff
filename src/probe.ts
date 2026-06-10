@@ -272,19 +272,32 @@ function getSortKey(item: unknown): string {
  * Also handles embedded JSON strings in "text" fields (from tool call responses).
  *
  * Sorting strategy:
- * - Object keys: sorted alphabetically
+ * - Object keys: sorted alphabetically (the MCP draft spec — see
+ *   https://modelcontextprotocol.io/specification/draft — now requires
+ *   deterministic ordering for list results; we've always done this)
  * - Arrays of objects: sorted by primary key (name, uri, type) for deterministic output
  * - Primitive arrays: sorted by string representation
  * - Embedded JSON in "text" fields: parsed, normalized, and re-serialized
+ *
+ * Cache-hint stripping:
+ * - The draft spec adds `ttlMs` and `cacheScope` (CacheableResult) to
+ *   results of tools/list, prompts/list, resources/list, resources/read,
+ *   and resources/templates/list. These are freshness/cache hints that vary
+ *   run-to-run and would produce diff noise, so we strip them at the top
+ *   level of each normalized result. Pass `stripCacheHints: true` for the
+ *   top-level call on a list/read result.
  */
-export function normalizeProbeResult(result: unknown): unknown {
+export function normalizeProbeResult(
+  result: unknown,
+  options: { stripCacheHints?: boolean } = {}
+): unknown {
   if (result === null || result === undefined) {
     return result;
   }
 
   if (Array.isArray(result)) {
     // First normalize all elements
-    const normalized = result.map(normalizeProbeResult);
+    const normalized = result.map((item) => normalizeProbeResult(item));
 
     // Then sort by sort key for deterministic output
     return normalized.sort((a, b) => {
@@ -302,6 +315,13 @@ export function normalizeProbeResult(result: unknown): unknown {
     const keys = Object.keys(obj).sort();
 
     for (const key of keys) {
+      // Skip MCP draft CacheableResult hints at the top level of a list/read
+      // result — see SEP-2461 in the draft changelog. These would otherwise
+      // produce spurious diffs between runs.
+      if (options.stripCacheHints && (key === "ttlMs" || key === "cacheScope")) {
+        continue;
+      }
+
       let value = obj[key];
 
       // Handle embedded JSON in "text" fields (tool call responses)
@@ -333,24 +353,40 @@ export function probeResultToFiles(result: ProbeResult): Map<string, string> {
   const files = new Map<string, string>();
 
   if (result.initialize) {
+    // TODO(mcp-draft, SEP-2575): the draft spec renames the `initialize`
+    // method to `server/discover`. When we adopt SDK v2 we should rename
+    // this snapshot file accordingly (or emit both for a release).
     files.set("initialize", JSON.stringify(normalizeProbeResult(result.initialize), null, 2));
   }
   if (result.instructions) {
     files.set("instructions", result.instructions);
   }
   if (result.tools) {
-    files.set("tools", JSON.stringify(normalizeProbeResult(result.tools), null, 2));
+    files.set(
+      "tools",
+      JSON.stringify(normalizeProbeResult(result.tools, { stripCacheHints: true }), null, 2)
+    );
   }
   if (result.prompts) {
-    files.set("prompts", JSON.stringify(normalizeProbeResult(result.prompts), null, 2));
+    files.set(
+      "prompts",
+      JSON.stringify(normalizeProbeResult(result.prompts, { stripCacheHints: true }), null, 2)
+    );
   }
   if (result.resources) {
-    files.set("resources", JSON.stringify(normalizeProbeResult(result.resources), null, 2));
+    files.set(
+      "resources",
+      JSON.stringify(normalizeProbeResult(result.resources, { stripCacheHints: true }), null, 2)
+    );
   }
   if (result.resourceTemplates) {
     files.set(
       "resource_templates",
-      JSON.stringify(normalizeProbeResult(result.resourceTemplates), null, 2)
+      JSON.stringify(
+        normalizeProbeResult(result.resourceTemplates, { stripCacheHints: true }),
+        null,
+        2
+      )
     );
   }
 
