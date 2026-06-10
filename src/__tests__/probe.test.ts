@@ -56,15 +56,22 @@ describe("normalizeProbeResult", () => {
     expect(result.tools[0].cacheScope).toBe("client");
   });
 
-  it("recursively scrubs io.modelcontextprotocol/* keys from _meta", () => {
+  it("scrubs only the listed io.modelcontextprotocol/* plumbing keys from _meta", () => {
     const input = {
       tools: [
         {
           name: "search",
           _meta: {
+            // Plumbing — stripped.
             "io.modelcontextprotocol/protocolVersion": "2025-11-25",
             "io.modelcontextprotocol/clientInfo": { name: "x" },
+            "io.modelcontextprotocol/clientCapabilities": { sampling: {} },
             "io.modelcontextprotocol/subscriptionId": "abc",
+            "io.modelcontextprotocol/logLevel": "info",
+            // Extension surfaces under the reserved prefix — preserved.
+            // MCP Apps (SEP-1865) puts UI metadata here.
+            ui: { csp: { connectDomains: ["https://api.example.com"] } },
+            "io.modelcontextprotocol/related-task": { taskId: "t1" },
             "x.acme/keep-me": true,
           },
         },
@@ -73,7 +80,50 @@ describe("normalizeProbeResult", () => {
     const result = normalizeProbeResult(input) as {
       tools: Array<{ _meta: Record<string, unknown> }>;
     };
-    expect(result.tools[0]._meta).toEqual({ "x.acme/keep-me": true });
+    expect(result.tools[0]._meta).toEqual({
+      ui: { csp: { connectDomains: ["https://api.example.com"] } },
+      "io.modelcontextprotocol/related-task": { taskId: "t1" },
+      "x.acme/keep-me": true,
+    });
+  });
+
+  it("preserves MCP Apps _meta.ui on UI resources (SEP-1865 regression)", () => {
+    // MCP Apps declares UI metadata at resource._meta.ui — including CSP
+    // config, sandbox permissions, and dedicated origin. None of this is
+    // protocol plumbing; all of it is the server's public surface and MUST
+    // round-trip through the snapshot intact.
+    const input = {
+      resources: [
+        {
+          uri: "ui://weather-dashboard",
+          name: "Weather Dashboard",
+          mimeType: "text/html;profile=mcp-app",
+          _meta: {
+            ui: {
+              csp: {
+                connectDomains: ["https://api.weather.com"],
+                resourceDomains: ["https://cdn.jsdelivr.net"],
+              },
+              permissions: { geolocation: {} },
+            },
+            // SDK injected this — must be stripped without taking ui with it.
+            "io.modelcontextprotocol/protocolVersion": "draft",
+          },
+        },
+      ],
+    };
+    const result = normalizeProbeResult(input) as {
+      resources: Array<{ _meta: Record<string, unknown> }>;
+    };
+    expect(result.resources[0]._meta).toEqual({
+      ui: {
+        csp: {
+          connectDomains: ["https://api.weather.com"],
+          resourceDomains: ["https://cdn.jsdelivr.net"],
+        },
+        permissions: { geolocation: {} },
+      },
+    });
   });
 
   it("drops _meta entirely when nothing useful is left after scrubbing", () => {
@@ -307,5 +357,150 @@ describe("cross-version diff cleanliness", () => {
     expect(probeResultToFiles(branchResult).get("tools")).not.toBe(
       probeResultToFiles(baseResult).get("tools")
     );
+  });
+});
+
+describe("lossless capture of advertised tool/resource properties", () => {
+  function makeResult(overrides: Partial<ProbeResult>): ProbeResult {
+    return {
+      initialize: null,
+      instructions: null,
+      tools: null,
+      prompts: null,
+      resources: null,
+      resourceTemplates: null,
+      customResponses: new Map(),
+      ...overrides,
+    };
+  }
+
+  // Build a single result with every spec-defined per-item field we can think
+  // of (tool annotations + outputSchema + custom _meta, MCP Apps UI resource
+  // with full _meta.ui, prompt arguments, resource templates) and confirm
+  // every property round-trips through the snapshot. This is the regression
+  // guard for "all advertised properties are effectively compared".
+  it("preserves tool annotations, outputSchema, custom _meta, MCP Apps UI metadata, and resource templates", () => {
+    const probe = makeResult({
+      tools: {
+        tools: [
+          {
+            name: "search",
+            description: "Find things",
+            inputSchema: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
+            // Newer spec fields — must survive.
+            annotations: {
+              title: "Search the web",
+              readOnlyHint: true,
+              destructiveHint: false,
+              idempotentHint: true,
+              openWorldHint: true,
+            },
+            outputSchema: {
+              type: "object",
+              properties: { results: { type: "array" } },
+            },
+            _meta: {
+              // MCP Apps tool→UI link (SEP-1865 examples wire tools to
+              // ui:// resources via _meta). Must NOT be stripped.
+              ui: { resource: "ui://search-results" },
+              // Vendor extension under a non-reserved namespace.
+              "x.acme/cost-tier": "premium",
+            },
+          },
+        ],
+      } as unknown as ProbeResult["tools"],
+      prompts: {
+        prompts: [
+          {
+            name: "code-review",
+            description: "Review code",
+            arguments: [{ name: "diff", description: "The diff", required: true }],
+            _meta: { "x.acme/version": 2 },
+          },
+        ],
+      } as unknown as ProbeResult["prompts"],
+      resources: {
+        resources: [
+          {
+            uri: "ui://weather-dashboard",
+            name: "Weather Dashboard",
+            description: "Interactive weather visualization",
+            mimeType: "text/html;profile=mcp-app",
+            // Full MCP Apps _meta.ui shape from SEP-1865 §UI Resource Format.
+            _meta: {
+              ui: {
+                csp: {
+                  connectDomains: ["https://api.weather.com", "wss://realtime.service.com"],
+                  resourceDomains: ["https://cdn.jsdelivr.net", "https://*.cloudflare.com"],
+                  frameDomains: ["https://www.youtube.com"],
+                  baseUriDomains: ["https://cdn.example.com"],
+                },
+                permissions: {
+                  camera: {},
+                  microphone: {},
+                  geolocation: {},
+                  clipboardWrite: {},
+                },
+              },
+            },
+          },
+        ],
+      } as unknown as ProbeResult["resources"],
+      resourceTemplates: {
+        resourceTemplates: [
+          {
+            uriTemplate: "weather://{city}",
+            name: "City weather",
+            description: "Weather for a city",
+            mimeType: "application/json",
+            _meta: { "x.acme/cache-ttl": 60 },
+          },
+        ],
+      } as unknown as ProbeResult["resourceTemplates"],
+    });
+
+    const files = probeResultToFiles(probe);
+
+    const tool = JSON.parse(files.get("tools")!).tools[0];
+    expect(tool.annotations).toEqual({
+      title: "Search the web",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    });
+    expect(tool.outputSchema).toEqual({
+      type: "object",
+      properties: { results: { type: "array" } },
+    });
+    expect(tool._meta).toEqual({
+      ui: { resource: "ui://search-results" },
+      "x.acme/cost-tier": "premium",
+    });
+
+    const prompt = JSON.parse(files.get("prompts")!).prompts[0];
+    expect(prompt.arguments).toEqual([{ description: "The diff", name: "diff", required: true }]);
+    expect(prompt._meta).toEqual({ "x.acme/version": 2 });
+
+    const uiResource = JSON.parse(files.get("resources")!).resources[0];
+    expect(uiResource.mimeType).toBe("text/html;profile=mcp-app");
+    expect(uiResource._meta.ui.csp.connectDomains).toEqual([
+      "https://api.weather.com",
+      "wss://realtime.service.com",
+    ]);
+    expect(uiResource._meta.ui.permissions).toEqual({
+      camera: {},
+      microphone: {},
+      geolocation: {},
+      clipboardWrite: {},
+    });
+
+    const template = JSON.parse(files.get("resource_templates")!).resourceTemplates[0];
+    expect(template.uriTemplate).toBe("weather://{city}");
+    expect(template._meta).toEqual({ "x.acme/cache-ttl": 60 });
   });
 });

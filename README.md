@@ -680,7 +680,7 @@ A common situation during the draft-spec rollout is that the base ref runs again
 What gets normalized away before snapshotting:
 
 - **CacheableResult hints** — top-level `ttlMs` / `cacheScope` on `tools/list`, `prompts/list`, `resources/list`, and `resources/templates/list` ([SEP-2461](https://modelcontextprotocol.io/specification/draft/changelog)).
-- **`_meta` protocol plumbing** — keys prefixed with `io.modelcontextprotocol/` (e.g. `protocolVersion`, `clientInfo`, `clientCapabilities`, `subscriptionId`, `logLevel`) are stripped from every `_meta` object, at any depth. An emptied `_meta` is dropped entirely.
+- **`_meta` protocol plumbing** — a specific, exact-key denylist is stripped from every `_meta` object, at any depth: `io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientInfo`, `io.modelcontextprotocol/clientCapabilities`, `io.modelcontextprotocol/subscriptionId`, `io.modelcontextprotocol/logLevel`. An emptied `_meta` is dropped entirely. **We do not strip by prefix**: the `io.modelcontextprotocol/*` namespace is reserved by the spec but is also where official extensions live (MCP Apps' `_meta.ui`, Tasks' `io.modelcontextprotocol/related-task`, etc.) — those surfaces are exactly what this tool exists to diff, so they round-trip untouched.
 - **W3C trace context inside `_meta`** — `traceparent`, `tracestate`, and `baggage` (transport-injected for OTel propagation) are stripped from `_meta`.
 - **`initialize` envelope churn** — `protocolVersion` and `capabilities.experimental` are excluded from the `initialize` snapshot body. The negotiated protocol version is captured separately and surfaced by the reporter (see below).
 - **Endpoint names are canonicalized** — see `CANONICAL_SNAPSHOT_NAMES` in `src/probe.ts`. When the spec eventually renames `initialize` → `server/discover`, both will map to the same `initialize` snapshot file so a spec upgrade shows up as a content diff on one file, not a "removed + added" pair.
@@ -689,7 +689,7 @@ What is **not** normalized (intentionally):
 
 - `serverInfo.version` (the SDK version is a legitimate signal worth tracking).
 - Nested `ttlMs` / `cacheScope` that live inside a tool/prompt/resource definition (those would be part of the public surface, not envelope hints).
-- Custom `_meta` keys outside the reserved `io.modelcontextprotocol/` namespace.
+- Any `_meta` key not on the exact denylist above — including the entire MCP Apps surface (`_meta.ui` and friends, [SEP-1865](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/1865)) and vendor extensions under non-reserved namespaces (`x.acme/*`, etc.).
 
 When the base and branch probes negotiate different MCP protocol versions, the report (and the PR summary) emit a banner like:
 

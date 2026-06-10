@@ -31,11 +31,14 @@ export declare function probeServer(options: ProbeOptions): Promise<ProbeResult>
  * - Embedded JSON in "text" fields: parsed, normalized, and re-serialized
  *
  * Cross-version noise stripping (always on):
- * - Recursively cleans `_meta` objects by dropping `io.modelcontextprotocol/*`
- *   keys (protocol plumbing introduced in the draft: protocolVersion,
- *   clientInfo, clientCapabilities, subscriptionId, logLevel) and W3C trace
- *   context (`traceparent`, `tracestate`, `baggage`). An emptied `_meta` is
- *   dropped entirely.
+ * - Recursively cleans `_meta` objects by dropping the specific
+ *   transport-plumbing keys listed in PROTOCOL_NOISE_META_KEYS (negotiated
+ *   protocol version, client info/capabilities, subscription IDs, log level,
+ *   plus W3C trace context). Crucially this is an *exact-key* denylist so
+ *   official extension surfaces under `io.modelcontextprotocol/*` (MCP Apps'
+ *   `_meta.ui`, Tasks' `_meta.io.modelcontextprotocol/related-task`, etc.)
+ *   are preserved — those are exactly what this tool exists to diff. An
+ *   emptied `_meta` is dropped entirely.
  *
  * Cache-hint stripping (opt-in via `stripCacheHints`):
  * - The draft spec adds `ttlMs` and `cacheScope` (CacheableResult, SEP-2461)

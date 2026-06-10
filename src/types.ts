@@ -96,41 +96,56 @@ export interface InitializeInfo {
 }
 
 export interface ToolsResult {
-  tools: Array<{
-    name: string;
-    description?: string;
-    inputSchema?: Record<string, unknown>;
-  }>;
+  // Permit forward-compat fields (annotations, outputSchema, _meta with
+  // extension surfaces like MCP Apps' io.modelcontextprotocol/ui, etc.).
+  // The probe captures the full shape verbatim; types should not narrow it.
+  [key: string]: unknown;
+  tools: Array<
+    {
+      name: string;
+      description?: string;
+      inputSchema?: Record<string, unknown>;
+    } & Record<string, unknown>
+  >;
 }
 
 export interface PromptsResult {
-  prompts: Array<{
-    name: string;
-    description?: string;
-    arguments?: Array<{
+  [key: string]: unknown;
+  prompts: Array<
+    {
       name: string;
       description?: string;
-      required?: boolean;
-    }>;
-  }>;
+      arguments?: Array<{
+        name: string;
+        description?: string;
+        required?: boolean;
+      }>;
+    } & Record<string, unknown>
+  >;
 }
 
 export interface ResourcesResult {
-  resources: Array<{
-    uri: string;
-    name: string;
-    description?: string;
-    mimeType?: string;
-  }>;
+  [key: string]: unknown;
+  resources: Array<
+    {
+      uri: string;
+      name: string;
+      description?: string;
+      mimeType?: string;
+    } & Record<string, unknown>
+  >;
 }
 
 export interface ResourceTemplatesResult {
-  resourceTemplates: Array<{
-    uriTemplate: string;
-    name: string;
-    description?: string;
-    mimeType?: string;
-  }>;
+  [key: string]: unknown;
+  resourceTemplates: Array<
+    {
+      uriTemplate: string;
+      name: string;
+      description?: string;
+      mimeType?: string;
+    } & Record<string, unknown>
+  >;
 }
 
 /** Counts of MCP primitives discovered */
