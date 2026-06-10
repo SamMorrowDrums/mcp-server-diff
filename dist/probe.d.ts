@@ -30,17 +30,39 @@ export declare function probeServer(options: ProbeOptions): Promise<ProbeResult>
  * - Primitive arrays: sorted by string representation
  * - Embedded JSON in "text" fields: parsed, normalized, and re-serialized
  *
- * Cache-hint stripping:
- * - The draft spec adds `ttlMs` and `cacheScope` (CacheableResult) to
- *   results of tools/list, prompts/list, resources/list, resources/read,
+ * Cross-version noise stripping (always on):
+ * - Recursively cleans `_meta` objects by dropping `io.modelcontextprotocol/*`
+ *   keys (protocol plumbing introduced in the draft: protocolVersion,
+ *   clientInfo, clientCapabilities, subscriptionId, logLevel) and W3C trace
+ *   context (`traceparent`, `tracestate`, `baggage`). An emptied `_meta` is
+ *   dropped entirely.
+ *
+ * Cache-hint stripping (opt-in via `stripCacheHints`):
+ * - The draft spec adds `ttlMs` and `cacheScope` (CacheableResult, SEP-2461)
+ *   to results of tools/list, prompts/list, resources/list, resources/read,
  *   and resources/templates/list. These are freshness/cache hints that vary
- *   run-to-run and would produce diff noise, so we strip them at the top
- *   level of each normalized result. Pass `stripCacheHints: true` for the
- *   top-level call on a list/read result.
+ *   run-to-run, so we strip them at the top level of each list/read result.
  */
 export declare function normalizeProbeResult(result: unknown, options?: {
     stripCacheHints?: boolean;
 }): unknown;
+/**
+ * Canonical snapshot file names. Endpoint renames in the spec (e.g. the
+ * draft's `initialize` → `server/discover`, SEP-2575) should be mapped here
+ * so a server moving from one spec revision to another shows up as a content
+ * diff on a single file, not "endpoint removed + endpoint added".
+ *
+ * We currently keep `initialize` as the canonical name for that snapshot;
+ * the constant exists so the mapping is explicit and easy to extend.
+ */
+export declare const CANONICAL_SNAPSHOT_NAMES: {
+    readonly initialize: "initialize";
+    readonly serverDiscover: "initialize";
+    readonly tools: "tools";
+    readonly prompts: "prompts";
+    readonly resources: "resources";
+    readonly resourceTemplates: "resource_templates";
+};
 /**
  * Convert probe result to a map of endpoint -> JSON string
  */
