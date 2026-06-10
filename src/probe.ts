@@ -192,7 +192,7 @@ export async function probeServer(options: ProbeOptions): Promise<ProbeResult> {
     // Send custom messages if provided
     if (options.customMessages && options.customMessages.length > 0) {
       // Schema that accepts any response for custom messages
-      const anyResponseSchema = z.record(z.unknown());
+      const anyResponseSchema = z.record(z.string(), z.unknown());
 
       for (const customMsg of options.customMessages) {
         try {
