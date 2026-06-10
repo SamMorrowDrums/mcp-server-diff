@@ -103,6 +103,20 @@ export async function probeServer(options: ProbeOptions): Promise<ProbeResult> {
       transport = new StreamableHTTPClientTransport(new URL(options.url), transportOptions);
     }
 
+    // The SDK doesn't expose the negotiated protocol version via a public
+    // getter. It does, however, call `transport.setProtocolVersion(...)` after
+    // initialize if the transport implements it. Wrap (or attach) that hook so
+    // we can capture the version for the snapshot. Works for stdio + HTTP.
+    let negotiatedProtocolVersion: string | undefined;
+    const transportWithHook = transport as {
+      setProtocolVersion?: (version: string) => void;
+    };
+    const originalSetProtocolVersion = transportWithHook.setProtocolVersion?.bind(transport);
+    transportWithHook.setProtocolVersion = (version: string) => {
+      negotiatedProtocolVersion = version;
+      originalSetProtocolVersion?.(version);
+    };
+
     // Connect to the server
     await client.connect(transport);
     log.info("  Connected successfully");
@@ -112,9 +126,14 @@ export async function probeServer(options: ProbeOptions): Promise<ProbeResult> {
     const serverInfo = client.getServerVersion();
 
     result.initialize = {
+      protocolVersion: negotiatedProtocolVersion,
       serverInfo,
       capabilities: serverCapabilities,
     } as InitializeInfo;
+
+    if (negotiatedProtocolVersion) {
+      log.info(`  Negotiated MCP protocol version: ${negotiatedProtocolVersion}`);
+    }
 
     // Get server instructions
     const instructions = client.getInstructions();
@@ -268,6 +287,40 @@ function getSortKey(item: unknown): string {
 }
 
 /**
+ * Keys inside a `_meta` object that are pure MCP protocol plumbing or
+ * cross-cutting tracing context — never part of the server's public surface
+ * and almost always different between protocol revisions or runs. We strip
+ * these from `_meta` everywhere they appear so spec-version churn doesn't
+ * masquerade as an API change.
+ *
+ * - `io.modelcontextprotocol/*` — MCP-reserved prefix added in the draft for
+ *   protocol-level annotations (clientInfo, clientCapabilities,
+ *   protocolVersion, subscriptionId, logLevel, …)
+ * - `traceparent` / `tracestate` / `baggage` — W3C trace context that some
+ *   transports inject for OTel propagation
+ */
+const PROTOCOL_NOISE_META_PREFIXES = ["io.modelcontextprotocol/"];
+const PROTOCOL_NOISE_META_EXACT = new Set(["traceparent", "tracestate", "baggage"]);
+
+function isProtocolNoiseMetaKey(key: string): boolean {
+  if (PROTOCOL_NOISE_META_EXACT.has(key)) return true;
+  return PROTOCOL_NOISE_META_PREFIXES.some((p) => key.startsWith(p));
+}
+
+/**
+ * Strip protocol-noise keys from a `_meta` object. Returns undefined if the
+ * cleaned object is empty (so the caller can omit it).
+ */
+function cleanMetaObject(meta: Record<string, unknown>): Record<string, unknown> | undefined {
+  const cleaned: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(meta)) {
+    if (isProtocolNoiseMetaKey(k)) continue;
+    cleaned[k] = v;
+  }
+  return Object.keys(cleaned).length > 0 ? cleaned : undefined;
+}
+
+/**
  * Normalize a probe result for comparison by sorting keys and arrays recursively.
  * Also handles embedded JSON strings in "text" fields (from tool call responses).
  *
@@ -279,13 +332,18 @@ function getSortKey(item: unknown): string {
  * - Primitive arrays: sorted by string representation
  * - Embedded JSON in "text" fields: parsed, normalized, and re-serialized
  *
- * Cache-hint stripping:
- * - The draft spec adds `ttlMs` and `cacheScope` (CacheableResult) to
- *   results of tools/list, prompts/list, resources/list, resources/read,
+ * Cross-version noise stripping (always on):
+ * - Recursively cleans `_meta` objects by dropping `io.modelcontextprotocol/*`
+ *   keys (protocol plumbing introduced in the draft: protocolVersion,
+ *   clientInfo, clientCapabilities, subscriptionId, logLevel) and W3C trace
+ *   context (`traceparent`, `tracestate`, `baggage`). An emptied `_meta` is
+ *   dropped entirely.
+ *
+ * Cache-hint stripping (opt-in via `stripCacheHints`):
+ * - The draft spec adds `ttlMs` and `cacheScope` (CacheableResult, SEP-2461)
+ *   to results of tools/list, prompts/list, resources/list, resources/read,
  *   and resources/templates/list. These are freshness/cache hints that vary
- *   run-to-run and would produce diff noise, so we strip them at the top
- *   level of each normalized result. Pass `stripCacheHints: true` for the
- *   top-level call on a list/read result.
+ *   run-to-run, so we strip them at the top level of each list/read result.
  */
 export function normalizeProbeResult(
   result: unknown,
@@ -324,6 +382,14 @@ export function normalizeProbeResult(
 
       let value = obj[key];
 
+      // Recursively scrub protocol-noise keys out of any `_meta` we encounter.
+      // Drop the `_meta` entirely if nothing useful is left.
+      if (key === "_meta" && value !== null && typeof value === "object") {
+        const cleaned = cleanMetaObject(value as Record<string, unknown>);
+        if (cleaned === undefined) continue;
+        value = cleaned;
+      }
+
       // Handle embedded JSON in "text" fields (tool call responses)
       if (key === "text" && typeof value === "string") {
         const trimmed = value.trim();
@@ -347,41 +413,90 @@ export function normalizeProbeResult(
 }
 
 /**
+ * Canonical snapshot file names. Endpoint renames in the spec (e.g. the
+ * draft's `initialize` → `server/discover`, SEP-2575) should be mapped here
+ * so a server moving from one spec revision to another shows up as a content
+ * diff on a single file, not "endpoint removed + endpoint added".
+ *
+ * We currently keep `initialize` as the canonical name for that snapshot;
+ * the constant exists so the mapping is explicit and easy to extend.
+ */
+export const CANONICAL_SNAPSHOT_NAMES = {
+  initialize: "initialize",
+  serverDiscover: "initialize",
+  tools: "tools",
+  prompts: "prompts",
+  resources: "resources",
+  resourceTemplates: "resource_templates",
+} as const;
+
+/**
+ * Normalize an initialize snapshot for diffing. Drops `protocolVersion` and
+ * `capabilities.experimental` from the comparison body because they're
+ * expected to drift across spec revisions / SDK upgrades and aren't part of
+ * the server's public surface. The reporter surfaces protocol-version
+ * changes separately so they aren't silently swallowed.
+ */
+function normalizeInitializeForDiff(info: InitializeInfo): unknown {
+  const {
+    protocolVersion: _ignoredVersion,
+    capabilities,
+    ...rest
+  } = info as InitializeInfo & {
+    protocolVersion?: string;
+  };
+  let cleanedCapabilities: Record<string, unknown> | undefined = capabilities;
+  if (capabilities && typeof capabilities === "object") {
+    const { experimental: _ignoredExperimental, ...capRest } = capabilities as Record<
+      string,
+      unknown
+    >;
+    cleanedCapabilities = capRest;
+  }
+  return normalizeProbeResult({ ...rest, capabilities: cleanedCapabilities });
+}
+
+/**
  * Convert probe result to a map of endpoint -> JSON string
  */
 export function probeResultToFiles(result: ProbeResult): Map<string, string> {
   const files = new Map<string, string>();
 
   if (result.initialize) {
-    // TODO(mcp-draft, SEP-2575): the draft spec renames the `initialize`
-    // method to `server/discover`. When we adopt SDK v2 we should rename
-    // this snapshot file accordingly (or emit both for a release).
-    files.set("initialize", JSON.stringify(normalizeProbeResult(result.initialize), null, 2));
+    // Use the canonical "initialize" filename even if the SDK eventually
+    // exposes this via the draft's `server/discover` method (SEP-2575) — see
+    // CANONICAL_SNAPSHOT_NAMES. The initialize snapshot omits protocolVersion
+    // and capabilities.experimental from the diff body; the reporter surfaces
+    // protocol-version changes via a separate banner.
+    files.set(
+      CANONICAL_SNAPSHOT_NAMES.initialize,
+      JSON.stringify(normalizeInitializeForDiff(result.initialize), null, 2)
+    );
   }
   if (result.instructions) {
     files.set("instructions", result.instructions);
   }
   if (result.tools) {
     files.set(
-      "tools",
+      CANONICAL_SNAPSHOT_NAMES.tools,
       JSON.stringify(normalizeProbeResult(result.tools, { stripCacheHints: true }), null, 2)
     );
   }
   if (result.prompts) {
     files.set(
-      "prompts",
+      CANONICAL_SNAPSHOT_NAMES.prompts,
       JSON.stringify(normalizeProbeResult(result.prompts, { stripCacheHints: true }), null, 2)
     );
   }
   if (result.resources) {
     files.set(
-      "resources",
+      CANONICAL_SNAPSHOT_NAMES.resources,
       JSON.stringify(normalizeProbeResult(result.resources, { stripCacheHints: true }), null, 2)
     );
   }
   if (result.resourceTemplates) {
     files.set(
-      "resource_templates",
+      CANONICAL_SNAPSHOT_NAMES.resourceTemplates,
       JSON.stringify(
         normalizeProbeResult(result.resourceTemplates, { stripCacheHints: true }),
         null,

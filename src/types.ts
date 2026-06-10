@@ -84,6 +84,8 @@ export interface ProbeResult {
 }
 
 export interface InitializeInfo {
+  /** Negotiated MCP protocol version (captured via transport hook). */
+  protocolVersion?: string;
   serverInfo?: {
     name: string;
     version: string;
@@ -150,6 +152,10 @@ export interface TestResult {
   branchCounts?: PrimitiveCounts;
   /** Primitive counts from base ref */
   baseCounts?: PrimitiveCounts;
+  /** Negotiated MCP protocol version on the current branch probe */
+  branchProtocolVersion?: string;
+  /** Negotiated MCP protocol version on the base ref probe */
+  baseProtocolVersion?: string;
   /** Error message if probing failed */
   error?: string;
 }

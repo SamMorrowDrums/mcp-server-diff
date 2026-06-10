@@ -916,6 +916,8 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
       diffs: new Map(),
       branchCounts: branchData?.result ? extractCounts(branchData.result) : undefined,
       baseCounts: baseData?.result ? extractCounts(baseData.result) : undefined,
+      branchProtocolVersion: branchData?.result.initialize?.protocolVersion,
+      baseProtocolVersion: baseData?.result.initialize?.protocolVersion,
     };
 
     // Handle errors

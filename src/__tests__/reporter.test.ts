@@ -2,7 +2,12 @@
  * Tests for report generation
  */
 
-import { generateReport, generateMarkdownReport, generatePRSummary } from "../reporter.js";
+import {
+  generateReport,
+  generateMarkdownReport,
+  generatePRSummary,
+  formatProtocolVersionBanner,
+} from "../reporter.js";
 import type { TestResult, ConformanceReport } from "../types.js";
 
 describe("generateReport", () => {
@@ -396,5 +401,85 @@ describe("generatePRSummary", () => {
     expect(summary).toContain("- error-config");
     // Error configs should not be in the changed section
     expect(summary).not.toContain("**error-config:**");
+  });
+});
+
+describe("formatProtocolVersionBanner", () => {
+  function makeResult(overrides: Partial<TestResult>): TestResult {
+    return {
+      configName: "c",
+      transport: "stdio",
+      branchTime: 0,
+      baseTime: 0,
+      hasDifferences: false,
+      diffs: new Map(),
+      ...overrides,
+    };
+  }
+
+  it("returns null when versions match", () => {
+    const r = makeResult({
+      branchProtocolVersion: "2025-11-25",
+      baseProtocolVersion: "2025-11-25",
+    });
+    expect(formatProtocolVersionBanner(r)).toBeNull();
+  });
+
+  it("returns null when either side is unknown", () => {
+    expect(formatProtocolVersionBanner(makeResult({ branchProtocolVersion: "draft" }))).toBeNull();
+    expect(formatProtocolVersionBanner(makeResult({ baseProtocolVersion: "draft" }))).toBeNull();
+  });
+
+  it("emits a banner with both versions when they differ", () => {
+    const banner = formatProtocolVersionBanner(
+      makeResult({
+        baseProtocolVersion: "2025-11-25",
+        branchProtocolVersion: "draft",
+      })
+    );
+    expect(banner).not.toBeNull();
+    expect(banner).toContain("`2025-11-25`");
+    expect(banner).toContain("`draft`");
+    expect(banner).toContain("protocol version changed");
+  });
+});
+
+describe("markdown report protocol-version banner", () => {
+  it("shows the per-config banner inline when versions differ", () => {
+    const results: TestResult[] = [
+      {
+        configName: "demo",
+        transport: "stdio",
+        branchTime: 100,
+        baseTime: 100,
+        hasDifferences: false,
+        diffs: new Map(),
+        baseProtocolVersion: "2025-11-25",
+        branchProtocolVersion: "draft",
+      },
+    ];
+    const report = generateReport(results, "feature-branch", "main");
+    const md = generateMarkdownReport(report);
+    expect(md).toContain("MCP protocol version changed");
+    expect(md).toContain("`2025-11-25`");
+    expect(md).toContain("`draft`");
+  });
+
+  it("PR summary surfaces version drift at the top", () => {
+    const results: TestResult[] = [
+      {
+        configName: "demo",
+        transport: "stdio",
+        branchTime: 100,
+        baseTime: 100,
+        hasDifferences: false,
+        diffs: new Map(),
+        baseProtocolVersion: "2025-11-25",
+        branchProtocolVersion: "draft",
+      },
+    ];
+    const summary = generatePRSummary(generateReport(results, "feature", "main"));
+    expect(summary.split("\n").slice(0, 5).join("\n")).toContain("MCP protocol version changed");
+    expect(summary).toContain("`2025-11-25` → `draft`");
   });
 });

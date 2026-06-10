@@ -673,6 +673,30 @@ The probe now strips the `ttlMs` and `cacheScope` cache hints (CacheableResult, 
 
 The `initialize` snapshot is unchanged. The draft renames it to `server/discover` ([SEP-2575](https://modelcontextprotocol.io/specification/draft/changelog)), but we will adopt the new method name in a follow-up release once `@modelcontextprotocol/sdk` v2 ships.
 
+### Cross-spec-version diffing
+
+A common situation during the draft-spec rollout is that the base ref runs against MCP spec `2025-06-18` or `2025-11-25` while the branch runs against the draft. The tool is designed so that a server upgrading its SDK without changing its public surface produces a **clean diff**.
+
+What gets normalized away before snapshotting:
+
+- **CacheableResult hints** — top-level `ttlMs` / `cacheScope` on `tools/list`, `prompts/list`, `resources/list`, and `resources/templates/list` ([SEP-2461](https://modelcontextprotocol.io/specification/draft/changelog)).
+- **`_meta` protocol plumbing** — keys prefixed with `io.modelcontextprotocol/` (e.g. `protocolVersion`, `clientInfo`, `clientCapabilities`, `subscriptionId`, `logLevel`) are stripped from every `_meta` object, at any depth. An emptied `_meta` is dropped entirely.
+- **W3C trace context inside `_meta`** — `traceparent`, `tracestate`, and `baggage` (transport-injected for OTel propagation) are stripped from `_meta`.
+- **`initialize` envelope churn** — `protocolVersion` and `capabilities.experimental` are excluded from the `initialize` snapshot body. The negotiated protocol version is captured separately and surfaced by the reporter (see below).
+- **Endpoint names are canonicalized** — see `CANONICAL_SNAPSHOT_NAMES` in `src/probe.ts`. When the spec eventually renames `initialize` → `server/discover`, both will map to the same `initialize` snapshot file so a spec upgrade shows up as a content diff on one file, not a "removed + added" pair.
+
+What is **not** normalized (intentionally):
+
+- `serverInfo.version` (the SDK version is a legitimate signal worth tracking).
+- Nested `ttlMs` / `cacheScope` that live inside a tool/prompt/resource definition (those would be part of the public surface, not envelope hints).
+- Custom `_meta` keys outside the reserved `io.modelcontextprotocol/` namespace.
+
+When the base and branch probes negotiate different MCP protocol versions, the report (and the PR summary) emit a banner like:
+
+> ℹ️ **MCP protocol version changed:** `2025-11-25` → `draft`. Protocol-level plumbing is normalized away; any diff below reflects real public-surface changes.
+
+If the public surface is identical the diff is empty even when the protocol version moved — the banner is the only signal.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.

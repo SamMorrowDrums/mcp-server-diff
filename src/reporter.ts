@@ -136,6 +136,15 @@ export function generateMarkdownReport(report: ConformanceReport): string {
     lines.push(`- **Base Time:** ${formatTime(result.baseTime)}`);
     lines.push("");
 
+    // Surface protocol-version drift up front so reviewers know to expect
+    // (and ignore) protocol-shaped noise. Cross-version normalization keeps
+    // the diff itself clean, but the version change itself is worth flagging.
+    const protocolBanner = formatProtocolVersionBanner(result);
+    if (protocolBanner) {
+      lines.push(protocolBanner);
+      lines.push("");
+    }
+
     if (result.hasDifferences) {
       lines.push("#### Changes");
       lines.push("");
@@ -166,6 +175,22 @@ function formatTime(ms: number): string {
   }
   const seconds = (ms / 1000).toFixed(2);
   return `${seconds}s`;
+}
+
+/**
+ * Build a banner string flagging that the MCP protocol version differs
+ * between the base and branch probes. Returns `null` when the versions match
+ * (or either side is unknown). The normalizer already scrubs protocol-shaped
+ * noise from the diff body, so this banner exists purely to give reviewers
+ * context for any leftover changes.
+ */
+export function formatProtocolVersionBanner(result: TestResult): string | null {
+  const base = result.baseProtocolVersion;
+  const branch = result.branchProtocolVersion;
+  if (!base || !branch || base === branch) {
+    return null;
+  }
+  return `> ℹ️ **MCP protocol version changed:** \`${base}\` → \`${branch}\`. Protocol-level plumbing (\`_meta\` keys, cache hints, \`capabilities.experimental\`) is normalized away; any diff below reflects real public-surface changes.`;
 }
 
 /**
@@ -226,6 +251,27 @@ export function saveReport(report: ConformanceReport, markdown: string, outputDi
  */
 export function generatePRSummary(report: ConformanceReport): string {
   const lines: string[] = [];
+
+  // Surface protocol-version drift at the very top of the PR summary so
+  // reviewers immediately know the diff was taken across spec revisions.
+  const versionDriftLines: string[] = [];
+  for (const r of report.results) {
+    const banner = formatProtocolVersionBanner(r);
+    if (banner) {
+      versionDriftLines.push(
+        `- **${r.configName}:** \`${r.baseProtocolVersion}\` → \`${r.branchProtocolVersion}\``
+      );
+    }
+  }
+  if (versionDriftLines.length > 0) {
+    lines.push("> ℹ️ **MCP protocol version changed in one or more configurations:**");
+    for (const v of versionDriftLines) lines.push(`> ${v}`);
+    lines.push(">");
+    lines.push(
+      "> Protocol-level plumbing is normalized away; any diff below reflects real public-surface changes."
+    );
+    lines.push("");
+  }
 
   if (report.diffCount === 0) {
     lines.push("## ✅ MCP Conformance: No Changes");
