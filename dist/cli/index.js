@@ -6562,7 +6562,7 @@ class Ajv {
     constructor(opts = {}) {
         this.schemas = {};
         this.refs = {};
-        this.formats = {};
+        this.formats = Object.create(null);
         this._compilations = new Set();
         this._loading = {};
         this._cache = new Map();
@@ -12813,6 +12813,24 @@ class SecureProxyConnectionError extends UndiciError {
   [kSecureProxyConnectionError] = true
 }
 
+const kMessageSizeExceededError = Symbol.for('undici.error.UND_ERR_WS_MESSAGE_SIZE_EXCEEDED')
+class MessageSizeExceededError extends UndiciError {
+  constructor (message) {
+    super(message)
+    this.name = 'MessageSizeExceededError'
+    this.message = message || 'Max decompressed message size exceeded'
+    this.code = 'UND_ERR_WS_MESSAGE_SIZE_EXCEEDED'
+  }
+
+  static [Symbol.hasInstance] (instance) {
+    return instance && instance[kMessageSizeExceededError] === true
+  }
+
+  get [kMessageSizeExceededError] () {
+    return true
+  }
+}
+
 module.exports = {
   AbortError,
   HTTPParserError,
@@ -12836,7 +12854,8 @@ module.exports = {
   ResponseExceededMaxSizeError,
   RequestRetryError,
   ResponseError,
-  SecureProxyConnectionError
+  SecureProxyConnectionError,
+  MessageSizeExceededError
 }
 
 
@@ -12911,6 +12930,10 @@ class Request {
 
     if (upgrade && typeof upgrade !== 'string') {
       throw new InvalidArgumentError('upgrade must be a string')
+    }
+
+    if (upgrade && !isValidHeaderValue(upgrade)) {
+      throw new InvalidArgumentError('invalid upgrade header')
     }
 
     if (headersTimeout != null && (!Number.isFinite(headersTimeout) || headersTimeout < 0)) {
@@ -13207,13 +13230,19 @@ function processHeader (request, key, val) {
     val = `${val}`
   }
 
-  if (request.host === null && headerName === 'host') {
+  if (headerName === 'host') {
+    if (request.host !== null) {
+      throw new InvalidArgumentError('duplicate host header')
+    }
     if (typeof val !== 'string') {
       throw new InvalidArgumentError('invalid host header')
     }
     // Consumed by Client
     request.host = val
-  } else if (request.contentLength === null && headerName === 'content-length') {
+  } else if (headerName === 'content-length') {
+    if (request.contentLength !== null) {
+      throw new InvalidArgumentError('duplicate content-length header')
+    }
     request.contentLength = parseInt(val, 10)
     if (!Number.isFinite(request.contentLength)) {
       throw new InvalidArgumentError('invalid content-length header')
@@ -14232,8 +14261,6 @@ function defaultFactory (origin, opts) {
 
 class Agent extends DispatcherBase {
   constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-    super()
-
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -14245,6 +14272,8 @@ class Agent extends DispatcherBase {
     if (!Number.isInteger(maxRedirections) || maxRedirections < 0) {
       throw new InvalidArgumentError('maxRedirections must be a positive number')
     }
+
+    super(options)
 
     if (connect && typeof connect !== 'function') {
       connect = { ...connect }
@@ -14839,27 +14868,69 @@ class Parser {
 
       const offset = llhttp.llhttp_get_error_pos(this.ptr) - currentBufferPtr
 
-      if (ret === constants.ERROR.PAUSED_UPGRADE) {
-        this.onUpgrade(data.slice(offset))
-      } else if (ret === constants.ERROR.PAUSED) {
-        this.paused = true
-        socket.unshift(data.slice(offset))
-      } else if (ret !== constants.ERROR.OK) {
-        const ptr = llhttp.llhttp_get_error_reason(this.ptr)
-        let message = ''
-        /* istanbul ignore else: difficult to make a test case for */
-        if (ptr) {
-          const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
-          message =
-            'Response does not match the HTTP/1.1 protocol (' +
-            Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-            ')'
+      if (ret !== constants.ERROR.OK) {
+        const body = data.subarray(offset)
+
+        if (ret === constants.ERROR.PAUSED_UPGRADE) {
+          this.onUpgrade(body)
+        } else if (ret === constants.ERROR.PAUSED) {
+          this.paused = true
+          socket.unshift(body)
+        } else {
+          throw this.createError(ret, body)
         }
-        throw new HTTPParserError(message, constants.ERROR[ret], data.slice(offset))
       }
     } catch (err) {
       util.destroy(socket, err)
     }
+  }
+
+  finish () {
+    assert(currentParser === null)
+    assert(this.ptr != null)
+    assert(!this.paused)
+
+    const { llhttp } = this
+
+    let ret
+
+    try {
+      currentParser = this
+      ret = llhttp.llhttp_finish(this.ptr)
+    } finally {
+      currentParser = null
+    }
+
+    if (ret === constants.ERROR.OK) {
+      return null
+    }
+
+    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+      this.paused = true
+      return null
+    }
+
+    return this.createError(ret, EMPTY_BUF)
+  }
+
+  createError (ret, data) {
+    const { llhttp, contentLength, bytesRead } = this
+
+    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const ptr = llhttp.llhttp_get_error_reason(this.ptr)
+    let message = ''
+    if (ptr) {
+      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+      message =
+        'Response does not match the HTTP/1.1 protocol (' +
+        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+        ')'
+    }
+
+    return new HTTPParserError(message, constants.ERROR[ret], data)
   }
 
   destroy () {
@@ -15233,8 +15304,11 @@ async function connectH1 (client, socket) {
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
     // to the user.
     if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so for as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        this[kError] = parserErr
+        this[kClient][kOnError](parserErr)
+      }
       return
     }
 
@@ -15253,8 +15327,10 @@ async function connectH1 (client, socket) {
     const parser = this[kParser]
 
     if (parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so far as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        util.destroy(this, parserErr)
+      }
       return
     }
 
@@ -15266,8 +15342,7 @@ async function connectH1 (client, socket) {
 
     if (parser) {
       if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-        // We treat all incoming data so far as a valid response.
-        parser.onMessageComplete()
+        this[kError] = parser.finish() || this[kError]
       }
 
       this[kParser].destroy()
@@ -16794,9 +16869,10 @@ class Client extends DispatcherBase {
     autoSelectFamilyAttemptTimeout,
     // h2
     maxConcurrentStreams,
-    allowH2
+    allowH2,
+    webSocket
   } = {}) {
-    super()
+    super({ webSocket })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -17328,15 +17404,23 @@ const { kDestroy, kClose, kClosed, kDestroyed, kDispatch, kInterceptors } = __nc
 const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
+const kWebSocketOptions = Symbol('webSocketOptions')
 
 class DispatcherBase extends Dispatcher {
-  constructor () {
+  constructor (opts) {
     super()
 
     this[kDestroyed] = false
     this[kOnDestroyed] = null
     this[kClosed] = false
     this[kOnClosed] = []
+    this[kWebSocketOptions] = opts?.webSocket ?? {}
+  }
+
+  get webSocketOptions () {
+    return {
+      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
   }
 
   get destroyed () {
@@ -17896,8 +17980,8 @@ const kRemoveClient = Symbol('remove client')
 const kStats = Symbol('stats')
 
 class PoolBase extends DispatcherBase {
-  constructor () {
-    super()
+  constructor (opts) {
+    super(opts)
 
     this[kQueue] = new FixedQueue()
     this[kClients] = []
@@ -18156,8 +18240,6 @@ class Pool extends PoolBase {
     allowH2,
     ...options
   } = {}) {
-    super()
-
     if (connections != null && (!Number.isFinite(connections) || connections < 0)) {
       throw new InvalidArgumentError('invalid connections')
     }
@@ -18181,6 +18263,8 @@ class Pool extends PoolBase {
         ...connect
       })
     }
+
+    super(options)
 
     this[kInterceptors] = options.interceptors?.Pool && Array.isArray(options.interceptors.Pool)
       ? options.interceptors.Pool
@@ -35930,6 +36014,7 @@ module.exports = {
 
 const { createInflateRaw, Z_DEFAULT_WINDOWBITS } = __nccwpck_require__(8522)
 const { isValidClientWindowBits } = __nccwpck_require__(8625)
+const { MessageSizeExceededError } = __nccwpck_require__(8707)
 
 const tail = Buffer.from([0x00, 0x00, 0xff, 0xff])
 const kBuffer = Symbol('kBuffer')
@@ -35941,17 +36026,29 @@ class PerMessageDeflate {
 
   #options = {}
 
-  constructor (extensions) {
+  #maxPayloadSize = 0
+
+  /**
+   * @param {Map<string, string>} extensions
+   */
+  constructor (extensions, options) {
     this.#options.serverNoContextTakeover = extensions.has('server_no_context_takeover')
     this.#options.serverMaxWindowBits = extensions.get('server_max_window_bits')
+
+    this.#maxPayloadSize = options.maxPayloadSize
   }
 
+  /**
+   * Decompress a compressed payload.
+   * @param {Buffer} chunk Compressed data
+   * @param {boolean} fin Final fragment flag
+   * @param {Function} callback Callback function
+   */
   decompress (chunk, fin, callback) {
     // An endpoint uses the following algorithm to decompress a message.
     // 1.  Append 4 octets of 0x00 0x00 0xff 0xff to the tail end of the
     //     payload of the message.
     // 2.  Decompress the resulting data using DEFLATE.
-
     if (!this.#inflate) {
       let windowBits = Z_DEFAULT_WINDOWBITS
 
@@ -35964,13 +36061,26 @@ class PerMessageDeflate {
         windowBits = Number.parseInt(this.#options.serverMaxWindowBits)
       }
 
-      this.#inflate = createInflateRaw({ windowBits })
+      try {
+        this.#inflate = createInflateRaw({ windowBits })
+      } catch (err) {
+        callback(err)
+        return
+      }
       this.#inflate[kBuffer] = []
       this.#inflate[kLength] = 0
 
       this.#inflate.on('data', (data) => {
-        this.#inflate[kBuffer].push(data)
         this.#inflate[kLength] += data.length
+
+        if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
+          callback(new MessageSizeExceededError())
+          this.#inflate.removeAllListeners()
+          this.#inflate = null
+          return
+        }
+
+        this.#inflate[kBuffer].push(data)
       })
 
       this.#inflate.on('error', (err) => {
@@ -35985,6 +36095,10 @@ class PerMessageDeflate {
     }
 
     this.#inflate.flush(() => {
+      if (!this.#inflate) {
+        return
+      }
+
       const full = Buffer.concat(this.#inflate[kBuffer], this.#inflate[kLength])
 
       this.#inflate[kBuffer].length = 0
@@ -36023,6 +36137,7 @@ const {
 const { WebsocketFrameSend } = __nccwpck_require__(3264)
 const { closeWebSocketConnection } = __nccwpck_require__(6897)
 const { PerMessageDeflate } = __nccwpck_require__(9469)
+const { MessageSizeExceededError } = __nccwpck_require__(8707)
 
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -36031,6 +36146,7 @@ const { PerMessageDeflate } = __nccwpck_require__(9469)
 
 class ByteParser extends Writable {
   #buffers = []
+  #fragmentsBytes = 0
   #byteOffset = 0
   #loop = false
 
@@ -36042,14 +36158,23 @@ class ByteParser extends Writable {
   /** @type {Map<string, PerMessageDeflate>} */
   #extensions
 
-  constructor (ws, extensions) {
+  /** @type {number} */
+  #maxPayloadSize
+
+  /**
+   * @param {import('./websocket').WebSocket} ws
+   * @param {Map<string, string>|null} extensions
+   * @param {{ maxPayloadSize?: number }} [options]
+   */
+  constructor (ws, extensions, options = {}) {
     super()
 
     this.ws = ws
     this.#extensions = extensions == null ? new Map() : extensions
+    this.#maxPayloadSize = options.maxPayloadSize ?? 0
 
     if (this.#extensions.has('permessage-deflate')) {
-      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions))
+      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options))
     }
   }
 
@@ -36063,6 +36188,19 @@ class ByteParser extends Writable {
     this.#loop = true
 
     this.run(callback)
+  }
+
+  #validatePayloadLength () {
+    if (
+      this.#maxPayloadSize > 0 &&
+      !isControlFrame(this.#info.opcode) &&
+      this.#info.payloadLength > this.#maxPayloadSize
+    ) {
+      failWebsocketConnection(this.ws, 'Payload size exceeds maximum allowed size')
+      return false
+    }
+
+    return true
   }
 
   /**
@@ -36153,6 +36291,10 @@ class ByteParser extends Writable {
         if (payloadLength <= 125) {
           this.#info.payloadLength = payloadLength
           this.#state = parserStates.READ_DATA
+
+          if (!this.#validatePayloadLength()) {
+            return
+          }
         } else if (payloadLength === 126) {
           this.#state = parserStates.PAYLOADLENGTH_16
         } else if (payloadLength === 127) {
@@ -36177,6 +36319,10 @@ class ByteParser extends Writable {
 
         this.#info.payloadLength = buffer.readUInt16BE(0)
         this.#state = parserStates.READ_DATA
+
+        if (!this.#validatePayloadLength()) {
+          return
+        }
       } else if (this.#state === parserStates.PAYLOADLENGTH_64) {
         if (this.#byteOffset < 8) {
           return callback()
@@ -36184,6 +36330,7 @@ class ByteParser extends Writable {
 
         const buffer = this.consume(8)
         const upper = buffer.readUInt32BE(0)
+        const lower = buffer.readUInt32BE(4)
 
         // 2^31 is the maximum bytes an arraybuffer can contain
         // on 32-bit systems. Although, on 64-bit systems, this is
@@ -36191,15 +36338,17 @@ class ByteParser extends Writable {
         // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Errors/Invalid_array_length
         // https://source.chromium.org/chromium/chromium/src/+/main:v8/src/common/globals.h;drc=1946212ac0100668f14eb9e2843bdd846e510a1e;bpv=1;bpt=1;l=1275
         // https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/js-array-buffer.h;l=34;drc=1946212ac0100668f14eb9e2843bdd846e510a1e
-        if (upper > 2 ** 31 - 1) {
+        if (upper !== 0 || lower > 2 ** 31 - 1) {
           failWebsocketConnection(this.ws, 'Received payload length > 2^31 bytes.')
           return
         }
 
-        const lower = buffer.readUInt32BE(4)
-
-        this.#info.payloadLength = (upper << 8) + lower
+        this.#info.payloadLength = lower
         this.#state = parserStates.READ_DATA
+
+        if (!this.#validatePayloadLength()) {
+          return
+        }
       } else if (this.#state === parserStates.READ_DATA) {
         if (this.#byteOffset < this.#info.payloadLength) {
           return callback()
@@ -36212,42 +36361,53 @@ class ByteParser extends Writable {
           this.#state = parserStates.INFO
         } else {
           if (!this.#info.compressed) {
-            this.#fragments.push(body)
+            this.writeFragments(body)
+
+            if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
+              failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+              return
+            }
 
             // If the frame is not fragmented, a message has been received.
             // If the frame is fragmented, it will terminate with a fin bit set
             // and an opcode of 0 (continuation), therefore we handle that when
             // parsing continuation frames, not here.
             if (!this.#info.fragmented && this.#info.fin) {
-              const fullMessage = Buffer.concat(this.#fragments)
-              websocketMessageReceived(this.ws, this.#info.binaryType, fullMessage)
-              this.#fragments.length = 0
+              websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments())
             }
 
             this.#state = parserStates.INFO
           } else {
-            this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
-              if (error) {
-                closeWebSocketConnection(this.ws, 1007, error.message, error.message.length)
-                return
-              }
+            this.#extensions.get('permessage-deflate').decompress(
+              body,
+              this.#info.fin,
+              (error, data) => {
+                if (error) {
+                  failWebsocketConnection(this.ws, error.message)
+                  return
+                }
 
-              this.#fragments.push(data)
+                this.writeFragments(data)
 
-              if (!this.#info.fin) {
-                this.#state = parserStates.INFO
+                if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
+                  failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+                  return
+                }
+
+                if (!this.#info.fin) {
+                  this.#state = parserStates.INFO
+                  this.#loop = true
+                  this.run(callback)
+                  return
+                }
+
+                websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments())
+
                 this.#loop = true
+                this.#state = parserStates.INFO
                 this.run(callback)
-                return
               }
-
-              websocketMessageReceived(this.ws, this.#info.binaryType, Buffer.concat(this.#fragments))
-
-              this.#loop = true
-              this.#state = parserStates.INFO
-              this.#fragments.length = 0
-              this.run(callback)
-            })
+            )
 
             this.#loop = false
             break
@@ -36297,6 +36457,26 @@ class ByteParser extends Writable {
     this.#byteOffset -= n
 
     return buffer
+  }
+
+  writeFragments (fragment) {
+    this.#fragmentsBytes += fragment.length
+    this.#fragments.push(fragment)
+  }
+
+  consumeFragments () {
+    const fragments = this.#fragments
+
+    if (fragments.length === 1) {
+      this.#fragmentsBytes = 0
+      return fragments.shift()
+    }
+
+    const output = Buffer.concat(fragments, this.#fragmentsBytes)
+    this.#fragments = []
+    this.#fragmentsBytes = 0
+
+    return output
   }
 
   parseCloseBody (data) {
@@ -36832,6 +37012,12 @@ function parseExtensions (extensions) {
  * @param {string} value
  */
 function isValidClientWindowBits (value) {
+  // Must have at least one character
+  if (value.length === 0) {
+    return false
+  }
+
+  // Check all characters are ASCII digits
   for (let i = 0; i < value.length; i++) {
     const byte = value.charCodeAt(i)
 
@@ -36840,7 +37026,9 @@ function isValidClientWindowBits (value) {
     }
   }
 
-  return true
+  // Check numeric range: zlib requires windowBits in range 8-15
+  const num = Number.parseInt(value, 10)
+  return num >= 8 && num <= 15
 }
 
 // https://nodejs.org/api/intl.html#detecting-internationalization-support
@@ -37318,11 +37506,15 @@ class WebSocket extends EventTarget {
    * @see https://websockets.spec.whatwg.org/#feedback-from-the-protocol
    */
   #onConnectionEstablished (response, parsedExtensions) {
-    // processResponse is called when the "response’s header list has been received and initialized."
+    // processResponse is called when the "response's header list has been received and initialized."
     // once this happens, the connection is open
     this[kResponse] = response
 
-    const parser = new ByteParser(this, parsedExtensions)
+    const maxPayloadSize = this[kController]?.dispatcher?.webSocketOptions?.maxPayloadSize
+
+    const parser = new ByteParser(this, parsedExtensions, {
+      maxPayloadSize
+    })
     parser.on('drain', onParserDrain)
     parser.on('error', onParserError.bind(this))
 
@@ -37852,7 +38044,7 @@ module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("util");
 
 
 
-const { normalizeIPv6, removeDotSegments, recomposeAuthority, normalizeComponentEncoding, isIPv4, nonSimpleDomain } = __nccwpck_require__(5077)
+const { normalizeIPv6, removeDotSegments, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, escapePreservingEscapes, reescapeHostDelimiters, isIPv4, nonSimpleDomain } = __nccwpck_require__(5077)
 const { SCHEMES, getSchemeHandler } = __nccwpck_require__(5300)
 
 /**
@@ -37863,7 +38055,7 @@ const { SCHEMES, getSchemeHandler } = __nccwpck_require__(5300)
  */
 function normalize (uri, options) {
   if (typeof uri === 'string') {
-    uri = /** @type {T} */ (serialize(parse(uri, options), options))
+    uri = /** @type {T} */ (normalizeString(uri, options))
   } else if (typeof uri === 'object') {
     uri = /** @type {T} */ (parse(serialize(uri, options), options))
   }
@@ -37958,21 +38150,10 @@ function resolveComponent (base, relative, options, skipNormalization) {
  * @returns {boolean}
  */
 function equal (uriA, uriB, options) {
-  if (typeof uriA === 'string') {
-    uriA = unescape(uriA)
-    uriA = serialize(normalizeComponentEncoding(parse(uriA, options), true), { ...options, skipEscape: true })
-  } else if (typeof uriA === 'object') {
-    uriA = serialize(normalizeComponentEncoding(uriA, true), { ...options, skipEscape: true })
-  }
+  const normalizedA = normalizeComparableURI(uriA, options)
+  const normalizedB = normalizeComparableURI(uriB, options)
 
-  if (typeof uriB === 'string') {
-    uriB = unescape(uriB)
-    uriB = serialize(normalizeComponentEncoding(parse(uriB, options), true), { ...options, skipEscape: true })
-  } else if (typeof uriB === 'object') {
-    uriB = serialize(normalizeComponentEncoding(uriB, true), { ...options, skipEscape: true })
-  }
-
-  return uriA.toLowerCase() === uriB.toLowerCase()
+  return normalizedA !== undefined && normalizedB !== undefined && normalizedA.toLowerCase() === normalizedB.toLowerCase()
 }
 
 /**
@@ -38008,13 +38189,13 @@ function serialize (cmpts, opts) {
 
   if (component.path !== undefined) {
     if (!options.skipEscape) {
-      component.path = escape(component.path)
+      component.path = escapePreservingEscapes(component.path)
 
       if (component.scheme !== undefined) {
         component.path = component.path.split('%3A').join(':')
       }
     } else {
-      component.path = unescape(component.path)
+      component.path = normalizePercentEncoding(component.path)
     }
   }
 
@@ -38066,11 +38247,28 @@ function serialize (cmpts, opts) {
 const URI_PARSE = /^(?:([^#/:?]+):)?(?:\/\/((?:([^#/?@]*)@)?(\[[^#/?\]]+\]|[^#/:?]*)(?::(\d*))?))?([^#?]*)(?:\?([^#]*))?(?:#((?:.|[\n\r])*))?/u
 
 /**
+ * @param {import('./types/index').URIComponent} parsed
+ * @param {RegExpMatchArray} matches
+ * @returns {string|undefined}
+ */
+function getParseError (parsed, matches) {
+  if (matches[2] !== undefined && parsed.path && parsed.path[0] !== '/') {
+    return 'URI path must start with "/" when authority is present.'
+  }
+
+  if (typeof parsed.port === 'number' && (parsed.port < 0 || parsed.port > 65535)) {
+    return 'URI port is malformed.'
+  }
+
+  return undefined
+}
+
+/**
  * @param {string} uri
  * @param {import('./types/index').Options} [opts]
- * @returns
+ * @returns {{ parsed: import('./types/index').URIComponent, malformedAuthorityOrPort: boolean }}
  */
-function parse (uri, opts) {
+function parseWithStatus (uri, opts) {
   const options = Object.assign({}, opts)
   /** @type {import('./types/index').URIComponent} */
   const parsed = {
@@ -38082,6 +38280,8 @@ function parse (uri, opts) {
     query: undefined,
     fragment: undefined
   }
+
+  let malformedAuthorityOrPort = false
 
   let isIP = false
   if (options.reference === 'suffix') {
@@ -38108,6 +38308,13 @@ function parse (uri, opts) {
     if (isNaN(parsed.port)) {
       parsed.port = matches[5]
     }
+
+    const parseError = getParseError(parsed, matches)
+    if (parseError !== undefined) {
+      parsed.error = parsed.error || parseError
+      malformedAuthorityOrPort = true
+    }
+
     if (parsed.host) {
       const ipv4result = isIPv4(parsed.host)
       if (ipv4result === false) {
@@ -38156,14 +38363,18 @@ function parse (uri, opts) {
           parsed.scheme = unescape(parsed.scheme)
         }
         if (parsed.host !== undefined) {
-          parsed.host = unescape(parsed.host)
+          parsed.host = reescapeHostDelimiters(unescape(parsed.host), isIP)
         }
       }
       if (parsed.path) {
-        parsed.path = escape(unescape(parsed.path))
+        parsed.path = normalizePathEncoding(parsed.path)
       }
       if (parsed.fragment) {
-        parsed.fragment = encodeURI(decodeURIComponent(parsed.fragment))
+        try {
+          parsed.fragment = encodeURI(decodeURIComponent(parsed.fragment))
+        } catch {
+          parsed.error = parsed.error || 'URI malformed'
+        }
       }
     }
 
@@ -38174,7 +38385,54 @@ function parse (uri, opts) {
   } else {
     parsed.error = parsed.error || 'URI can not be parsed.'
   }
-  return parsed
+  return { parsed, malformedAuthorityOrPort }
+}
+
+/**
+ * @param {string} uri
+ * @param {import('./types/index').Options} [opts]
+ * @returns
+ */
+function parse (uri, opts) {
+  return parseWithStatus(uri, opts).parsed
+}
+
+/**
+ * @param {string} uri
+ * @param {import('./types/index').Options} [opts]
+ * @returns {string}
+ */
+function normalizeString (uri, opts) {
+  return normalizeStringWithStatus(uri, opts).normalized
+}
+
+/**
+ * @param {string} uri
+ * @param {import('./types/index').Options} [opts]
+ * @returns {{ normalized: string, malformedAuthorityOrPort: boolean }}
+ */
+function normalizeStringWithStatus (uri, opts) {
+  const { parsed, malformedAuthorityOrPort } = parseWithStatus(uri, opts)
+  return {
+    normalized: malformedAuthorityOrPort ? uri : serialize(parsed, opts),
+    malformedAuthorityOrPort
+  }
+}
+
+/**
+ * @param {import ('./types/index').URIComponent|string} uri
+ * @param {import('./types/index').Options} [opts]
+ * @returns {string|undefined}
+ */
+function normalizeComparableURI (uri, opts) {
+  if (typeof uri === 'string') {
+    const { normalized, malformedAuthorityOrPort } = normalizeStringWithStatus(uri, opts)
+    return malformedAuthorityOrPort ? undefined : normalized
+  }
+
+  if (typeof uri === 'object') {
+    return serialize(uri, opts)
+  }
 }
 
 const fastUri = {
@@ -38479,6 +38737,15 @@ const isUUID = RegExp.prototype.test.bind(/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\d
 /** @type {(value: string) => boolean} */
 const isIPv4 = RegExp.prototype.test.bind(/^(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)$/u)
 
+/** @type {(value: string) => boolean} */
+const isHexPair = RegExp.prototype.test.bind(/^[\da-f]{2}$/iu)
+
+/** @type {(value: string) => boolean} */
+const isUnreserved = RegExp.prototype.test.bind(/^[\da-z\-._~]$/iu)
+
+/** @type {(value: string) => boolean} */
+const isPathCharacter = RegExp.prototype.test.bind(/^[\da-z\-._~!$&'()*+,;=:@/]$/iu)
+
 /**
  * @param {Array<string>} input
  * @returns {string}
@@ -38737,31 +39004,126 @@ function removeDotSegments (path) {
 }
 
 /**
- * @param {import('../types/index').URIComponent} component
- * @param {boolean} esc
- * @returns {import('../types/index').URIComponent}
+ * Re-escape RFC 3986 gen-delims that must not appear literally in the host.
+ * After the URI regex parses, these characters cannot be literal in the host
+ * field, so any that appear after decoding came from percent-encoding and
+ * must be restored to prevent authority structure changes.
+ *
+ * @param {string} host
+ * @param {boolean} isIP - true for IPv4/IPv6 hosts (skip colon re-escaping)
+ * @returns {string}
  */
-function normalizeComponentEncoding (component, esc) {
-  const func = esc !== true ? escape : unescape
-  if (component.scheme !== undefined) {
-    component.scheme = func(component.scheme)
+const HOST_DELIMS = { '@': '%40', '/': '%2F', '?': '%3F', '#': '%23', ':': '%3A' }
+const HOST_DELIM_RE = /[@/?#:]/g
+const HOST_DELIM_NO_COLON_RE = /[@/?#]/g
+
+function reescapeHostDelimiters (host, isIP) {
+  const re = isIP ? HOST_DELIM_NO_COLON_RE : HOST_DELIM_RE
+  re.lastIndex = 0
+  return host.replace(re, (ch) => HOST_DELIMS[ch])
+}
+
+/**
+ * Normalizes percent escapes and optionally decodes only unreserved ASCII bytes.
+ * Reserved delimiters such as `%2F` and `%2E` stay escaped.
+ *
+ * @param {string} input
+ * @param {boolean} [decodeUnreserved=false]
+ * @returns {string}
+ */
+function normalizePercentEncoding (input, decodeUnreserved = false) {
+  if (input.indexOf('%') === -1) {
+    return input
   }
-  if (component.userinfo !== undefined) {
-    component.userinfo = func(component.userinfo)
+
+  let output = ''
+
+  for (let i = 0; i < input.length; i++) {
+    if (input[i] === '%' && i + 2 < input.length) {
+      const hex = input.slice(i + 1, i + 3)
+      if (isHexPair(hex)) {
+        const normalizedHex = hex.toUpperCase()
+        const decoded = String.fromCharCode(parseInt(normalizedHex, 16))
+
+        if (decodeUnreserved && isUnreserved(decoded)) {
+          output += decoded
+        } else {
+          output += '%' + normalizedHex
+        }
+
+        i += 2
+        continue
+      }
+    }
+
+    output += input[i]
   }
-  if (component.host !== undefined) {
-    component.host = func(component.host)
+
+  return output
+}
+
+/**
+ * Normalizes path data without turning reserved escapes into live path syntax.
+ * Valid escapes are uppercased, raw unsafe characters are escaped, and only
+ * unreserved bytes that are not `.` are decoded.
+ *
+ * @param {string} input
+ * @returns {string}
+ */
+function normalizePathEncoding (input) {
+  let output = ''
+
+  for (let i = 0; i < input.length; i++) {
+    if (input[i] === '%' && i + 2 < input.length) {
+      const hex = input.slice(i + 1, i + 3)
+      if (isHexPair(hex)) {
+        const normalizedHex = hex.toUpperCase()
+        const decoded = String.fromCharCode(parseInt(normalizedHex, 16))
+
+        if (decoded !== '.' && isUnreserved(decoded)) {
+          output += decoded
+        } else {
+          output += '%' + normalizedHex
+        }
+
+        i += 2
+        continue
+      }
+    }
+
+    if (isPathCharacter(input[i])) {
+      output += input[i]
+    } else {
+      output += escape(input[i])
+    }
   }
-  if (component.path !== undefined) {
-    component.path = func(component.path)
+
+  return output
+}
+
+/**
+ * Escapes a component while preserving existing valid percent escapes.
+ *
+ * @param {string} input
+ * @returns {string}
+ */
+function escapePreservingEscapes (input) {
+  let output = ''
+
+  for (let i = 0; i < input.length; i++) {
+    if (input[i] === '%' && i + 2 < input.length) {
+      const hex = input.slice(i + 1, i + 3)
+      if (isHexPair(hex)) {
+        output += '%' + hex.toUpperCase()
+        i += 2
+        continue
+      }
+    }
+
+    output += escape(input[i])
   }
-  if (component.query !== undefined) {
-    component.query = func(component.query)
-  }
-  if (component.fragment !== undefined) {
-    component.fragment = func(component.fragment)
-  }
-  return component
+
+  return output
 }
 
 /**
@@ -38783,7 +39145,7 @@ function recomposeAuthority (component) {
       if (ipV6res.isIPV6 === true) {
         host = `[${ipV6res.escapedHost}]`
       } else {
-        host = component.host
+        host = reescapeHostDelimiters(host, false)
       }
     }
     uriTokens.push(host)
@@ -38800,7 +39162,10 @@ function recomposeAuthority (component) {
 module.exports = {
   nonSimpleDomain,
   recomposeAuthority,
-  normalizeComponentEncoding,
+  reescapeHostDelimiters,
+  normalizePercentEncoding,
+  normalizePathEncoding,
+  escapePreservingEscapes,
   removeDotSegments,
   isIPv4,
   isUUID,
@@ -44455,10 +44820,9 @@ const CursorSchema = schemas_string();
  */
 const TaskCreationParamsSchema = looseObject({
     /**
-     * Time in milliseconds to keep task results available after completion.
-     * If null, the task has unlimited lifetime until manually cleaned up.
+     * Requested duration in milliseconds to retain task from creation.
      */
-    ttl: union([schemas_number(), schemas_null()]).optional(),
+    ttl: schemas_number().optional(),
     /**
      * Time in milliseconds to wait between task status requests.
      */
@@ -44870,7 +45234,11 @@ const ClientCapabilitiesSchema = object({
     /**
      * Present if the client supports task creation.
      */
-    tasks: ClientTasksCapabilitySchema.optional()
+    tasks: ClientTasksCapabilitySchema.optional(),
+    /**
+     * Extensions that the client supports. Keys are extension identifiers (vendor-prefix/extension-name).
+     */
+    extensions: record(schemas_string(), AssertObjectSchema).optional()
 });
 const InitializeRequestParamsSchema = BaseRequestParamsSchema.extend({
     /**
@@ -44941,7 +45309,11 @@ const ServerCapabilitiesSchema = object({
     /**
      * Present if the server supports task creation.
      */
-    tasks: ServerTasksCapabilitySchema.optional()
+    tasks: ServerTasksCapabilitySchema.optional(),
+    /**
+     * Extensions that the server supports. Keys are extension identifiers (vendor-prefix/extension-name).
+     */
+    extensions: record(schemas_string(), AssertObjectSchema).optional()
 });
 /**
  * After receiving an initialize request from the client, the server sends this response.
@@ -45215,6 +45587,12 @@ const ResourceSchema = object({
      * The MIME type of this resource, if known.
      */
     mimeType: optional(schemas_string()),
+    /**
+     * The size of the raw resource content, in bytes (i.e., before base64 encoding or any tokenization), if known.
+     *
+     * This can be used by Hosts to display file sizes and estimate context window usage.
+     */
+    size: optional(schemas_number()),
     /**
      * Optional annotations for the client.
      */
@@ -48022,6 +48400,10 @@ class Protocol {
         this._progressHandlers.clear();
         this._taskProgressTokens.clear();
         this._pendingDebouncedNotifications.clear();
+        for (const info of this._timeoutInfo.values()) {
+            clearTimeout(info.timeoutId);
+        }
+        this._timeoutInfo.clear();
         // Abort all in-flight request handlers so they stop sending messages
         for (const controller of this._requestHandlerAbortControllers.values()) {
             controller.abort();
@@ -48181,7 +48563,11 @@ class Protocol {
         })
             .catch(error => this._onerror(new Error(`Failed to send response: ${error}`)))
             .finally(() => {
-            this._requestHandlerAbortControllers.delete(request.id);
+            // Only delete if the stored controller is still ours; after close()+connect(),
+            // a new connection may have reused the same request ID with a different controller.
+            if (this._requestHandlerAbortControllers.get(request.id) === abortController) {
+                this._requestHandlerAbortControllers.delete(request.id);
+            }
         });
     }
     _onprogress(notification) {
@@ -49946,7 +50332,7 @@ class StdioClientTransport {
                 },
                 stdio: ['pipe', 'pipe', this._serverParams.stderr ?? 'inherit'],
                 shell: false,
-                windowsHide: external_node_process_namespaceObject.platform === 'win32' && isElectron(),
+                windowsHide: external_node_process_namespaceObject.platform === 'win32',
                 cwd: this._serverParams.cwd
             });
             this._process.on('error', error => {
@@ -50060,9 +50446,6 @@ class StdioClientTransport {
             }
         });
     }
-}
-function isElectron() {
-    return "" in external_node_process_namespaceObject;
 }
 //# sourceMappingURL=stdio.js.map
 ;// CONCATENATED MODULE: ./node_modules/@modelcontextprotocol/sdk/dist/esm/shared/transport.js
@@ -50683,16 +51066,20 @@ const AUTHORIZATION_CODE_CHALLENGE_METHOD = 'S256';
  */
 function selectClientAuthMethod(clientInformation, supportedMethods) {
     const hasClientSecret = clientInformation.client_secret !== undefined;
-    // If server doesn't specify supported methods, use RFC 6749 defaults
-    if (supportedMethods.length === 0) {
-        return hasClientSecret ? 'client_secret_post' : 'none';
-    }
-    // Prefer the method returned by the server during client registration if valid and supported
+    // Prefer the method returned by the server during client registration, if valid.
+    // When server metadata is present we also require the method to be listed as supported;
+    // when supportedMethods is empty (metadata omitted the field) the DCR hint stands alone.
     if ('token_endpoint_auth_method' in clientInformation &&
         clientInformation.token_endpoint_auth_method &&
         isClientAuthMethod(clientInformation.token_endpoint_auth_method) &&
-        supportedMethods.includes(clientInformation.token_endpoint_auth_method)) {
+        (supportedMethods.length === 0 || supportedMethods.includes(clientInformation.token_endpoint_auth_method))) {
         return clientInformation.token_endpoint_auth_method;
+    }
+    // If server metadata omits token_endpoint_auth_methods_supported, RFC 8414 §2 says the
+    // default is client_secret_basic. RFC 6749 §2.3.1 also requires servers to support HTTP
+    // Basic authentication for clients with a secret, making it the safest default.
+    if (supportedMethods.length === 0) {
+        return hasClientSecret ? 'client_secret_basic' : 'none';
     }
     // Try methods in priority order (most secure first)
     if (hasClientSecret && supportedMethods.includes('client_secret_basic')) {
@@ -50813,28 +51200,66 @@ async function auth(provider, options) {
     }
 }
 async function authInternal(provider, { serverUrl, authorizationCode, scope, resourceMetadataUrl, fetchFn }) {
+    // Check if the provider has cached discovery state to skip discovery
+    const cachedState = await provider.discoveryState?.();
     let resourceMetadata;
     let authorizationServerUrl;
-    try {
-        resourceMetadata = await discoverOAuthProtectedResourceMetadata(serverUrl, { resourceMetadataUrl }, fetchFn);
-        if (resourceMetadata.authorization_servers && resourceMetadata.authorization_servers.length > 0) {
-            authorizationServerUrl = resourceMetadata.authorization_servers[0];
+    let metadata;
+    // If resourceMetadataUrl is not provided, try to load it from cached state
+    // This handles browser redirects where the URL was saved before navigation
+    let effectiveResourceMetadataUrl = resourceMetadataUrl;
+    if (!effectiveResourceMetadataUrl && cachedState?.resourceMetadataUrl) {
+        effectiveResourceMetadataUrl = new URL(cachedState.resourceMetadataUrl);
+    }
+    if (cachedState?.authorizationServerUrl) {
+        // Restore discovery state from cache
+        authorizationServerUrl = cachedState.authorizationServerUrl;
+        resourceMetadata = cachedState.resourceMetadata;
+        metadata =
+            cachedState.authorizationServerMetadata ?? (await discoverAuthorizationServerMetadata(authorizationServerUrl, { fetchFn }));
+        // If resource metadata wasn't cached, try to fetch it for selectResourceURL
+        if (!resourceMetadata) {
+            try {
+                resourceMetadata = await discoverOAuthProtectedResourceMetadata(serverUrl, { resourceMetadataUrl: effectiveResourceMetadataUrl }, fetchFn);
+            }
+            catch {
+                // RFC 9728 not available — selectResourceURL will handle undefined
+            }
+        }
+        // Re-save if we enriched the cached state with missing metadata
+        if (metadata !== cachedState.authorizationServerMetadata || resourceMetadata !== cachedState.resourceMetadata) {
+            await provider.saveDiscoveryState?.({
+                authorizationServerUrl: String(authorizationServerUrl),
+                resourceMetadataUrl: effectiveResourceMetadataUrl?.toString(),
+                resourceMetadata,
+                authorizationServerMetadata: metadata
+            });
         }
     }
-    catch {
-        // Ignore errors and fall back to /.well-known/oauth-authorization-server
-    }
-    /**
-     * If we don't get a valid authorization server metadata from protected resource metadata,
-     * fallback to the legacy MCP spec's implementation (version 2025-03-26): MCP server base URL acts as the Authorization server.
-     */
-    if (!authorizationServerUrl) {
-        authorizationServerUrl = new URL('/', serverUrl);
+    else {
+        // Full discovery via RFC 9728
+        const serverInfo = await discoverOAuthServerInfo(serverUrl, { resourceMetadataUrl: effectiveResourceMetadataUrl, fetchFn });
+        authorizationServerUrl = serverInfo.authorizationServerUrl;
+        metadata = serverInfo.authorizationServerMetadata;
+        resourceMetadata = serverInfo.resourceMetadata;
+        // Persist discovery state for future use
+        // TODO: resourceMetadataUrl is only populated when explicitly provided via options
+        // or loaded from cached state. The URL derived internally by
+        // discoverOAuthProtectedResourceMetadata() is not captured back here.
+        await provider.saveDiscoveryState?.({
+            authorizationServerUrl: String(authorizationServerUrl),
+            resourceMetadataUrl: effectiveResourceMetadataUrl?.toString(),
+            resourceMetadata,
+            authorizationServerMetadata: metadata
+        });
     }
     const resource = await selectResourceURL(serverUrl, provider, resourceMetadata);
-    const metadata = await discoverAuthorizationServerMetadata(authorizationServerUrl, {
-        fetchFn
-    });
+    // Apply scope selection strategy (SEP-835):
+    // 1. WWW-Authenticate scope (passed via `scope` param)
+    // 2. PRM scopes_supported
+    // 3. Client metadata scope (user-configured fallback)
+    // The resolved scope is used consistently for both DCR and the authorization request.
+    const resolvedScope = scope || resourceMetadata?.scopes_supported?.join(' ') || provider.clientMetadata.scope;
     // Handle client registration if needed
     let clientInformation = await Promise.resolve(provider.clientInformation());
     if (!clientInformation) {
@@ -50862,6 +51287,7 @@ async function authInternal(provider, { serverUrl, authorizationCode, scope, res
             const fullInformation = await registerClient(authorizationServerUrl, {
                 metadata,
                 clientMetadata: provider.clientMetadata,
+                scope: resolvedScope,
                 fetchFn
             });
             await provider.saveClientInformation(fullInformation);
@@ -50915,7 +51341,7 @@ async function authInternal(provider, { serverUrl, authorizationCode, scope, res
         clientInformation,
         state,
         redirectUrl: provider.redirectUrl,
-        scope: scope || resourceMetadata?.scopes_supported?.join(' ') || provider.clientMetadata.scope,
+        scope: resolvedScope,
         resource
     });
     await provider.saveCodeVerifier(codeVerifier);
@@ -51252,6 +51678,50 @@ async function discoverAuthorizationServerMetadata(authorizationServerUrl, { fet
     return undefined;
 }
 /**
+ * Discovers the authorization server for an MCP server following
+ * {@link https://datatracker.ietf.org/doc/html/rfc9728 | RFC 9728} (OAuth 2.0 Protected
+ * Resource Metadata), with fallback to treating the server URL as the
+ * authorization server.
+ *
+ * This function combines two discovery steps into one call:
+ * 1. Probes `/.well-known/oauth-protected-resource` on the MCP server to find the
+ *    authorization server URL (RFC 9728).
+ * 2. Fetches authorization server metadata from that URL (RFC 8414 / OpenID Connect Discovery).
+ *
+ * Use this when you need the authorization server metadata for operations outside the
+ * {@linkcode auth} orchestrator, such as token refresh or token revocation.
+ *
+ * @param serverUrl - The MCP resource server URL
+ * @param opts - Optional configuration
+ * @param opts.resourceMetadataUrl - Override URL for the protected resource metadata endpoint
+ * @param opts.fetchFn - Custom fetch function for HTTP requests
+ * @returns Authorization server URL, metadata, and resource metadata (if available)
+ */
+async function discoverOAuthServerInfo(serverUrl, opts) {
+    let resourceMetadata;
+    let authorizationServerUrl;
+    try {
+        resourceMetadata = await discoverOAuthProtectedResourceMetadata(serverUrl, { resourceMetadataUrl: opts?.resourceMetadataUrl }, opts?.fetchFn);
+        if (resourceMetadata.authorization_servers && resourceMetadata.authorization_servers.length > 0) {
+            authorizationServerUrl = resourceMetadata.authorization_servers[0];
+        }
+    }
+    catch {
+        // RFC 9728 not supported -- fall back to treating the server URL as the authorization server
+    }
+    // If we don't get a valid authorization server from protected resource metadata,
+    // fall back to the legacy MCP spec behavior: MCP server base URL acts as the authorization server
+    if (!authorizationServerUrl) {
+        authorizationServerUrl = String(new URL('/', serverUrl));
+    }
+    const authorizationServerMetadata = await discoverAuthorizationServerMetadata(authorizationServerUrl, { fetchFn: opts?.fetchFn });
+    return {
+        authorizationServerUrl,
+        authorizationServerMetadata,
+        resourceMetadata
+    };
+}
+/**
  * Begins the authorization flow with the given server, by generating a PKCE challenge and constructing the authorization URL.
  */
 async function startAuthorization(authorizationServerUrl, { metadata, clientInformation, redirectUrl, scope, state, resource }) {
@@ -51452,8 +51922,12 @@ async function fetchToken(provider, authorizationServerUrl, { metadata, resource
 }
 /**
  * Performs OAuth 2.0 Dynamic Client Registration according to RFC 7591.
+ *
+ * If `scope` is provided, it overrides `clientMetadata.scope` in the registration
+ * request body. This allows callers to apply the Scope Selection Strategy (SEP-835)
+ * consistently across both DCR and the subsequent authorization request.
  */
-async function registerClient(authorizationServerUrl, { metadata, clientMetadata, fetchFn }) {
+async function registerClient(authorizationServerUrl, { metadata, clientMetadata, scope, fetchFn }) {
     let registrationUrl;
     if (metadata) {
         if (!metadata.registration_endpoint) {
@@ -51469,7 +51943,10 @@ async function registerClient(authorizationServerUrl, { metadata, clientMetadata
         headers: {
             'Content-Type': 'application/json'
         },
-        body: JSON.stringify(clientMetadata)
+        body: JSON.stringify({
+            ...clientMetadata,
+            ...(scope !== undefined ? { scope } : {})
+        })
     });
     if (!response.ok) {
         throw await parseErrorResponse(response);
@@ -51483,46 +51960,128 @@ class ParseError extends Error {
     super(message), this.name = "ParseError", this.type = options.type, this.field = options.field, this.value = options.value, this.line = options.line;
   }
 }
+const LF = 10, CR = 13, SPACE = 32;
 function noop(_arg) {
 }
-function createParser(callbacks) {
-  if (typeof callbacks == "function")
+function createParser(config) {
+  if (typeof config == "function")
     throw new TypeError(
-      "`callbacks` must be an object, got a function instead. Did you mean `{onEvent: fn}`?"
+      "`config` must be an object, got a function instead. Did you mean `createParser({onEvent: fn})`?"
     );
-  const { onEvent = noop, onError = noop, onRetry = noop, onComment } = callbacks;
-  let incompleteLine = "", isFirstChunk = !0, id, data = "", eventType = "";
-  function feed(newChunk) {
-    const chunk = isFirstChunk ? newChunk.replace(/^\xEF\xBB\xBF/, "") : newChunk, [complete, incomplete] = splitLines(`${incompleteLine}${chunk}`);
-    for (const line of complete)
-      parseLine(line);
-    incompleteLine = incomplete, isFirstChunk = !1;
+  const { onEvent = noop, onError = noop, onRetry = noop, onComment, maxBufferSize } = config, pendingFragments = [];
+  let pendingFragmentsLength = 0, isFirstChunk = !0, id, data = "", dataLines = 0, eventType, terminated = !1;
+  function feed(chunk) {
+    if (terminated)
+      throw new Error(
+        "Cannot feed parser: it was terminated after exceeding the configured max buffer size. Call `reset()` to resume parsing."
+      );
+    if (isFirstChunk && (isFirstChunk = !1, chunk.charCodeAt(0) === 239 && chunk.charCodeAt(1) === 187 && chunk.charCodeAt(2) === 191 && (chunk = chunk.slice(3))), pendingFragments.length === 0) {
+      const trailing2 = processLines(chunk);
+      trailing2 !== "" && (pendingFragments.push(trailing2), pendingFragmentsLength = trailing2.length), checkBufferSize();
+      return;
+    }
+    if (chunk.indexOf(`
+`) === -1 && chunk.indexOf("\r") === -1) {
+      pendingFragments.push(chunk), pendingFragmentsLength += chunk.length, checkBufferSize();
+      return;
+    }
+    pendingFragments.push(chunk);
+    const input = pendingFragments.join("");
+    pendingFragments.length = 0, pendingFragmentsLength = 0;
+    const trailing = processLines(input);
+    trailing !== "" && (pendingFragments.push(trailing), pendingFragmentsLength = trailing.length), checkBufferSize();
   }
-  function parseLine(line) {
-    if (line === "") {
+  function checkBufferSize() {
+    maxBufferSize !== void 0 && (pendingFragmentsLength + data.length <= maxBufferSize || (terminated = !0, pendingFragments.length = 0, pendingFragmentsLength = 0, id = void 0, data = "", dataLines = 0, eventType = void 0, onError(
+      new ParseError(`Buffered data exceeded max buffer size of ${maxBufferSize} characters`, {
+        type: "max-buffer-size-exceeded"
+      })
+    )));
+  }
+  function processLines(chunk) {
+    let searchIndex = 0;
+    if (chunk.indexOf("\r") === -1) {
+      let lfIndex = chunk.indexOf(`
+`, searchIndex);
+      for (; lfIndex !== -1; ) {
+        if (searchIndex === lfIndex) {
+          dataLines > 0 && onEvent({ id, event: eventType, data }), id = void 0, data = "", dataLines = 0, eventType = void 0, searchIndex = lfIndex + 1, lfIndex = chunk.indexOf(`
+`, searchIndex);
+          continue;
+        }
+        const firstCharCode = chunk.charCodeAt(searchIndex);
+        if (isDataPrefix(chunk, searchIndex, firstCharCode)) {
+          const valueStart = chunk.charCodeAt(searchIndex + 5) === SPACE ? searchIndex + 6 : searchIndex + 5, value = chunk.slice(valueStart, lfIndex);
+          if (dataLines === 0 && chunk.charCodeAt(lfIndex + 1) === LF) {
+            onEvent({ id, event: eventType, data: value }), id = void 0, data = "", eventType = void 0, searchIndex = lfIndex + 2, lfIndex = chunk.indexOf(`
+`, searchIndex);
+            continue;
+          }
+          data = dataLines === 0 ? value : `${data}
+${value}`, dataLines++;
+        } else isEventPrefix(chunk, searchIndex, firstCharCode) ? eventType = chunk.slice(
+          chunk.charCodeAt(searchIndex + 6) === SPACE ? searchIndex + 7 : searchIndex + 6,
+          lfIndex
+        ) || void 0 : parseLine(chunk, searchIndex, lfIndex);
+        searchIndex = lfIndex + 1, lfIndex = chunk.indexOf(`
+`, searchIndex);
+      }
+      return chunk.slice(searchIndex);
+    }
+    for (; searchIndex < chunk.length; ) {
+      const crIndex = chunk.indexOf("\r", searchIndex), lfIndex = chunk.indexOf(`
+`, searchIndex);
+      let lineEnd = -1;
+      if (crIndex !== -1 && lfIndex !== -1 ? lineEnd = crIndex < lfIndex ? crIndex : lfIndex : crIndex !== -1 ? crIndex === chunk.length - 1 ? lineEnd = -1 : lineEnd = crIndex : lfIndex !== -1 && (lineEnd = lfIndex), lineEnd === -1)
+        break;
+      parseLine(chunk, searchIndex, lineEnd), searchIndex = lineEnd + 1, chunk.charCodeAt(searchIndex - 1) === CR && chunk.charCodeAt(searchIndex) === LF && searchIndex++;
+    }
+    return chunk.slice(searchIndex);
+  }
+  function parseLine(chunk, start, end) {
+    if (start === end) {
       dispatchEvent();
       return;
     }
-    if (line.startsWith(":")) {
-      onComment && onComment(line.slice(line.startsWith(": ") ? 2 : 1));
+    const firstCharCode = chunk.charCodeAt(start);
+    if (isDataPrefix(chunk, start, firstCharCode)) {
+      const valueStart = chunk.charCodeAt(start + 5) === SPACE ? start + 6 : start + 5, value2 = chunk.slice(valueStart, end);
+      data = dataLines === 0 ? value2 : `${data}
+${value2}`, dataLines++;
       return;
     }
-    const fieldSeparatorIndex = line.indexOf(":");
-    if (fieldSeparatorIndex !== -1) {
-      const field = line.slice(0, fieldSeparatorIndex), offset = line[fieldSeparatorIndex + 1] === " " ? 2 : 1, value = line.slice(fieldSeparatorIndex + offset);
-      processField(field, value, line);
+    if (isEventPrefix(chunk, start, firstCharCode)) {
+      eventType = chunk.slice(chunk.charCodeAt(start + 6) === SPACE ? start + 7 : start + 6, end) || void 0;
       return;
     }
-    processField(line, "", line);
+    if (firstCharCode === 105 && chunk.charCodeAt(start + 1) === 100 && chunk.charCodeAt(start + 2) === 58) {
+      const value2 = chunk.slice(chunk.charCodeAt(start + 3) === SPACE ? start + 4 : start + 3, end);
+      id = value2.includes("\0") ? void 0 : value2;
+      return;
+    }
+    if (firstCharCode === 58) {
+      if (onComment) {
+        const line2 = chunk.slice(start, end);
+        onComment(line2.slice(chunk.charCodeAt(start + 1) === SPACE ? 2 : 1));
+      }
+      return;
+    }
+    const line = chunk.slice(start, end), fieldSeparatorIndex = line.indexOf(":");
+    if (fieldSeparatorIndex === -1) {
+      processField(line, "", line);
+      return;
+    }
+    const field = line.slice(0, fieldSeparatorIndex), offset = line.charCodeAt(fieldSeparatorIndex + 1) === SPACE ? 2 : 1, value = line.slice(fieldSeparatorIndex + offset);
+    processField(field, value, line);
   }
   function processField(field, value, line) {
     switch (field) {
       case "event":
-        eventType = value;
+        eventType = value || void 0;
         break;
       case "data":
-        data = `${data}${value}
-`;
+        data = dataLines === 0 ? value : `${data}
+${value}`, dataLines++;
         break;
       case "id":
         id = value.includes("\0") ? void 0 : value;
@@ -51547,37 +52106,26 @@ function createParser(callbacks) {
     }
   }
   function dispatchEvent() {
-    data.length > 0 && onEvent({
+    dataLines > 0 && onEvent({
       id,
-      event: eventType || void 0,
-      // If the data buffer's last character is a U+000A LINE FEED (LF) character,
-      // then remove the last character from the data buffer.
-      data: data.endsWith(`
-`) ? data.slice(0, -1) : data
-    }), id = void 0, data = "", eventType = "";
+      event: eventType,
+      data
+    }), id = void 0, data = "", dataLines = 0, eventType = void 0;
   }
   function reset(options = {}) {
-    incompleteLine && options.consume && parseLine(incompleteLine), isFirstChunk = !0, id = void 0, data = "", eventType = "", incompleteLine = "";
+    if (options.consume && pendingFragments.length > 0) {
+      const incompleteLine = pendingFragments.join("");
+      parseLine(incompleteLine, 0, incompleteLine.length);
+    }
+    isFirstChunk = !0, id = void 0, data = "", dataLines = 0, eventType = void 0, pendingFragments.length = 0, pendingFragmentsLength = 0, terminated = !1;
   }
   return { feed, reset };
 }
-function splitLines(chunk) {
-  const lines = [];
-  let incompleteLine = "", searchIndex = 0;
-  for (; searchIndex < chunk.length; ) {
-    const crIndex = chunk.indexOf("\r", searchIndex), lfIndex = chunk.indexOf(`
-`, searchIndex);
-    let lineEnd = -1;
-    if (crIndex !== -1 && lfIndex !== -1 ? lineEnd = Math.min(crIndex, lfIndex) : crIndex !== -1 ? crIndex === chunk.length - 1 ? lineEnd = -1 : lineEnd = crIndex : lfIndex !== -1 && (lineEnd = lfIndex), lineEnd === -1) {
-      incompleteLine = chunk.slice(searchIndex);
-      break;
-    } else {
-      const line = chunk.slice(searchIndex, lineEnd);
-      lines.push(line), searchIndex = lineEnd + 1, chunk[searchIndex - 1] === "\r" && chunk[searchIndex] === `
-` && searchIndex++;
-    }
-  }
-  return [lines, incompleteLine];
+function isDataPrefix(chunk, i, firstCharCode) {
+  return firstCharCode === 100 && chunk.charCodeAt(i + 1) === 97 && chunk.charCodeAt(i + 2) === 116 && chunk.charCodeAt(i + 3) === 97 && chunk.charCodeAt(i + 4) === 58;
+}
+function isEventPrefix(chunk, i, firstCharCode) {
+  return firstCharCode === 101 && chunk.charCodeAt(i + 1) === 118 && chunk.charCodeAt(i + 2) === 101 && chunk.charCodeAt(i + 3) === 110 && chunk.charCodeAt(i + 4) === 116 && chunk.charCodeAt(i + 5) === 58;
 }
 
 //# sourceMappingURL=index.js.map
@@ -51586,7 +52134,7 @@ function splitLines(chunk) {
 
 
 class EventSourceParserStream extends TransformStream {
-  constructor({ onError, onRetry, onComment } = {}) {
+  constructor({ onError, onRetry, onComment, maxBufferSize } = {}) {
     let parser;
     super({
       start(controller) {
@@ -51595,10 +52143,11 @@ class EventSourceParserStream extends TransformStream {
             controller.enqueue(event);
           },
           onError(error) {
-            onError === "terminate" ? controller.error(error) : typeof onError == "function" && onError(error);
+            typeof onError == "function" && onError(error), (onError === "terminate" || error.type === "max-buffer-size-exceeded") && controller.error(error);
           },
           onRetry,
-          onComment
+          onComment,
+          maxBufferSize
         });
       },
       transform(chunk) {
