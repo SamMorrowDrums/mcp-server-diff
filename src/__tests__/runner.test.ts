@@ -1,5 +1,23 @@
-import { parseHeaders, parseConfigurations } from "../runner.js";
+import { parseHeaders, parseConfigurations, compareConfigResults } from "../runner.js";
 import { normalizeProbeResult } from "../probe.js";
+import type { ProbeResult } from "../types.js";
+
+function makeProbeResult(partial: Partial<ProbeResult> = {}): ProbeResult {
+  return {
+    initialize: null,
+    instructions: null,
+    tools: null,
+    prompts: null,
+    resources: null,
+    resourceTemplates: null,
+    customResponses: new Map(),
+    ...partial,
+  };
+}
+
+function toolsResult(names: string[]): ProbeResult["tools"] {
+  return { tools: names.map((name) => ({ name, description: `${name} desc` })) };
+}
 
 describe("parseHeaders", () => {
   it("returns empty object for empty input", () => {
@@ -426,5 +444,83 @@ describe("normalizeProbeResult", () => {
     // Falls back to JSON string comparison
     expect(result.items[0].value).toBe(1);
     expect(result.items[1].value).toBe(3);
+  });
+});
+
+describe("compareConfigResults", () => {
+  const compareRef = "main";
+
+  it("returns a fatal error when both sides fail to start", () => {
+    const branch = makeProbeResult({ error: "branch boom" });
+    const base = makeProbeResult({ error: "base boom" });
+
+    const outcome = compareConfigResults("scope-x", branch, base, compareRef);
+
+    expect(outcome.fatalError).toBe(true);
+    expect(outcome.configMissing).toBeUndefined();
+    expect(outcome.diffs.has("error")).toBe(true);
+    expect(outcome.diffs.get("error")).toContain("branch boom");
+    expect(outcome.diffs.get("error")).toContain("base boom");
+    expect(outcome.diffs.has("config-missing")).toBe(false);
+  });
+
+  it("treats a base-only startup failure as a non-fatal missing config with a full added diff", () => {
+    const branch = makeProbeResult({ tools: toolsResult(["new_tool"]) });
+    const base = makeProbeResult({ error: "MCP error -32000: Connection closed" });
+
+    const outcome = compareConfigResults("scope-repository", branch, base, compareRef);
+
+    expect(outcome.fatalError).toBe(false);
+    expect(outcome.configMissing).toEqual({
+      side: "base",
+      error: "MCP error -32000: Connection closed",
+    });
+    // Working side's surface renders as added.
+    expect(outcome.diffs.get("tools")).toContain("added in current branch");
+    // Note names the failed side / compare ref.
+    expect(outcome.diffs.has("config-missing")).toBe(true);
+    expect(outcome.diffs.get("config-missing")).toContain("compare ref (main)");
+    // It is not a genuine probe error.
+    expect(outcome.diffs.has("error")).toBe(false);
+  });
+
+  it("treats a branch-only startup failure as a non-fatal missing config with a full removed diff", () => {
+    const branch = makeProbeResult({ error: "branch failed to start" });
+    const base = makeProbeResult({ tools: toolsResult(["legacy_tool"]) });
+
+    const outcome = compareConfigResults("scope-legacy", branch, base, compareRef);
+
+    expect(outcome.fatalError).toBe(false);
+    expect(outcome.configMissing).toEqual({
+      side: "branch",
+      error: "branch failed to start",
+    });
+    expect(outcome.diffs.get("tools")).toContain("removed in current branch");
+    expect(outcome.diffs.get("config-missing")).toContain("current branch");
+    expect(outcome.diffs.has("error")).toBe(false);
+  });
+
+  it("returns a normal diff when both sides start (changed surface)", () => {
+    const branch = makeProbeResult({ tools: toolsResult(["a", "b"]) });
+    const base = makeProbeResult({ tools: toolsResult(["a"]) });
+
+    const outcome = compareConfigResults("scope-x", branch, base, compareRef);
+
+    expect(outcome.fatalError).toBe(false);
+    expect(outcome.configMissing).toBeUndefined();
+    expect(outcome.diffs.has("error")).toBe(false);
+    expect(outcome.diffs.has("config-missing")).toBe(false);
+    expect(outcome.diffs.has("tools")).toBe(true);
+  });
+
+  it("returns no diffs when both sides start with identical surfaces", () => {
+    const branch = makeProbeResult({ tools: toolsResult(["a", "b"]) });
+    const base = makeProbeResult({ tools: toolsResult(["a", "b"]) });
+
+    const outcome = compareConfigResults("scope-x", branch, base, compareRef);
+
+    expect(outcome.fatalError).toBe(false);
+    expect(outcome.configMissing).toBeUndefined();
+    expect(outcome.diffs.size).toBe(0);
   });
 });

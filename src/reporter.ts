@@ -7,6 +7,35 @@ import * as fs from "fs";
 import * as path from "path";
 import type { TestResult, ConformanceReport } from "./types.js";
 
+/** A result that failed to start on exactly one side (diffed against empty). */
+function isConfigMissing(result: TestResult): boolean {
+  return !!result.configMissing || result.diffs.has("config-missing");
+}
+
+/** A result with a genuine probe error (both sides failed to start). */
+function isErrored(result: TestResult): boolean {
+  return !isConfigMissing(result) && (!!result.error || result.diffs.has("error"));
+}
+
+/** A result with real API changes (not an error, not a one-sided missing config). */
+function isChanged(result: TestResult): boolean {
+  return result.hasDifferences && !isErrored(result) && !isConfigMissing(result);
+}
+
+/** A result with no differences, errors, or missing-config markers. */
+function isPassing(result: TestResult): boolean {
+  return !result.hasDifferences && !isErrored(result) && !isConfigMissing(result);
+}
+
+/** Human-readable label for the side that failed to start. */
+function missingSideLabel(report: ConformanceReport, result: TestResult): string {
+  const side = result.configMissing?.side;
+  if (side === "branch") {
+    return `current branch (${report.currentBranch})`;
+  }
+  return `compare ref (${report.compareRef})`;
+}
+
 /**
  * Generate a diff report from test results
  */
@@ -65,7 +94,7 @@ export function generateMarkdownReport(report: ConformanceReport): string {
     lines.push("");
     lines.push("**✅ Passing configurations (no changes detected):**");
     for (const result of report.results) {
-      if (!result.error && !result.diffs.has("error") && !result.hasDifferences) {
+      if (isPassing(result)) {
         lines.push(`- ${result.configName}`);
       }
     }
@@ -74,9 +103,7 @@ export function generateMarkdownReport(report: ConformanceReport): string {
     lines.push("");
 
     // List passing configurations first
-    const passingConfigs = report.results.filter(
-      (r) => !r.error && !r.diffs.has("error") && !r.hasDifferences
-    );
+    const passingConfigs = report.results.filter(isPassing);
     if (passingConfigs.length > 0) {
       lines.push("**✅ Passing configurations (no changes detected):**");
       for (const result of passingConfigs) {
@@ -85,10 +112,8 @@ export function generateMarkdownReport(report: ConformanceReport): string {
       lines.push("");
     }
 
-    // List configurations with changes (excluding errors)
-    const changedConfigs = report.results.filter(
-      (r) => r.hasDifferences && !r.error && !r.diffs.has("error")
-    );
+    // List configurations with changes (excluding errors and missing configs)
+    const changedConfigs = report.results.filter(isChanged);
     if (changedConfigs.length > 0) {
       lines.push("**⚠️ Configurations with changes:**");
       for (const result of changedConfigs) {
@@ -97,8 +122,18 @@ export function generateMarkdownReport(report: ConformanceReport): string {
       lines.push("");
     }
 
+    // List configurations that did not start on one side (diffed against empty)
+    const missingConfigs = report.results.filter(isConfigMissing);
+    if (missingConfigs.length > 0) {
+      lines.push("**🚫 Configurations missing on one side (diffed against an empty baseline):**");
+      for (const result of missingConfigs) {
+        lines.push(`- ${result.configName} — did not start on ${missingSideLabel(report, result)}`);
+      }
+      lines.push("");
+    }
+
     // List configurations with errors if any
-    const errorConfigs = report.results.filter((r) => r.error || r.diffs.has("error"));
+    const errorConfigs = report.results.filter(isErrored);
     if (errorConfigs.length > 0) {
       lines.push("**❌ Configurations with errors:**");
       for (const result of errorConfigs) {
@@ -113,7 +148,9 @@ export function generateMarkdownReport(report: ConformanceReport): string {
   lines.push("");
 
   for (const result of report.results) {
-    const statusIcon = result.error ? "❌" : result.hasDifferences ? "⚠️" : "✅";
+    const missing = isConfigMissing(result);
+    const errored = isErrored(result);
+    const statusIcon = errored ? "❌" : missing ? "🚫" : result.hasDifferences ? "⚠️" : "✅";
     lines.push(`### ${statusIcon} ${result.configName}`);
     lines.push("");
     lines.push(`- **Transport:** ${result.transport}`);
@@ -145,11 +182,28 @@ export function generateMarkdownReport(report: ConformanceReport): string {
       lines.push("");
     }
 
+    // Callout for one-sided startup failure
+    if (missing) {
+      const note = result.diffs.get("config-missing");
+      lines.push(`> 🚫 **Did not start on ${missingSideLabel(report, result)}.**`);
+      if (note) {
+        lines.push(`>`);
+        lines.push(`> ${note}`);
+      }
+      if (result.configMissing?.error) {
+        lines.push(`>`);
+        lines.push(`> Startup error: \`${result.configMissing.error}\``);
+      }
+      lines.push("");
+    }
+
     if (result.hasDifferences) {
       lines.push("#### Changes");
       lines.push("");
 
       for (const [endpoint, diff] of result.diffs) {
+        // The config-missing marker is rendered as a callout above, not a diff block.
+        if (endpoint === "config-missing") continue;
         lines.push(`**${endpoint}**`);
         lines.push("");
         lines.push("```diff");
@@ -279,9 +333,7 @@ export function generatePRSummary(report: ConformanceReport): string {
     lines.push(`Tested ${report.results.length} configuration(s) - no API changes detected.`);
     lines.push("");
     lines.push("**✅ Passing configurations:**");
-    for (const result of report.results.filter(
-      (r) => !r.error && !r.diffs.has("error") && !r.hasDifferences
-    )) {
+    for (const result of report.results.filter(isPassing)) {
       lines.push(`- ${result.configName}`);
     }
   } else {
@@ -293,9 +345,7 @@ export function generatePRSummary(report: ConformanceReport): string {
     lines.push("");
 
     // List passing configurations
-    const passingConfigs = report.results.filter(
-      (r) => !r.error && !r.diffs.has("error") && !r.hasDifferences
-    );
+    const passingConfigs = report.results.filter(isPassing);
     if (passingConfigs.length > 0) {
       lines.push("**✅ Passing configurations (no changes):**");
       for (const result of passingConfigs) {
@@ -304,10 +354,8 @@ export function generatePRSummary(report: ConformanceReport): string {
       lines.push("");
     }
 
-    // List configurations with changes (excluding errors)
-    const changedConfigs = report.results.filter(
-      (r) => r.hasDifferences && !r.error && !r.diffs.has("error")
-    );
+    // List configurations with changes (excluding errors and missing configs)
+    const changedConfigs = report.results.filter(isChanged);
     if (changedConfigs.length > 0) {
       lines.push("**⚠️ Changed configurations:**");
       for (const result of changedConfigs) {
@@ -316,8 +364,20 @@ export function generatePRSummary(report: ConformanceReport): string {
       lines.push("");
     }
 
+    // List configurations that did not start on one side (diffed against empty)
+    const missingConfigs = report.results.filter(isConfigMissing);
+    if (missingConfigs.length > 0) {
+      lines.push("**🚫 Missing on one side (diffed against an empty baseline):**");
+      for (const result of missingConfigs) {
+        lines.push(
+          `- **${result.configName}:** did not start on ${missingSideLabel(report, result)}`
+        );
+      }
+      lines.push("");
+    }
+
     // List configurations with errors if any
-    const errorConfigs = report.results.filter((r) => r.error || r.diffs.has("error"));
+    const errorConfigs = report.results.filter(isErrored);
     if (errorConfigs.length > 0) {
       lines.push("**❌ Configurations with errors:**");
       for (const result of errorConfigs) {

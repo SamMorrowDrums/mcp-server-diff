@@ -257,8 +257,22 @@ async function run(): Promise<void> {
     // Set final status
     core.info("");
 
-    // Check for actual probe errors (separate from differences)
+    // Check for actual probe errors (separate from differences). A one-sided
+    // startup failure is reported as "config-missing" (non-fatal) and is fully
+    // diffed against an empty baseline, so it does not count as a probe error.
     const hasErrors = results.some((r) => r.diffs.has("error"));
+
+    // Surface one-sided "missing on compare" configs explicitly (non-fatal).
+    const missingConfigs = results.filter((r) => r.configMissing);
+    if (missingConfigs.length > 0) {
+      for (const r of missingConfigs) {
+        const side = r.configMissing?.side === "branch" ? "current branch" : "compare ref";
+        core.warning(
+          `Configuration "${r.configName}" did not start on the ${side}; ` +
+            `diffed against an empty baseline (non-fatal).`
+        );
+      }
+    }
 
     if (hasErrors && inputs.failOnError) {
       const errorConfigs = results.filter((r) => r.diffs.has("error")).map((r) => r.configName);
