@@ -140,6 +140,18 @@ export interface TestResult {
     baseProtocolVersion?: string;
     /** Error message if probing failed */
     error?: string;
+    /**
+     * Set when the configuration failed to start on exactly one side of the
+     * comparison (e.g. a new config that does not exist on the compare ref). The
+     * working side is still diffed against an empty baseline; this records which
+     * side could not start and the underlying startup error.
+     */
+    configMissing?: {
+        /** Side that failed to start: "branch" (current) or "base" (compare ref) */
+        side: "branch" | "base";
+        /** Underlying startup error from the failed side */
+        error: string;
+    };
 }
 export interface ConformanceReport {
     generatedAt: string;
