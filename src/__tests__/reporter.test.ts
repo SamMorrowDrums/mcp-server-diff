@@ -217,6 +217,59 @@ describe("generateMarkdownReport", () => {
     expect(markdown).toContain("**⚠️ Configurations with changes:**");
     expect(markdown).toContain("- config-with-diff (see diff below)");
   });
+
+  it("renders a one-sided missing config in its own section with a callout", () => {
+    const results: TestResult[] = [
+      {
+        configName: "passing-config",
+        transport: "stdio",
+        branchTime: 100,
+        baseTime: 90,
+        hasDifferences: false,
+        diffs: new Map(),
+      },
+      {
+        configName: "scope-repository",
+        transport: "stdio",
+        branchTime: 50,
+        baseTime: 0,
+        hasDifferences: true,
+        diffs: new Map([
+          ["tools", "Endpoint added in current branch (not present in base)"],
+          [
+            "config-missing",
+            'Configuration "scope-repository" did not start on the compare ref (main); it may not exist on that version. Diffed the current branch against an empty baseline.',
+          ],
+        ]),
+        configMissing: { side: "base", error: "MCP error -32000: Connection closed" },
+      },
+    ];
+
+    const report: ConformanceReport = {
+      generatedAt: "2024-01-01T00:00:00.000Z",
+      currentBranch: "feature",
+      compareRef: "main",
+      results,
+      totalBranchTime: 150,
+      totalBaseTime: 90,
+      passedCount: 1,
+      diffCount: 1,
+    };
+
+    const markdown = generateMarkdownReport(report);
+
+    // Dedicated missing-on-one-side section, not the errors section.
+    expect(markdown).toContain("**🚫 Configurations missing on one side");
+    expect(markdown).toContain("- scope-repository — did not start on compare ref (main)");
+    expect(markdown).not.toContain("**❌ Configurations with errors:**");
+    // Per-config callout names the side and includes the startup error.
+    expect(markdown).toContain("> 🚫 **Did not start on compare ref (main).**");
+    expect(markdown).toContain("MCP error -32000: Connection closed");
+    // The working side's surface still renders as a diff block.
+    expect(markdown).toContain("**tools**");
+    // The marker itself is not rendered as a diff block header.
+    expect(markdown).not.toContain("**config-missing**");
+  });
 });
 
 describe("generatePRSummary", () => {
@@ -396,5 +449,41 @@ describe("generatePRSummary", () => {
     expect(summary).toContain("- error-config");
     // Error configs should not be in the changed section
     expect(summary).not.toContain("**error-config:**");
+  });
+
+  it("shows one-sided missing configs in their own section (not as errors)", () => {
+    const results: TestResult[] = [
+      {
+        configName: "scope-pull-request",
+        transport: "stdio",
+        branchTime: 40,
+        baseTime: 0,
+        hasDifferences: true,
+        diffs: new Map([
+          ["tools", "Endpoint added in current branch (not present in base)"],
+          ["config-missing", "did not start on the compare ref (main)"],
+        ]),
+        configMissing: { side: "base", error: "Connection closed" },
+      },
+    ];
+
+    const report: ConformanceReport = {
+      generatedAt: "2024-01-01T00:00:00.000Z",
+      currentBranch: "feature",
+      compareRef: "main",
+      results,
+      totalBranchTime: 40,
+      totalBaseTime: 0,
+      passedCount: 0,
+      diffCount: 1,
+    };
+
+    const summary = generatePRSummary(report);
+
+    expect(summary).toContain("**🚫 Missing on one side");
+    expect(summary).toContain("- **scope-pull-request:** did not start on compare ref (main)");
+    expect(summary).not.toContain("**❌ Configurations with errors:**");
+    // Should not be miscategorized as a normal changed config.
+    expect(summary).not.toContain("**⚠️ Changed configurations:**");
   });
 });

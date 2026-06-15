@@ -388,9 +388,78 @@ function compareResults(
 }
 
 /**
- * Generate a semantic JSON diff that shows actual changes
- * rather than line-by-line text comparison
+ * Outcome of comparing one configuration's probe results across both sides.
  */
+export interface ComparisonOutcome {
+  /** Endpoint -> diff/marker map (may include "error" or "config-missing" keys) */
+  diffs: Map<string, string>;
+  /** Present when exactly one side failed to start */
+  configMissing?: { side: "branch" | "base"; error: string };
+  /**
+   * True only for genuine probe failures (both sides failed to start). When
+   * true the "error" key is set and the run should honor fail_on_error.
+   */
+  fatalError: boolean;
+}
+
+/**
+ * Compare a single configuration's branch/base probe results, handling the
+ * three startup outcomes:
+ *
+ * - Both sides failed to start -> genuine probe error (fatal).
+ * - Exactly one side failed to start -> treat the failed side as an empty
+ *   probe result and diff the working side against it, so its entire surface
+ *   renders as added/removed. Non-fatal; tagged with a "config-missing" note
+ *   naming the side that could not start.
+ * - Neither side errored -> normal comparison.
+ */
+export function compareConfigResults(
+  configName: string,
+  branchResult: ProbeResult | undefined,
+  baseResult: ProbeResult | undefined,
+  compareRef: string
+): ComparisonOutcome {
+  const branchError = branchResult?.error;
+  const baseError = baseResult?.error;
+
+  // Both sides failed to start: a genuine probe failure.
+  if (branchError && baseError) {
+    const diffs = new Map<string, string>();
+    diffs.set(
+      "error",
+      `Probe failed on both sides. Current branch: ${branchError}; Base ref: ${baseError}`
+    );
+    return { diffs, fatalError: true };
+  }
+
+  // Exactly one side failed to start: diff the working side against an empty
+  // baseline so its full surface renders as added/removed.
+  if (branchError || baseError) {
+    const side: "branch" | "base" = branchError ? "branch" : "base";
+    const error = String(branchError || baseError);
+
+    const branchFiles = branchError ? new Map<string, string>() : probeResultToFiles(branchResult!);
+    const baseFiles = baseError ? new Map<string, string>() : probeResultToFiles(baseResult!);
+
+    const diffs = compareResults(branchFiles, baseFiles);
+
+    const note =
+      side === "base"
+        ? `Configuration "${configName}" did not start on the compare ref (${compareRef}); ` +
+          `it may not exist on that version. Diffed the current branch against an empty baseline.`
+        : `Configuration "${configName}" did not start on the current branch; ` +
+          `it may not exist on this version. Diffed the compare ref (${compareRef}) against an empty baseline.`;
+
+    diffs.set("config-missing", note);
+
+    return { diffs, configMissing: { side, error }, fatalError: false };
+  }
+
+  // Both sides started: normal comparison.
+  const branchFiles = probeResultToFiles(branchResult!);
+  const baseFiles = probeResultToFiles(baseResult!);
+  return { diffs: compareResults(branchFiles, baseFiles), fatalError: false };
+}
 function generateJsonDiff(name: string, base: string, branch: string): string | null {
   try {
     const baseObj = JSON.parse(base);
@@ -918,29 +987,30 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
       baseCounts: baseData?.result ? extractCounts(baseData.result) : undefined,
     };
 
-    // Handle errors
-    if (branchData?.result.error) {
-      result.hasDifferences = true;
-      result.diffs.set("error", `Current branch probe failed: ${branchData.result.error}`);
-      results.push(result);
-      continue;
-    }
+    // Compare results (handles one-sided / both-sided startup failures)
+    const outcome = compareConfigResults(
+      config.name,
+      branchData?.result,
+      baseData?.result,
+      ctx.compareRef
+    );
 
-    if (baseData?.result.error) {
-      result.hasDifferences = true;
-      result.diffs.set("error", `Base ref probe failed: ${baseData.result.error}`);
-      results.push(result);
-      continue;
-    }
-
-    // Compare results
-    const branchFiles = probeResultToFiles(branchData!.result);
-    const baseFiles = probeResultToFiles(baseData!.result);
-
-    result.diffs = compareResults(branchFiles, baseFiles);
+    result.diffs = outcome.diffs;
+    result.configMissing = outcome.configMissing;
     result.hasDifferences = result.diffs.size > 0;
 
-    if (result.hasDifferences) {
+    if (outcome.fatalError) {
+      core.error(`❌ Configuration ${config.name}: probe failed on both sides`);
+    } else if (outcome.configMissing) {
+      const failedRef =
+        outcome.configMissing.side === "base"
+          ? `compare ref (${ctx.compareRef})`
+          : "current branch";
+      core.warning(
+        `⚠️ Configuration ${config.name}: did not start on ${failedRef}; ` +
+          `diffing the working side against an empty baseline`
+      );
+    } else if (result.hasDifferences) {
       core.info(`📋 Configuration ${config.name}: ${result.diffs.size} change(s) found`);
     } else {
       core.info(`✅ Configuration ${config.name}: no changes`);

@@ -57248,9 +57248,46 @@ function compareResults(branchFiles, baseFiles) {
     return diffs;
 }
 /**
- * Generate a semantic JSON diff that shows actual changes
- * rather than line-by-line text comparison
+ * Compare a single configuration's branch/base probe results, handling the
+ * three startup outcomes:
+ *
+ * - Both sides failed to start -> genuine probe error (fatal).
+ * - Exactly one side failed to start -> treat the failed side as an empty
+ *   probe result and diff the working side against it, so its entire surface
+ *   renders as added/removed. Non-fatal; tagged with a "config-missing" note
+ *   naming the side that could not start.
+ * - Neither side errored -> normal comparison.
  */
+function compareConfigResults(configName, branchResult, baseResult, compareRef) {
+    const branchError = branchResult?.error;
+    const baseError = baseResult?.error;
+    // Both sides failed to start: a genuine probe failure.
+    if (branchError && baseError) {
+        const diffs = new Map();
+        diffs.set("error", `Probe failed on both sides. Current branch: ${branchError}; Base ref: ${baseError}`);
+        return { diffs, fatalError: true };
+    }
+    // Exactly one side failed to start: diff the working side against an empty
+    // baseline so its full surface renders as added/removed.
+    if (branchError || baseError) {
+        const side = branchError ? "branch" : "base";
+        const error = String(branchError || baseError);
+        const branchFiles = branchError ? new Map() : probeResultToFiles(branchResult);
+        const baseFiles = baseError ? new Map() : probeResultToFiles(baseResult);
+        const diffs = compareResults(branchFiles, baseFiles);
+        const note = side === "base"
+            ? `Configuration "${configName}" did not start on the compare ref (${compareRef}); ` +
+                `it may not exist on that version. Diffed the current branch against an empty baseline.`
+            : `Configuration "${configName}" did not start on the current branch; ` +
+                `it may not exist on this version. Diffed the compare ref (${compareRef}) against an empty baseline.`;
+        diffs.set("config-missing", note);
+        return { diffs, configMissing: { side, error }, fatalError: false };
+    }
+    // Both sides started: normal comparison.
+    const branchFiles = probeResultToFiles(branchResult);
+    const baseFiles = probeResultToFiles(baseResult);
+    return { diffs: compareResults(branchFiles, baseFiles), fatalError: false };
+}
 function generateJsonDiff(name, base, branch) {
     try {
         const baseObj = JSON.parse(base);
@@ -57673,25 +57710,22 @@ async function runAllTests(ctx) {
             branchCounts: branchData?.result ? extractCounts(branchData.result) : undefined,
             baseCounts: baseData?.result ? extractCounts(baseData.result) : undefined,
         };
-        // Handle errors
-        if (branchData?.result.error) {
-            result.hasDifferences = true;
-            result.diffs.set("error", `Current branch probe failed: ${branchData.result.error}`);
-            results.push(result);
-            continue;
-        }
-        if (baseData?.result.error) {
-            result.hasDifferences = true;
-            result.diffs.set("error", `Base ref probe failed: ${baseData.result.error}`);
-            results.push(result);
-            continue;
-        }
-        // Compare results
-        const branchFiles = probeResultToFiles(branchData.result);
-        const baseFiles = probeResultToFiles(baseData.result);
-        result.diffs = compareResults(branchFiles, baseFiles);
+        // Compare results (handles one-sided / both-sided startup failures)
+        const outcome = compareConfigResults(config.name, branchData?.result, baseData?.result, ctx.compareRef);
+        result.diffs = outcome.diffs;
+        result.configMissing = outcome.configMissing;
         result.hasDifferences = result.diffs.size > 0;
-        if (result.hasDifferences) {
+        if (outcome.fatalError) {
+            lib_core.error(`❌ Configuration ${config.name}: probe failed on both sides`);
+        }
+        else if (outcome.configMissing) {
+            const failedRef = outcome.configMissing.side === "base"
+                ? `compare ref (${ctx.compareRef})`
+                : "current branch";
+            lib_core.warning(`⚠️ Configuration ${config.name}: did not start on ${failedRef}; ` +
+                `diffing the working side against an empty baseline`);
+        }
+        else if (result.hasDifferences) {
             lib_core.info(`📋 Configuration ${config.name}: ${result.diffs.size} change(s) found`);
         }
         else {
@@ -57716,6 +57750,30 @@ async function runAllTests(ctx) {
 
 
 
+/** A result that failed to start on exactly one side (diffed against empty). */
+function isConfigMissing(result) {
+    return !!result.configMissing || result.diffs.has("config-missing");
+}
+/** A result with a genuine probe error (both sides failed to start). */
+function isErrored(result) {
+    return !isConfigMissing(result) && (!!result.error || result.diffs.has("error"));
+}
+/** A result with real API changes (not an error, not a one-sided missing config). */
+function isChanged(result) {
+    return result.hasDifferences && !isErrored(result) && !isConfigMissing(result);
+}
+/** A result with no differences, errors, or missing-config markers. */
+function isPassing(result) {
+    return !result.hasDifferences && !isErrored(result) && !isConfigMissing(result);
+}
+/** Human-readable label for the side that failed to start. */
+function missingSideLabel(report, result) {
+    const side = result.configMissing?.side;
+    if (side === "branch") {
+        return `current branch (${report.currentBranch})`;
+    }
+    return `compare ref (${report.compareRef})`;
+}
 /**
  * Generate a diff report from test results
  */
@@ -57765,7 +57823,7 @@ function generateMarkdownReport(report) {
         lines.push("");
         lines.push("**✅ Passing configurations (no changes detected):**");
         for (const result of report.results) {
-            if (!result.error && !result.diffs.has("error") && !result.hasDifferences) {
+            if (isPassing(result)) {
                 lines.push(`- ${result.configName}`);
             }
         }
@@ -57774,7 +57832,7 @@ function generateMarkdownReport(report) {
         lines.push("## 📋 API Changes Detected");
         lines.push("");
         // List passing configurations first
-        const passingConfigs = report.results.filter((r) => !r.error && !r.diffs.has("error") && !r.hasDifferences);
+        const passingConfigs = report.results.filter(isPassing);
         if (passingConfigs.length > 0) {
             lines.push("**✅ Passing configurations (no changes detected):**");
             for (const result of passingConfigs) {
@@ -57782,8 +57840,8 @@ function generateMarkdownReport(report) {
             }
             lines.push("");
         }
-        // List configurations with changes (excluding errors)
-        const changedConfigs = report.results.filter((r) => r.hasDifferences && !r.error && !r.diffs.has("error"));
+        // List configurations with changes (excluding errors and missing configs)
+        const changedConfigs = report.results.filter(isChanged);
         if (changedConfigs.length > 0) {
             lines.push("**⚠️ Configurations with changes:**");
             for (const result of changedConfigs) {
@@ -57791,8 +57849,17 @@ function generateMarkdownReport(report) {
             }
             lines.push("");
         }
+        // List configurations that did not start on one side (diffed against empty)
+        const missingConfigs = report.results.filter(isConfigMissing);
+        if (missingConfigs.length > 0) {
+            lines.push("**🚫 Configurations missing on one side (diffed against an empty baseline):**");
+            for (const result of missingConfigs) {
+                lines.push(`- ${result.configName} — did not start on ${missingSideLabel(report, result)}`);
+            }
+            lines.push("");
+        }
         // List configurations with errors if any
-        const errorConfigs = report.results.filter((r) => r.error || r.diffs.has("error"));
+        const errorConfigs = report.results.filter(isErrored);
         if (errorConfigs.length > 0) {
             lines.push("**❌ Configurations with errors:**");
             for (const result of errorConfigs) {
@@ -57805,7 +57872,9 @@ function generateMarkdownReport(report) {
     lines.push("## Configuration Results");
     lines.push("");
     for (const result of report.results) {
-        const statusIcon = result.error ? "❌" : result.hasDifferences ? "⚠️" : "✅";
+        const missing = isConfigMissing(result);
+        const errored = isErrored(result);
+        const statusIcon = errored ? "❌" : missing ? "🚫" : result.hasDifferences ? "⚠️" : "✅";
         lines.push(`### ${statusIcon} ${result.configName}`);
         lines.push("");
         lines.push(`- **Transport:** ${result.transport}`);
@@ -57828,10 +57897,27 @@ function generateMarkdownReport(report) {
         lines.push(`- **Branch Time:** ${formatTime(result.branchTime)}`);
         lines.push(`- **Base Time:** ${formatTime(result.baseTime)}`);
         lines.push("");
+        // Callout for one-sided startup failure
+        if (missing) {
+            const note = result.diffs.get("config-missing");
+            lines.push(`> 🚫 **Did not start on ${missingSideLabel(report, result)}.**`);
+            if (note) {
+                lines.push(`>`);
+                lines.push(`> ${note}`);
+            }
+            if (result.configMissing?.error) {
+                lines.push(`>`);
+                lines.push(`> Startup error: \`${result.configMissing.error}\``);
+            }
+            lines.push("");
+        }
         if (result.hasDifferences) {
             lines.push("#### Changes");
             lines.push("");
             for (const [endpoint, diff] of result.diffs) {
+                // The config-missing marker is rendered as a callout above, not a diff block.
+                if (endpoint === "config-missing")
+                    continue;
                 lines.push(`**${endpoint}**`);
                 lines.push("");
                 lines.push("```diff");
@@ -57909,7 +57995,7 @@ function generatePRSummary(report) {
         lines.push(`Tested ${report.results.length} configuration(s) - no API changes detected.`);
         lines.push("");
         lines.push("**✅ Passing configurations:**");
-        for (const result of report.results.filter((r) => !r.error && !r.diffs.has("error") && !r.hasDifferences)) {
+        for (const result of report.results.filter(isPassing)) {
             lines.push(`- ${result.configName}`);
         }
     }
@@ -57919,7 +58005,7 @@ function generatePRSummary(report) {
         lines.push(`**${report.diffCount}** of ${report.results.length} configuration(s) have changes.`);
         lines.push("");
         // List passing configurations
-        const passingConfigs = report.results.filter((r) => !r.error && !r.diffs.has("error") && !r.hasDifferences);
+        const passingConfigs = report.results.filter(isPassing);
         if (passingConfigs.length > 0) {
             lines.push("**✅ Passing configurations (no changes):**");
             for (const result of passingConfigs) {
@@ -57927,8 +58013,8 @@ function generatePRSummary(report) {
             }
             lines.push("");
         }
-        // List configurations with changes (excluding errors)
-        const changedConfigs = report.results.filter((r) => r.hasDifferences && !r.error && !r.diffs.has("error"));
+        // List configurations with changes (excluding errors and missing configs)
+        const changedConfigs = report.results.filter(isChanged);
         if (changedConfigs.length > 0) {
             lines.push("**⚠️ Changed configurations:**");
             for (const result of changedConfigs) {
@@ -57936,8 +58022,17 @@ function generatePRSummary(report) {
             }
             lines.push("");
         }
+        // List configurations that did not start on one side (diffed against empty)
+        const missingConfigs = report.results.filter(isConfigMissing);
+        if (missingConfigs.length > 0) {
+            lines.push("**🚫 Missing on one side (diffed against an empty baseline):**");
+            for (const result of missingConfigs) {
+                lines.push(`- **${result.configName}:** did not start on ${missingSideLabel(report, result)}`);
+            }
+            lines.push("");
+        }
         // List configurations with errors if any
-        const errorConfigs = report.results.filter((r) => r.error || r.diffs.has("error"));
+        const errorConfigs = report.results.filter(isErrored);
         if (errorConfigs.length > 0) {
             lines.push("**❌ Configurations with errors:**");
             for (const result of errorConfigs) {
@@ -58172,8 +58267,19 @@ async function run() {
         saveReport(report, markdown, workDir);
         // Set final status
         lib_core.info("");
-        // Check for actual probe errors (separate from differences)
+        // Check for actual probe errors (separate from differences). A one-sided
+        // startup failure is reported as "config-missing" (non-fatal) and is fully
+        // diffed against an empty baseline, so it does not count as a probe error.
         const hasErrors = results.some((r) => r.diffs.has("error"));
+        // Surface one-sided "missing on compare" configs explicitly (non-fatal).
+        const missingConfigs = results.filter((r) => r.configMissing);
+        if (missingConfigs.length > 0) {
+            for (const r of missingConfigs) {
+                const side = r.configMissing?.side === "branch" ? "current branch" : "compare ref";
+                lib_core.warning(`Configuration "${r.configName}" did not start on the ${side}; ` +
+                    `diffed against an empty baseline (non-fatal).`);
+            }
+        }
         if (hasErrors && inputs.failOnError) {
             const errorConfigs = results.filter((r) => r.diffs.has("error")).map((r) => r.configName);
             lib_core.setFailed(`❌ Probe errors occurred in: ${errorConfigs.join(", ")}`);
