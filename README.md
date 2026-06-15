@@ -204,7 +204,7 @@ Either `start_command` (for stdio) or `server_url` (for HTTP) must be provided, 
 |-------|-------------|---------|
 | `compare_ref` | Git ref to compare against. Auto-detects merge-base on PRs or previous tag on tag pushes if not specified. | `""` |
 | `fail_on_diff` | Fail the action if API changes are detected. Useful for release validation workflows. | `false` |
-| `fail_on_error` | Fail the action if probe errors occur (connection failures, etc.) | `true` |
+| `fail_on_error` | Fail the action if a genuine probe error occurs (e.g. the server fails to start on **both** sides). A configuration that starts on only one side is reported as "missing on one side" and is **not** treated as a probe error — see [One-Sided Startup Failures](#one-sided-startup-failures). | `true` |
 
 ### Configuration Object Schema
 
@@ -298,6 +298,30 @@ Differences appear as unified diffs in the report. Common changes include:
 - Schema changes (new parameters, updated descriptions)
 - Capability changes (new features enabled)
 - Version string updates
+
+### One-Sided Startup Failures
+
+Sometimes a configuration starts on one side of the comparison but fails to start on
+the other. The most common cause is a **brand-new configuration** that depends on a CLI
+flag or option that doesn't exist on the compare ref yet — for example a PR that
+introduces a new scoped server mode. On the compare ref the unknown flag is rejected and
+the server exits with something like `MCP error -32000: Connection closed`.
+
+When **exactly one** side fails to start (and the other probes successfully), the action:
+
+1. **Reports a fail on the side that could not start**, naming the version (current
+   branch or compare ref) in a dedicated "🚫 missing on one side" section and a per-config
+   callout, instead of an opaque probe error.
+2. **Diffs the working side against an empty baseline**, so the entire surface of the
+   new (or removed) configuration renders as added/removed — giving you a complete
+   picture of what it exposes.
+3. **Does not trip `fail_on_error`.** A one-sided startup failure is treated as a
+   surface difference (`config-missing`), not a genuine probe error, so an introducing PR
+   isn't failed for the expected "this config doesn't exist on the base ref yet" case. It
+   still counts as a difference, so `fail_on_diff` will flag it if enabled.
+
+When **both** sides fail to start, that is a genuine probe failure: it is reported as an
+error and trips `fail_on_error` (when enabled).
 
 ## Transport Support
 
