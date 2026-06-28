@@ -18,34 +18,6 @@ export interface ProbeOptions {
  * Probes an MCP server and returns capability snapshots
  */
 export declare function probeServer(options: ProbeOptions): Promise<ProbeResult>;
-/**
- * Normalize a probe result for comparison by sorting keys and arrays recursively.
- * Also handles embedded JSON strings in "text" fields (from tool call responses).
- *
- * Sorting strategy:
- * - Object keys: sorted alphabetically (the MCP draft spec — see
- *   https://modelcontextprotocol.io/specification/draft — now requires
- *   deterministic ordering for list results; we've always done this)
- * - Arrays of objects: sorted by primary key (name, uri, type) for deterministic output
- * - Primitive arrays: sorted by string representation
- * - Embedded JSON in "text" fields: parsed, normalized, and re-serialized
- *
- * Cross-version noise stripping (always on):
- * - Recursively cleans `_meta` objects by dropping the specific
- *   transport-plumbing keys listed in PROTOCOL_NOISE_META_KEYS (negotiated
- *   protocol version, client info/capabilities, subscription IDs, log level,
- *   plus W3C trace context). Crucially this is an *exact-key* denylist so
- *   official extension surfaces under `io.modelcontextprotocol/*` (MCP Apps'
- *   `_meta.ui`, Tasks' `_meta.io.modelcontextprotocol/related-task`, etc.)
- *   are preserved — those are exactly what this tool exists to diff. An
- *   emptied `_meta` is dropped entirely.
- *
- * Cache-hint stripping (opt-in via `stripCacheHints`):
- * - The draft spec adds `ttlMs` and `cacheScope` (CacheableResult, SEP-2461)
- *   to results of tools/list, prompts/list, resources/list, resources/read,
- *   and resources/templates/list. These are freshness/cache hints that vary
- *   run-to-run, so we strip them at the top level of each list/read result.
- */
 export declare function normalizeProbeResult(result: unknown, options?: {
     stripCacheHints?: boolean;
 }): unknown;

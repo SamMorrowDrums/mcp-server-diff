@@ -65273,7 +65273,34 @@ function cleanMetaObject(meta) {
  *   to results of tools/list, prompts/list, resources/list, resources/read,
  *   and resources/templates/list. These are freshness/cache hints that vary
  *   run-to-run, so we strip them at the top level of each list/read result.
+ *
+ * Tool-annotation default stripping (always on):
+ * - The MCP spec defines defaults for `ToolAnnotations` hints: `readOnlyHint`
+ *   = false, `destructiveHint` = true, `idempotentHint` = false,
+ *   `openWorldHint` = true. A server that omits a hint is semantically
+ *   identical to one that emits the default value. Different SDK versions
+ *   (or `omitempty`-toggling SDK upgrades, e.g. go-sdk v1.6→v1.7) cause one
+ *   side to emit defaults and the other to omit them, producing pure
+ *   cross-version churn on every tool. We canonicalize by dropping any
+ *   annotation field that equals its spec default. An emptied `annotations`
+ *   object is dropped entirely.
  */
+const TOOL_ANNOTATION_DEFAULTS = {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: true,
+};
+function normalizeToolAnnotations(annotations) {
+    const cleaned = {};
+    for (const [key, value] of Object.entries(annotations)) {
+        if (key in TOOL_ANNOTATION_DEFAULTS && value === TOOL_ANNOTATION_DEFAULTS[key]) {
+            continue;
+        }
+        cleaned[key] = value;
+    }
+    return Object.keys(cleaned).length === 0 ? undefined : cleaned;
+}
 function normalizeProbeResult(result, options = {}) {
     if (result === null || result === undefined) {
         return result;
@@ -65305,6 +65332,15 @@ function normalizeProbeResult(result, options = {}) {
             // Drop the `_meta` entirely if nothing useful is left.
             if (key === "_meta" && value !== null && typeof value === "object") {
                 const cleaned = cleanMetaObject(value);
+                if (cleaned === undefined)
+                    continue;
+                value = cleaned;
+            }
+            // Canonicalize tool `annotations`: drop hint fields that equal their
+            // spec defaults so a server that emits `idempotentHint: false`
+            // compares equal to one that omits it (cross-SDK / cross-spec churn).
+            if (key === "annotations" && value !== null && typeof value === "object") {
+                const cleaned = normalizeToolAnnotations(value);
                 if (cleaned === undefined)
                     continue;
                 value = cleaned;
