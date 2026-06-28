@@ -158,6 +158,97 @@ describe("normalizeProbeResult", () => {
   });
 });
 
+describe("normalizeProbeResult tool-annotation default stripping", () => {
+  // The MCP spec gives ToolAnnotations these defaults: readOnlyHint=false,
+  // destructiveHint=true, idempotentHint=false, openWorldHint=true. An SDK
+  // that emits explicit defaults (e.g. go-sdk v1.7 dropped `omitempty` on
+  // ReadOnlyHint/IdempotentHint) must compare equal to one that omits them
+  // (go-sdk v1.6).
+
+  it("drops annotation fields that equal their spec defaults", () => {
+    const input = {
+      tools: [
+        {
+          name: "search",
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: true,
+            idempotentHint: false,
+            openWorldHint: true,
+          },
+        },
+      ],
+    };
+    const result = normalizeProbeResult(input) as {
+      tools: Array<Record<string, unknown>>;
+    };
+    expect("annotations" in result.tools[0]).toBe(false);
+  });
+
+  it("keeps annotation fields that differ from spec defaults", () => {
+    const input = {
+      tools: [
+        {
+          name: "search",
+          annotations: {
+            title: "Search the web",
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+          },
+        },
+      ],
+    };
+    const result = normalizeProbeResult(input) as {
+      tools: Array<{ annotations: Record<string, unknown> }>;
+    };
+    expect(result.tools[0].annotations).toEqual({
+      title: "Search the web",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+  });
+
+  it("makes omit-vs-default-emit equivalent (go-sdk v1.6 vs v1.7 regression)", () => {
+    // Same tool, two SDK versions: v1.6 omits the default hints, v1.7
+    // emits them explicitly. After normalization they must be identical.
+    const v16 = { tools: [{ name: "t1" }] };
+    const v17 = {
+      tools: [
+        {
+          name: "t1",
+          annotations: { readOnlyHint: false, idempotentHint: false },
+        },
+      ],
+    };
+    expect(JSON.stringify(normalizeProbeResult(v16))).toBe(
+      JSON.stringify(normalizeProbeResult(v17))
+    );
+  });
+
+  it("preserves non-hint annotation fields like title regardless of hint defaults", () => {
+    const input = {
+      tools: [
+        {
+          name: "search",
+          annotations: {
+            title: "Just a title",
+            readOnlyHint: false,
+            idempotentHint: false,
+          },
+        },
+      ],
+    };
+    const result = normalizeProbeResult(input) as {
+      tools: Array<{ annotations: Record<string, unknown> }>;
+    };
+    expect(result.tools[0].annotations).toEqual({ title: "Just a title" });
+  });
+});
+
 describe("probeResultToFiles cache-hint stripping", () => {
   function makeResult(overrides: Partial<ProbeResult>): ProbeResult {
     return {
@@ -397,7 +488,7 @@ describe("lossless capture of advertised tool/resource properties", () => {
               readOnlyHint: true,
               destructiveHint: false,
               idempotentHint: true,
-              openWorldHint: true,
+              openWorldHint: false,
             },
             outputSchema: {
               type: "object",
@@ -471,7 +562,7 @@ describe("lossless capture of advertised tool/resource properties", () => {
       readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
-      openWorldHint: true,
+      openWorldHint: false,
     });
     expect(tool.outputSchema).toEqual({
       type: "object",
