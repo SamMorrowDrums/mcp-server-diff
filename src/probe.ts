@@ -957,7 +957,7 @@ export const CANONICAL_SNAPSHOT_NAMES = {
  *
  * Importantly, `instructions` and `capabilities` shape are NOT stripped —
  * those are real public-interface signals (e.g. go-sdk v1.7.0-pre.1's
- * discover-omits-instructions vs initialize-emits-instructions regression
+ * discover-omits-instructions vs initialize-emits-instructions difference
  * has to surface, not be hidden).
  */
 function normalizeInitializeForDiff(info: InitializeInfo): unknown {

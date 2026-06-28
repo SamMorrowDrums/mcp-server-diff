@@ -609,13 +609,15 @@ describe("discover/initialize cross-spec diffing (fixture-driven)", () => {
   //   carries CacheableResult hints (ttlMs, cacheScope), the `tools/list`
   //   result carries them too, every tool emits the previously-omitempty
   //   `idempotentHint:false` / `readOnlyHint:false` defaults, AND
-  //   `instructions` is OMITTED — a real public-interface regression we
-  //   want the diff to surface.
+  //   `instructions` is OMITTED — a real public-interface difference we
+  //   want the diff to surface. `instructions` is OPTIONAL in both
+  //   InitializeResult and DiscoverResult per the spec, so omitting it
+  //   is conformant; it's still a behavioral inconsistency clients see.
   //
   // The test asserts that, after normalization:
   //   - cross-version protocol noise (cache hints, protocolVersion churn,
   //     annotation defaults) disappears, and
-  //   - the `instructions` regression survives as a visible diff.
+  //   - the `instructions` difference survives as a visible diff.
 
   function baseProbeResult(): ProbeResult {
     return {
@@ -663,8 +665,9 @@ describe("discover/initialize cross-spec diffing (fixture-driven)", () => {
           "io.modelcontextprotocol/clientCapabilities": {},
         },
       } as unknown as ProbeResult["initialize"],
-      // discover-path regression: server/discover omits instructions even
-      // though initialize emits them. This MUST surface.
+      // discover-path behavior: server/discover omits instructions even
+      // though initialize emits them (spec-optional on both, but a real
+      // public-interface difference). This MUST surface.
       instructions: null,
       tools: {
         // Cache hints on the list envelope, default-valued annotation
@@ -724,10 +727,13 @@ describe("discover/initialize cross-spec diffing (fixture-driven)", () => {
     ]);
   });
 
-  it("preserves the discover-omits-instructions regression as a diff signal", () => {
+  it("preserves the discover-omits-instructions difference as a diff signal", () => {
     // This is the case study: same server, two probe paths, instructions
-    // semantically present on one and absent on the other. The tool MUST
-    // surface this — it's a public-interface change, not protocol churn.
+    // semantically present on one and absent on the other. `instructions`
+    // is spec-optional in both InitializeResult and DiscoverResult, so
+    // neither side is non-conformant — but the tool MUST surface this
+    // because it's a public-interface change clients adopting discover
+    // observe, not protocol churn.
     const baseFiles = probeResultToFiles(baseProbeResult());
     const branchFiles = probeResultToFiles(branchProbeResult());
     expect(baseFiles.get("instructions")).toBe(
@@ -827,10 +833,12 @@ describe("real-wire fixture: github-mcp-server v1.6.1 vs v1.7.0-pre.1", () => {
     expect(baseTool.icons).toBeUndefined();
   });
 
-  it("surfaces the discover-omits-instructions regression (case study)", () => {
+  it("surfaces the discover-omits-instructions difference (case study)", () => {
     // The headline assertion: same logical server, instructions present
     // on initialize and absent on discover, and normalization MUST leave
-    // that gap visible.
+    // that gap visible. `instructions` is spec-optional on both result
+    // shapes, so the server is conformant either way — but the surface
+    // difference is real and clients adopting discover observe it.
     const baseFiles = probeResultToFiles(baseEnvelope());
     const branchFiles = probeResultToFiles(branchEnvelope());
     expect(baseFiles.get("instructions")).toContain("GitHub MCP Server");
