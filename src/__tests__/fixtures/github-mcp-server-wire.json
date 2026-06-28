@@ -1,0 +1,126 @@
+{
+  "_comment": [
+    "Raw JSON-RPC bodies captured live from github-mcp-server, used as the",
+    "case study for cross-spec-version diff cleanliness. To refresh:",
+    "  1. Build github-mcp-server at the relevant go-sdk tag.",
+    "  2. For 'new_*' fields, probe stateless server/discover @ 2026-07-28",
+    "     with the SEP-2243 headers + reserved _meta. Capture the SSE",
+    "     `data:` payload from each method as JSON.",
+    "  3. For 'base_*' fields, probe the legacy initialize handshake at",
+    "     2025-11-25. Capture the JSON-RPC result envelope as JSON.",
+    "  4. Replace any base64 image payloads with the literal string",
+    "     '<TRUNCATED>' to keep the fixture small.",
+    "These are the *response* shapes; request shapes are documented in",
+    "src/probe.ts (buildStatelessReservedMeta + openStatelessHttp/Stdio)."
+  ],
+
+  "new_server_discover_response": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "ttlMs": 0,
+      "cacheScope": "public",
+      "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"],
+      "capabilities": {
+        "completions": {},
+        "prompts": {},
+        "resources": {},
+        "tools": {}
+      },
+      "serverInfo": {
+        "name": "github-mcp-server",
+        "title": "GitHub MCP Server",
+        "version": "version",
+        "icons": [
+          { "src": "data:image/png;base64,<TRUNCATED>", "mimeType": "image/png", "theme": "light" },
+          { "src": "data:image/png;base64,<TRUNCATED>", "mimeType": "image/png", "theme": "dark" }
+        ]
+      }
+    }
+  },
+
+  "new_tools_list_response": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "result": {
+      "ttlMs": 0,
+      "cacheScope": "public",
+      "tools": [
+        {
+          "name": "get_me",
+          "annotations": {
+            "idempotentHint": false,
+            "readOnlyHint": true,
+            "title": "Get my user profile"
+          },
+          "description": "Get details of the authenticated GitHub user. Use this when a request is about the user's own profile for GitHub. Or when information is missing to build other tool calls.",
+          "inputSchema": { "type": "object", "properties": {} },
+          "icons": [
+            {
+              "src": "data:image/png;base64,<TRUNCATED>",
+              "mimeType": "image/png",
+              "theme": "light"
+            },
+            { "src": "data:image/png;base64,<TRUNCATED>", "mimeType": "image/png", "theme": "dark" }
+          ]
+        }
+      ]
+    }
+  },
+
+  "new_error_32020_header_mismatch": {
+    "jsonrpc": "2.0",
+    "id": 9,
+    "error": {
+      "code": -32020,
+      "message": "header mismatch: Mcp-Method header value 'prompts/list' does not match body value 'tools/list'"
+    }
+  },
+
+  "new_error_32602_missing_meta": {
+    "jsonrpc": "2.0",
+    "id": 10,
+    "error": {
+      "code": -32602,
+      "message": "missing or invalid _meta field \"io.modelcontextprotocol/clientCapabilities\""
+    }
+  },
+
+  "base_initialize_response": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+      "protocolVersion": "2025-11-25",
+      "capabilities": {
+        "completions": {},
+        "logging": {},
+        "prompts": { "listChanged": true },
+        "tools": { "listChanged": true }
+      },
+      "instructions": "The GitHub MCP Server provides tools to interact with GitHub platform.\n\nTool selection guidance:\n\t1. Use 'list_*' tools for broad retrieval ...",
+      "serverInfo": {
+        "name": "github-mcp-server",
+        "title": "GitHub MCP Server",
+        "version": "version",
+        "icons": [
+          { "src": "data:image/png;base64,<TRUNCATED>", "mimeType": "image/png", "theme": "light" }
+        ]
+      }
+    }
+  },
+
+  "base_tools_list_get_me_response": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "result": {
+      "tools": [
+        {
+          "name": "get_me",
+          "annotations": { "readOnlyHint": true, "title": "Get my user profile" },
+          "description": "Get details of the authenticated GitHub user. Use this when a request is about the user's own profile for GitHub. Or when information is missing to build other tool calls.",
+          "inputSchema": { "type": "object", "properties": {} }
+        }
+      ]
+    }
+  }
+}
