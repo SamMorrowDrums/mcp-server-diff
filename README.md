@@ -671,7 +671,7 @@ If you consume `mcp-server-diff` as a GitHub Action or via `npx`, nothing in you
 
 The probe now strips the `ttlMs` and `cacheScope` cache hints (CacheableResult, [SEP-2461](https://modelcontextprotocol.io/specification/draft/changelog)) from the top level of `tools/list`, `prompts/list`, `resources/list`, and `resources/templates/list` results before snapshotting. These freshness hints are intended to vary between runs, so stripping them keeps diffs focused on real interface changes. Nested `ttlMs` / `cacheScope` fields (e.g. inside a tool description) are preserved.
 
-The `initialize` snapshot is unchanged. The draft renames it to `server/discover` ([SEP-2575](https://modelcontextprotocol.io/specification/draft/changelog)), but we will adopt the new method name in a follow-up release once `@modelcontextprotocol/sdk` v2 ships.
+The `initialize` snapshot is captured from whichever handshake path the server actually supports — see [Cross-spec-version diffing](#cross-spec-version-diffing) for details. Servers on the draft spec ([SEP-2575](https://modelcontextprotocol.io/specification/draft/changelog)) are probed statelessly via `server/discover`; pre-draft servers continue to use the legacy `initialize` handshake via `@modelcontextprotocol/sdk`. Both flow into the same canonical `initialize` snapshot file.
 
 ### Cross-spec-version diffing
 
@@ -684,7 +684,7 @@ What gets normalized away before snapshotting:
 - **W3C trace context inside `_meta`** — `traceparent`, `tracestate`, and `baggage` (transport-injected for OTel propagation) are stripped from `_meta`.
 - **Tool annotation default hints** — `ToolAnnotations` fields are dropped when they equal their spec defaults (`readOnlyHint=false`, `destructiveHint=true`, `idempotentHint=false`, `openWorldHint=true`), so a server that emits explicit defaults compares equal to one that omits them. Important when an SDK toggles `omitempty` between versions (e.g. go-sdk v1.6→v1.7 dropped it on `ReadOnlyHint`/`IdempotentHint` and would otherwise show every tool as "changed"). An emptied `annotations` object is dropped entirely.
 - **`initialize` envelope churn** — `protocolVersion` and `capabilities.experimental` are excluded from the `initialize` snapshot body. The negotiated protocol version is captured separately and surfaced by the reporter (see below).
-- **Endpoint names are canonicalized** — see `CANONICAL_SNAPSHOT_NAMES` in `src/probe.ts`. When the spec eventually renames `initialize` → `server/discover`, both will map to the same `initialize` snapshot file so a spec upgrade shows up as a content diff on one file, not a "removed + added" pair.
+- **Endpoint names are canonicalized** — see `CANONICAL_SNAPSHOT_NAMES` in `src/probe.ts`. The probe tries the stateless `server/discover` path first (SEP-2575, SEP-2243) so a server on the draft spec is probed at its own newest spec version; on any failure it falls back to the legacy `initialize` handshake via `@modelcontextprotocol/sdk`. Both flow into the same `initialize` snapshot file, so a spec upgrade shows up as a content diff on one file, not a "removed + added" pair. The reporter still surfaces "Protocol version changed from X to Y" via a banner. Note that fields like `instructions` and `capabilities` are NOT normalized away even though they may differ between paths — those are real public-interface signals, e.g. go-sdk v1.7.0-pre.1's discover-omits-instructions vs initialize-emits-instructions regression has to surface.
 
 What is **not** normalized (intentionally):
 

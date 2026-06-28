@@ -595,3 +595,152 @@ describe("lossless capture of advertised tool/resource properties", () => {
     expect(template._meta).toEqual({ "x.acme/cache-ttl": 60 });
   });
 });
+
+describe("discover/initialize cross-spec diffing (fixture-driven)", () => {
+  // These fixtures are lifted verbatim from real wire transcripts:
+  //
+  // - BASE: github-mcp-server built against go-sdk v1.6.1, probed via the
+  //   legacy `initialize` handshake at 2025-11-25. The SDK populates
+  //   `instructions` via getInstructions(); the server emits no top-level
+  //   cache hints; tool annotations omit defaults.
+  // - BRANCH: same server built against go-sdk v1.7.0-pre.1, probed via the
+  //   stateless `server/discover` path at 2026-07-28. The discover result
+  //   carries CacheableResult hints (ttlMs, cacheScope), the `tools/list`
+  //   result carries them too, every tool emits the previously-omitempty
+  //   `idempotentHint:false` / `readOnlyHint:false` defaults, AND
+  //   `instructions` is OMITTED — a real public-interface regression we
+  //   want the diff to surface.
+  //
+  // The test asserts that, after normalization:
+  //   - cross-version protocol noise (cache hints, protocolVersion churn,
+  //     annotation defaults) disappears, and
+  //   - the `instructions` regression survives as a visible diff.
+
+  function baseProbeResult(): ProbeResult {
+    return {
+      initialize: {
+        protocolVersion: "2025-11-25",
+        serverInfo: { name: "github-mcp-server", version: "version" },
+        capabilities: { prompts: {}, resources: {}, tools: {} },
+      },
+      instructions: "GitHub MCP Server. Access GitHub via tools for issues, PRs, repos, and more.",
+      tools: {
+        tools: [
+          {
+            name: "get_me",
+            description: "Get authenticated user",
+            inputSchema: { type: "object", properties: {} },
+            annotations: { readOnlyHint: true, title: "Get me" },
+          },
+        ],
+      } as unknown as ProbeResult["tools"],
+      prompts: { prompts: [{ name: "summarize_issue", description: "Summarize an issue" }] },
+      resources: null,
+      resourceTemplates: null,
+      customResponses: new Map(),
+    };
+  }
+
+  function branchProbeResult(): ProbeResult {
+    return {
+      initialize: {
+        // server/discover-mapped: server's newest supportedVersion goes in
+        // the protocolVersion slot for the banner.
+        protocolVersion: "2026-07-28",
+        serverInfo: {
+          name: "github-mcp-server",
+          version: "version",
+          title: "GitHub MCP Server",
+        },
+        capabilities: { completions: {}, prompts: {}, resources: {}, tools: {} },
+        // CacheableResult hints arrive on the discover envelope itself.
+        ttlMs: 0,
+        cacheScope: "public",
+        // SDK-injected protocol plumbing in _meta — must be stripped.
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+          "io.modelcontextprotocol/clientCapabilities": {},
+        },
+      } as unknown as ProbeResult["initialize"],
+      // discover-path regression: server/discover omits instructions even
+      // though initialize emits them. This MUST surface.
+      instructions: null,
+      tools: {
+        // Cache hints on the list envelope, default-valued annotation
+        // hints from the omitempty drop, plus an extra "completions" cap.
+        ttlMs: 0,
+        cacheScope: "public",
+        tools: [
+          {
+            name: "get_me",
+            description: "Get authenticated user",
+            inputSchema: { type: "object", properties: {} },
+            annotations: {
+              idempotentHint: false,
+              readOnlyHint: true,
+              title: "Get me",
+            },
+          },
+        ],
+      } as unknown as ProbeResult["tools"],
+      prompts: {
+        ttlMs: 0,
+        cacheScope: "public",
+        prompts: [{ name: "summarize_issue", description: "Summarize an issue" }],
+      } as unknown as ProbeResult["prompts"],
+      resources: null,
+      resourceTemplates: null,
+      customResponses: new Map(),
+    };
+  }
+
+  it("collapses pure cross-spec churn on the tools snapshot", () => {
+    const base = probeResultToFiles(baseProbeResult()).get("tools")!;
+    const branch = probeResultToFiles(branchProbeResult()).get("tools")!;
+    expect(branch).toBe(base);
+  });
+
+  it("collapses pure cross-spec churn on the prompts snapshot", () => {
+    const base = probeResultToFiles(baseProbeResult()).get("prompts")!;
+    const branch = probeResultToFiles(branchProbeResult()).get("prompts")!;
+    expect(branch).toBe(base);
+  });
+
+  it("strips ttlMs/cacheScope and _meta plumbing from the discover→initialize snapshot", () => {
+    const branchInit = JSON.parse(probeResultToFiles(branchProbeResult()).get("initialize")!);
+    // No protocol-shape churn left.
+    expect(branchInit.ttlMs).toBeUndefined();
+    expect(branchInit.cacheScope).toBeUndefined();
+    expect(branchInit.protocolVersion).toBeUndefined();
+    expect(branchInit._meta).toBeUndefined();
+    // But real surface (serverInfo, capabilities) is preserved.
+    expect(branchInit.serverInfo.name).toBe("github-mcp-server");
+    expect(Object.keys(branchInit.capabilities).sort()).toEqual([
+      "completions",
+      "prompts",
+      "resources",
+      "tools",
+    ]);
+  });
+
+  it("preserves the discover-omits-instructions regression as a diff signal", () => {
+    // This is the case study: same server, two probe paths, instructions
+    // semantically present on one and absent on the other. The tool MUST
+    // surface this — it's a public-interface change, not protocol churn.
+    const baseFiles = probeResultToFiles(baseProbeResult());
+    const branchFiles = probeResultToFiles(branchProbeResult());
+    expect(baseFiles.get("instructions")).toBe(
+      "GitHub MCP Server. Access GitHub via tools for issues, PRs, repos, and more."
+    );
+    expect(branchFiles.get("instructions")).toBeUndefined();
+  });
+
+  it("surfaces capability-shape changes (e.g. discover adds 'completions')", () => {
+    // The new spec advertises `completions` capability; the old initialize
+    // path does not. This is real surface — it must appear in the diff.
+    const baseInit = JSON.parse(probeResultToFiles(baseProbeResult()).get("initialize")!);
+    const branchInit = JSON.parse(probeResultToFiles(branchProbeResult()).get("initialize")!);
+    expect(baseInit.capabilities.completions).toBeUndefined();
+    expect(branchInit.capabilities.completions).toEqual({});
+  });
+});

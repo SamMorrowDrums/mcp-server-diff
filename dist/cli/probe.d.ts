@@ -15,7 +15,18 @@ export interface ProbeOptions {
     customMessages?: CustomMessage[];
 }
 /**
- * Probes an MCP server and returns capability snapshots
+ * Probes an MCP server and returns capability snapshots.
+ *
+ * Tries the stateless `server/discover` path first (SEP-2575 / SEP-2243) so
+ * a server that supports the new spec is probed at its own newest spec
+ * version — the honest "what does this server actually expose right now"
+ * picture. On any failure to discover (HTTP 400, JSON-RPC -32601, missing
+ * `supportedVersions`, parse error, …) we fall back to the legacy SDK-driven
+ * `initialize` handshake, which is what every pre-2026 server supports.
+ *
+ * This means an upgrade like go-sdk v1.6.1 → v1.7.0-pre.1 produces an
+ * "old base probed via initialize / new branch probed via discover" diff
+ * rather than silently negotiating both sides down onto initialize.
  */
 export declare function probeServer(options: ProbeOptions): Promise<ProbeResult>;
 export declare function normalizeProbeResult(result: unknown, options?: {
