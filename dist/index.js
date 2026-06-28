@@ -65128,6 +65128,10 @@ class StreamableHTTPClientTransport {
     }
 }
 //# sourceMappingURL=streamableHttp.js.map
+;// CONCATENATED MODULE: external "node:child_process"
+const external_node_child_process_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:child_process");
+;// CONCATENATED MODULE: external "node:readline"
+const external_node_readline_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:readline");
 ;// CONCATENATED MODULE: ./src/logger.ts
 /**
  * Logger abstraction - works in both CLI and GitHub Actions contexts
@@ -65211,15 +65215,245 @@ const log = {
 
 
 
+
+
+/**
+ * Stateless probe client identity. Sent as
+ * `_meta["io.modelcontextprotocol/clientInfo"]` on every stateless request
+ * per SEP-2243 (reserved `_meta` keys on the stateless path).
+ */
+const PROBE_CLIENT_INFO = {
+    name: "mcp-server-diff-probe",
+    version: "3.0",
+};
+/**
+ * Protocol version we advertise on the stateless `server/discover` path. The
+ * server will negotiate down via the returned `supportedVersions` array if
+ * needed; we capture `supportedVersions[0]` (the server's newest) as the
+ * negotiated version for the snapshot banner.
+ */
+const STATELESS_PROBE_PROTOCOL_VERSION = "2026-07-28";
+/**
+ * Build the reserved `_meta` block that every stateless request's `params`
+ * must carry per SEP-2243. Omitting any of these three keys causes the
+ * server to reject the request with -32602.
+ */
+function buildStatelessReservedMeta(protocolVersion) {
+    return {
+        "io.modelcontextprotocol/protocolVersion": protocolVersion,
+        "io.modelcontextprotocol/clientInfo": { ...PROBE_CLIENT_INFO },
+        "io.modelcontextprotocol/clientCapabilities": {},
+    };
+}
+/**
+ * Parse a single SSE frame as emitted by the streamable-HTTP MCP server
+ * (`event: message\ndata: {json}\n\n`). The MCP stateless path uses
+ * one-frame-then-close responses, so we just concatenate all `data:` lines
+ * and parse the result as JSON.
+ */
+function parseSingleSseFrame(text) {
+    const dataLines = [];
+    for (const rawLine of text.split(/\r?\n/)) {
+        if (rawLine.startsWith("data:")) {
+            dataLines.push(rawLine.slice(5).replace(/^ /, ""));
+        }
+    }
+    if (dataLines.length === 0) {
+        throw new Error(`Expected SSE data frame, got: ${text.length > 200 ? text.slice(0, 200) + "…" : text}`);
+    }
+    return dataLines.join("\n");
+}
+/**
+ * JSON-RPC error envelope returned by stateless responses. We pass these
+ * through as Error objects so the orchestrator can decide whether they
+ * indicate "not supported, fall back" or a real probe failure.
+ */
+class JsonRpcRemoteError extends Error {
+    code;
+    data;
+    constructor(code, message, data) {
+        super(`JSON-RPC error ${code}: ${message}`);
+        this.code = code;
+        this.data = data;
+        this.name = "JsonRpcRemoteError";
+    }
+}
+/**
+ * Open a stateless HTTP connection to an MCP server. Each request POSTs to
+ * the server URL with the SEP-2243 headers (MCP-Protocol-Version, Mcp-Method)
+ * and required reserved `_meta`. Responses come back as a single SSE frame
+ * with Content-Type: text/event-stream — we parse the `data:` line as JSON.
+ */
+function openStatelessHttp(url, baseHeaders, protocolVersion) {
+    let nextId = 1;
+    const reservedMeta = buildStatelessReservedMeta(protocolVersion);
+    return {
+        async request(method, params) {
+            const id = nextId++;
+            const mergedParams = { ...(params ?? {}) };
+            mergedParams._meta = {
+                ...(typeof mergedParams._meta === "object" && mergedParams._meta !== null
+                    ? mergedParams._meta
+                    : {}),
+                ...reservedMeta,
+            };
+            const body = JSON.stringify({ jsonrpc: "2.0", id, method, params: mergedParams });
+            const resp = await fetch(url, {
+                method: "POST",
+                headers: {
+                    ...baseHeaders,
+                    "Content-Type": "application/json",
+                    Accept: "application/json, text/event-stream",
+                    "MCP-Protocol-Version": protocolVersion,
+                    "Mcp-Method": method,
+                },
+                body,
+            });
+            const rawBody = await resp.text();
+            if (!resp.ok) {
+                // v1.6.1-style "no discover handler" returns HTTP 400 text/plain
+                // ("Bad Request: Unsupported protocol version …" or
+                // "JSON RPC not handled …"). Surface as a plain Error so the
+                // orchestrator falls back to the SDK initialize path.
+                throw new Error(`HTTP ${resp.status}: ${rawBody.slice(0, 300)}`);
+            }
+            const contentType = resp.headers.get("content-type") ?? "";
+            const json = contentType.includes("text/event-stream")
+                ? parseSingleSseFrame(rawBody)
+                : rawBody;
+            const parsed = JSON.parse(json);
+            if (parsed.error) {
+                throw new JsonRpcRemoteError(parsed.error.code, parsed.error.message, parsed.error.data);
+            }
+            return parsed.result;
+        },
+        async close() {
+            // fetch has no persistent connection state to release.
+        },
+    };
+}
+/**
+ * Open a stateless stdio connection to an MCP server. We spawn the child
+ * process, write line-delimited JSON-RPC to stdin, and read line-delimited
+ * JSON-RPC responses from stdout, correlating by `id`. There are no
+ * SEP-2243 HTTP headers over stdio — only the reserved `_meta` on params.
+ */
+function openStatelessStdio(command, args, env, workingDir, protocolVersion) {
+    const child = (0,external_node_child_process_namespaceObject.spawn)(command, args, {
+        env,
+        cwd: workingDir,
+        stdio: ["pipe", "pipe", "pipe"],
+    });
+    // Surface stderr for debuggability without spamming on healthy probes.
+    child.stderr.on("data", (chunk) => {
+        log.info(`  [stdio stderr] ${chunk.toString("utf8").trimEnd()}`);
+    });
+    const rl = (0,external_node_readline_namespaceObject.createInterface)({ input: child.stdout, crlfDelay: Infinity });
+    const pending = new Map();
+    rl.on("line", (line) => {
+        const trimmed = line.trim();
+        if (!trimmed)
+            return;
+        let msg;
+        try {
+            msg = JSON.parse(trimmed);
+        }
+        catch {
+            // Servers sometimes log to stdout before the JSON-RPC stream starts —
+            // ignore non-JSON lines rather than rejecting outstanding requests.
+            return;
+        }
+        if (typeof msg.id !== "number")
+            return;
+        const handler = pending.get(msg.id);
+        if (!handler)
+            return;
+        pending.delete(msg.id);
+        if (msg.error) {
+            handler.reject(new JsonRpcRemoteError(msg.error.code, msg.error.message));
+        }
+        else {
+            handler.resolve(msg.result);
+        }
+    });
+    child.on("error", (err) => {
+        for (const { reject } of pending.values())
+            reject(err);
+        pending.clear();
+    });
+    child.on("exit", (code) => {
+        const err = new Error(`stdio child exited prematurely with code ${code}`);
+        for (const { reject } of pending.values())
+            reject(err);
+        pending.clear();
+    });
+    let nextId = 1;
+    const reservedMeta = buildStatelessReservedMeta(protocolVersion);
+    return {
+        request(method, params) {
+            return new Promise((resolve, reject) => {
+                const id = nextId++;
+                const mergedParams = { ...(params ?? {}) };
+                mergedParams._meta = {
+                    ...(typeof mergedParams._meta === "object" && mergedParams._meta !== null
+                        ? mergedParams._meta
+                        : {}),
+                    ...reservedMeta,
+                };
+                const line = JSON.stringify({ jsonrpc: "2.0", id, method, params: mergedParams }) + "\n";
+                pending.set(id, { resolve, reject });
+                child.stdin.write(line, (err) => {
+                    if (err) {
+                        pending.delete(id);
+                        reject(err);
+                    }
+                });
+            });
+        },
+        async close() {
+            try {
+                child.stdin.end();
+            }
+            catch {
+                // ignore
+            }
+            try {
+                rl.close();
+            }
+            catch {
+                // ignore
+            }
+            try {
+                child.kill();
+            }
+            catch {
+                // ignore
+            }
+        },
+    };
+}
 /**
  * Check if an error is "Method not found" (-32601)
  */
 function isMethodNotFound(error) {
+    if (error instanceof JsonRpcRemoteError)
+        return error.code === -32601;
     const errorStr = String(error);
     return errorStr.includes("-32601") || errorStr.includes("Method not found");
 }
 /**
- * Probes an MCP server and returns capability snapshots
+ * Probes an MCP server and returns capability snapshots.
+ *
+ * Tries the stateless `server/discover` path first (SEP-2575 / SEP-2243) so
+ * a server that supports the new spec is probed at its own newest spec
+ * version — the honest "what does this server actually expose right now"
+ * picture. On any failure to discover (HTTP 400, JSON-RPC -32601, missing
+ * `supportedVersions`, parse error, …) we fall back to the legacy SDK-driven
+ * `initialize` handshake, which is what every pre-2026 server supports.
+ *
+ * This means an upgrade like go-sdk v1.6.1 → v1.7.0-pre.1 produces an
+ * "old base probed via initialize / new branch probed via discover" diff
+ * rather than silently negotiating both sides down onto initialize.
  */
 async function probeServer(options) {
     const result = {
@@ -65231,6 +65465,190 @@ async function probeServer(options) {
         resourceTemplates: null,
         customResponses: new Map(),
     };
+    // First, try the stateless discover path. If it succeeds we get the new
+    // spec's honest surface. If it fails for any reason we fall back to the
+    // legacy SDK initialize path on a fresh client.
+    const discoverOutcome = await probeViaDiscover(options, result);
+    if (discoverOutcome === "ok") {
+        return result;
+    }
+    log.info(`  server/discover not supported (${discoverOutcome}); falling back to initialize`);
+    await probeViaInitialize(options, result);
+    return result;
+}
+/**
+ * Attempt to probe via the stateless `server/discover` path. Populates
+ * `result` in place and returns "ok" on success, or a short reason string
+ * when the orchestrator should fall back to the initialize path.
+ */
+async function probeViaDiscover(options, result) {
+    let connection;
+    try {
+        if (options.transport === "stdio") {
+            if (!options.command)
+                return "stdio command missing";
+            log.info(`  Probing via server/discover (stdio): ${options.command} ${(options.args || []).join(" ")}`);
+            const env = {};
+            for (const [key, value] of Object.entries(process.env)) {
+                if (value !== undefined)
+                    env[key] = value;
+            }
+            for (const [key, value] of Object.entries(options.envVars || {}))
+                env[key] = value;
+            connection = openStatelessStdio(options.command, options.args || [], env, options.workingDir, STATELESS_PROBE_PROTOCOL_VERSION);
+        }
+        else {
+            if (!options.url)
+                return "http url missing";
+            log.info(`  Probing via server/discover (http): ${options.url}`);
+            connection = openStatelessHttp(options.url, options.headers ?? {}, STATELESS_PROBE_PROTOCOL_VERSION);
+        }
+    }
+    catch (err) {
+        return `connection open failed: ${err}`;
+    }
+    try {
+        let discoverResult;
+        try {
+            discoverResult = (await connection.request("server/discover"));
+        }
+        catch (err) {
+            // Any failure on discover — HTTP 400 text/plain (v1.6.1 base),
+            // -32601 method-not-found, parse errors — means we should fall back.
+            await connection.close();
+            return `discover request failed: ${err}`;
+        }
+        // Must look like a real DiscoverResult. Servers that don't speak the new
+        // spec sometimes echo back unrelated shapes; treat anything without
+        // `supportedVersions` as "not supported".
+        if (!discoverResult ||
+            typeof discoverResult !== "object" ||
+            !Array.isArray(discoverResult.supportedVersions) ||
+            discoverResult.supportedVersions.length === 0) {
+            await connection.close();
+            return "discover response missing supportedVersions";
+        }
+        // The server's newest spec version is what we negotiated against.
+        const negotiatedProtocolVersion = discoverResult.supportedVersions[0];
+        log.info(`  server/discover succeeded; negotiated ${negotiatedProtocolVersion}`);
+        // Map the discover result into the existing `initialize` slot. The
+        // canonical snapshot filename is "initialize" (see
+        // CANONICAL_SNAPSHOT_NAMES) so a server that moves from initialize to
+        // discover shows as a content diff on one file, not remove+add.
+        const { supportedVersions: _ignoredSupported, ...discoverRest } = discoverResult;
+        result.initialize = {
+            ...discoverRest,
+            protocolVersion: negotiatedProtocolVersion,
+            // serverInfo / capabilities flow through verbatim. Cache hints
+            // (ttlMs, cacheScope) ride along too and are stripped at snapshot
+            // time by normalizeInitializeForDiff.
+        };
+        // Important: do NOT synthesize `instructions` if discover omits it.
+        // The discover-omits-instructions-vs-initialize-emits-instructions
+        // regression in go-sdk v1.7.0-pre.1 is a real public-interface change
+        // we want the diff to surface, not hide.
+        if (typeof discoverResult.instructions === "string" && discoverResult.instructions) {
+            result.instructions = discoverResult.instructions;
+            log.info(`  Got server instructions (${result.instructions.length} chars)`);
+        }
+        const capabilities = (discoverResult.capabilities ?? {});
+        if (capabilities.tools) {
+            try {
+                const toolsResult = (await connection.request("tools/list"));
+                result.tools = toolsResult;
+                log.info(`  Listed ${toolsResult.tools.length} tools`);
+            }
+            catch (err) {
+                if (isMethodNotFound(err))
+                    log.info("  Server does not implement tools/list");
+                else
+                    log.warning(`  Failed to list tools: ${err}`);
+            }
+        }
+        else {
+            log.info("  Server does not support tools");
+        }
+        if (capabilities.prompts) {
+            try {
+                const promptsResult = (await connection.request("prompts/list"));
+                result.prompts = promptsResult;
+                log.info(`  Listed ${promptsResult.prompts.length} prompts`);
+            }
+            catch (err) {
+                if (isMethodNotFound(err))
+                    log.info("  Server does not implement prompts/list");
+                else
+                    log.warning(`  Failed to list prompts: ${err}`);
+            }
+        }
+        else {
+            log.info("  Server does not support prompts");
+        }
+        if (capabilities.resources) {
+            try {
+                const resourcesResult = (await connection.request("resources/list"));
+                result.resources = resourcesResult;
+                log.info(`  Listed ${resourcesResult.resources.length} resources`);
+            }
+            catch (err) {
+                if (isMethodNotFound(err))
+                    log.info("  Server does not implement resources/list");
+                else
+                    log.warning(`  Failed to list resources: ${err}`);
+            }
+            try {
+                const templatesResult = (await connection.request("resources/templates/list"));
+                result.resourceTemplates = templatesResult;
+                log.info(`  Listed ${templatesResult.resourceTemplates.length} resource templates`);
+            }
+            catch (err) {
+                if (isMethodNotFound(err))
+                    log.info("  Server does not implement resources/templates/list");
+                else
+                    log.warning(`  Failed to list resource templates: ${err}`);
+            }
+        }
+        else {
+            log.info("  Server does not support resources");
+        }
+        if (options.customMessages && options.customMessages.length > 0) {
+            for (const customMsg of options.customMessages) {
+                try {
+                    const method = customMsg.message.method;
+                    if (typeof method !== "string") {
+                        log.warning(`  Custom message '${customMsg.name}' has no method, skipping`);
+                        continue;
+                    }
+                    const params = customMsg.message.params;
+                    const response = await connection.request(method, params);
+                    result.customResponses.set(customMsg.name, response);
+                    log.info(`  Custom message '${customMsg.name}' successful`);
+                }
+                catch (err) {
+                    log.warning(`  Custom message '${customMsg.name}' failed: ${err}`);
+                }
+            }
+        }
+        log.info("  Probe complete (discover path)");
+        await connection.close();
+        return "ok";
+    }
+    catch (err) {
+        await connection.close();
+        result.error = String(err);
+        log.error(`  Error during stateless probe: ${err}`);
+        // Don't fall back if discover *itself* succeeded — that means the
+        // server does speak the new spec and a subsequent failure is a real
+        // probe error, not a "not supported, fall back" signal.
+        return "ok";
+    }
+}
+/**
+ * Probe via the legacy SDK `initialize` handshake. This is the fallback for
+ * servers that don't yet implement `server/discover` (every pre-2026 SDK
+ * release). Caps negotiated version at the SDK's `LATEST_PROTOCOL_VERSION`.
+ */
+async function probeViaInitialize(options, result) {
     const client = new Client({
         name: "mcp-server-diff-probe",
         version: "2.0.0",
@@ -65391,7 +65809,7 @@ async function probeServer(options) {
                 }
             }
         }
-        log.info("  Probe complete");
+        log.info("  Probe complete (initialize path)");
         // Close the connection
         await client.close();
     }
@@ -65406,7 +65824,6 @@ async function probeServer(options) {
             // Ignore close errors
         }
     }
-    return result;
 }
 /**
  * Get a sort key for an array element based on common MCP entity patterns.
@@ -65627,14 +66044,21 @@ const CANONICAL_SNAPSHOT_NAMES = {
     resourceTemplates: "resource_templates",
 };
 /**
- * Normalize an initialize snapshot for diffing. Drops `protocolVersion` and
- * `capabilities.experimental` from the comparison body because they're
- * expected to drift across spec revisions / SDK upgrades and aren't part of
- * the server's public surface. The reporter surfaces protocol-version
- * changes separately so they aren't silently swallowed.
+ * Normalize an initialize (or server/discover) snapshot for diffing. Drops:
+ * - `protocolVersion` (varies by negotiated version; reporter surfaces it
+ *   via a separate banner)
+ * - `capabilities.experimental` (churn across SDK versions)
+ * - top-level `ttlMs` / `cacheScope` (CacheableResult hints, SEP-2461 — the
+ *   discover handshake now carries these too, so we strip them here in
+ *   addition to on each list result)
+ *
+ * Importantly, `instructions` and `capabilities` shape are NOT stripped —
+ * those are real public-interface signals (e.g. go-sdk v1.7.0-pre.1's
+ * discover-omits-instructions vs initialize-emits-instructions regression
+ * has to surface, not be hidden).
  */
 function normalizeInitializeForDiff(info) {
-    const { protocolVersion: _ignoredVersion, capabilities, ...rest } = info;
+    const { protocolVersion: _ignoredVersion, capabilities, ttlMs: _ignoredTtl, cacheScope: _ignoredCacheScope, ...rest } = info;
     let cleanedCapabilities = capabilities;
     if (capabilities && typeof capabilities === "object") {
         const { experimental: _ignoredExperimental, ...capRest } = capabilities;
