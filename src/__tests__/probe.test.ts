@@ -4,6 +4,7 @@
 
 import { normalizeProbeResult, probeResultToFiles } from "../probe.js";
 import type { ProbeResult } from "../types.js";
+import githubMcpServerWire from "./fixtures/github-mcp-server-wire.json";
 
 describe("normalizeProbeResult", () => {
   it("sorts object keys alphabetically", () => {
@@ -742,5 +743,119 @@ describe("discover/initialize cross-spec diffing (fixture-driven)", () => {
     const branchInit = JSON.parse(probeResultToFiles(branchProbeResult()).get("initialize")!);
     expect(baseInit.capabilities.completions).toBeUndefined();
     expect(branchInit.capabilities.completions).toEqual({});
+  });
+});
+
+describe("real-wire fixture: github-mcp-server v1.6.1 vs v1.7.0-pre.1", () => {
+  // Drives the case-study assertion directly off real wire bodies captured
+  // from github-mcp-server. See src/__tests__/fixtures/github-mcp-server-wire.json
+  // for the source data + refresh instructions.
+  const wire = githubMcpServerWire as Record<string, unknown>;
+
+  function probeResultFromInitialize(
+    initResult: Record<string, unknown>,
+    toolsResult: Record<string, unknown>
+  ): ProbeResult {
+    return {
+      initialize: {
+        protocolVersion: initResult.protocolVersion as string | undefined,
+        serverInfo: initResult.serverInfo as { name: string; version: string },
+        capabilities: initResult.capabilities as Record<string, unknown>,
+      },
+      instructions: (initResult.instructions as string | undefined) ?? null,
+      tools: toolsResult as unknown as ProbeResult["tools"],
+      prompts: null,
+      resources: null,
+      resourceTemplates: null,
+      customResponses: new Map(),
+    };
+  }
+
+  function probeResultFromDiscover(
+    discoverResult: Record<string, unknown>,
+    toolsResult: Record<string, unknown>
+  ): ProbeResult {
+    // Mirrors probe.ts:probeViaDiscover mapping discover→initialize slot.
+    const { supportedVersions, ...rest } = discoverResult as {
+      supportedVersions: string[];
+      [k: string]: unknown;
+    };
+    return {
+      initialize: {
+        ...rest,
+        protocolVersion: supportedVersions[0],
+      } as unknown as ProbeResult["initialize"],
+      instructions: (discoverResult.instructions as string | undefined) ?? null,
+      tools: toolsResult as unknown as ProbeResult["tools"],
+      prompts: null,
+      resources: null,
+      resourceTemplates: null,
+      customResponses: new Map(),
+    };
+  }
+
+  function baseEnvelope(): ProbeResult {
+    const init = (wire.base_initialize_response as { result: Record<string, unknown> }).result;
+    const tools = (wire.base_tools_list_get_me_response as { result: Record<string, unknown> })
+      .result;
+    return probeResultFromInitialize(init, tools);
+  }
+
+  function branchEnvelope(): ProbeResult {
+    const discover = (wire.new_server_discover_response as { result: Record<string, unknown> })
+      .result;
+    const tools = (wire.new_tools_list_response as { result: Record<string, unknown> }).result;
+    return probeResultFromDiscover(discover, tools);
+  }
+
+  it("strips all pure cross-spec churn from the tools snapshot (get_me)", () => {
+    // idempotentHint:false (omitempty drop), ttlMs+cacheScope (CacheableResult),
+    // and the new `icons` field on the new side that isn't on base — wait,
+    // the icons ARE part of the public surface and SHOULD diff. Let's check
+    // what's left after normalization.
+    const baseTools = probeResultToFiles(baseEnvelope()).get("tools")!;
+    const branchTools = probeResultToFiles(branchEnvelope()).get("tools")!;
+    const baseTool = JSON.parse(baseTools).tools[0];
+    const branchTool = JSON.parse(branchTools).tools[0];
+    // Annotation defaults stripped — both sides now have only readOnlyHint:true + title.
+    expect(baseTool.annotations).toEqual(branchTool.annotations);
+    // Cache hints stripped from the new side's envelope.
+    expect(JSON.parse(branchTools).ttlMs).toBeUndefined();
+    expect(JSON.parse(branchTools).cacheScope).toBeUndefined();
+    // The real `icons` addition is preserved as a public-surface signal.
+    expect(branchTool.icons).toBeDefined();
+    expect(baseTool.icons).toBeUndefined();
+  });
+
+  it("surfaces the discover-omits-instructions regression (case study)", () => {
+    // The headline assertion: same logical server, instructions present
+    // on initialize and absent on discover, and normalization MUST leave
+    // that gap visible.
+    const baseFiles = probeResultToFiles(baseEnvelope());
+    const branchFiles = probeResultToFiles(branchEnvelope());
+    expect(baseFiles.get("instructions")).toContain("GitHub MCP Server");
+    expect(branchFiles.get("instructions")).toBeUndefined();
+  });
+
+  it("strips protocol-version + cache hints from the initialize slot but preserves capability shape", () => {
+    const baseInit = JSON.parse(probeResultToFiles(baseEnvelope()).get("initialize")!);
+    const branchInit = JSON.parse(probeResultToFiles(branchEnvelope()).get("initialize")!);
+
+    // Both: protocolVersion + cache hints gone.
+    expect(baseInit.protocolVersion).toBeUndefined();
+    expect(branchInit.protocolVersion).toBeUndefined();
+    expect(branchInit.ttlMs).toBeUndefined();
+    expect(branchInit.cacheScope).toBeUndefined();
+
+    // Capability *shape* changes are real surface. v1.6.1 advertised
+    // logging + prompts.listChanged + tools.listChanged; the new discover
+    // response advertises bare `completions/prompts/resources/tools`.
+    // These differences must remain visible after normalization.
+    expect(baseInit.capabilities.logging).toEqual({});
+    expect(branchInit.capabilities.logging).toBeUndefined();
+    expect(baseInit.capabilities.tools).toEqual({ listChanged: true });
+    expect(branchInit.capabilities.tools).toEqual({});
+    expect(branchInit.capabilities.resources).toEqual({});
+    expect(baseInit.capabilities.resources).toBeUndefined();
   });
 });
