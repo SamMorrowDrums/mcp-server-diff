@@ -32,7 +32,7 @@ Thank you for your interest in contributing! This document provides guidelines f
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 22+
 - npm
 - Git
 
