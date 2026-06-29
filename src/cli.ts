@@ -12,6 +12,7 @@ import { probeServer } from "./probe.js";
 import { compareProbeResults, extractCounts, type DiffResult } from "./diff.js";
 import { ConsoleLogger, QuietLogger, setLogger, log } from "./logger.js";
 import type { ProbeResult, PrimitiveCounts } from "./types.js";
+import { PACKAGE_VERSION } from "./version.js";
 
 interface ServerConfig {
   name: string;
@@ -549,7 +550,7 @@ async function main(): Promise<void> {
   }
 
   if (values.version) {
-    console.log("mcp-server-diff v2.1.1");
+    console.log(`mcp-server-diff v${PACKAGE_VERSION}`);
     process.exit(0);
   }
 

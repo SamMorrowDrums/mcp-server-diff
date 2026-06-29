@@ -32,14 +32,21 @@ export interface ProbeOptions {
   customMessages?: CustomMessage[];
 }
 
+import { PACKAGE_VERSION } from "./version.js";
+
 /**
- * Stateless probe client identity. Sent as
- * `_meta["io.modelcontextprotocol/clientInfo"]` on every stateless request
- * per SEP-2243 (reserved `_meta` keys on the stateless path).
+ * Single source of truth for client identity, used both on the stateless
+ * `server/discover` path (inside the reserved `_meta.io.modelcontextprotocol/
+ * clientInfo` block per SEP-2243) and on the legacy `initialize` fallback
+ * (the SDK `Client` constructor). Wire captures should show the same
+ * name/version regardless of which probe path was taken.
+ *
+ * `version` is read from package.json at build time so this stays aligned
+ * with the published package version.
  */
 const PROBE_CLIENT_INFO = {
   name: "mcp-server-diff-probe",
-  version: "3.0",
+  version: PACKAGE_VERSION,
 } as const;
 
 /**
@@ -204,7 +211,7 @@ function openStatelessStdio(
   }) as ChildProcessWithoutNullStreams;
   // Surface stderr for debuggability without spamming on healthy probes.
   child.stderr.on("data", (chunk: Buffer) => {
-    log.info(`  [stdio stderr] ${chunk.toString("utf8").trimEnd()}`);
+    log.debug(`  [stdio stderr] ${chunk.toString("utf8").trimEnd()}`);
   });
   const rl: ReadlineInterface = createInterface({ input: child.stdout, crlfDelay: Infinity });
   const pending = new Map<
@@ -512,10 +519,7 @@ async function probeViaDiscover(
  */
 async function probeViaInitialize(options: ProbeOptions, result: ProbeResult): Promise<void> {
   const client = new Client(
-    {
-      name: "mcp-server-diff-probe",
-      version: "2.0.0",
-    },
+    { ...PROBE_CLIENT_INFO },
     {
       capabilities: {},
     }
