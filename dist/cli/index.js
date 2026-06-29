@@ -1542,7 +1542,7 @@ exports.resolveSchema = exports.getCompilingSchema = exports.resolveRef = export
 const codegen_1 = __nccwpck_require__(1436);
 const validation_error_1 = __nccwpck_require__(3021);
 const names_1 = __nccwpck_require__(630);
-const resolve_1 = __nccwpck_require__(1709);
+const resolve_1 = __nccwpck_require__(4090);
 const util_1 = __nccwpck_require__(4464);
 const validate_1 = __nccwpck_require__(7881);
 class SchemaEnv {
@@ -1820,7 +1820,7 @@ exports["default"] = names;
 
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-const resolve_1 = __nccwpck_require__(1709);
+const resolve_1 = __nccwpck_require__(4090);
 class MissingRefError extends Error {
     constructor(resolver, baseId, ref, msg) {
         super(msg || `can't resolve reference ${ref} from id ${baseId}`);
@@ -1833,7 +1833,7 @@ exports["default"] = MissingRefError;
 
 /***/ }),
 
-/***/ 1709:
+/***/ 4090:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 
@@ -2556,7 +2556,7 @@ const keyword_1 = __nccwpck_require__(5202);
 const subschema_1 = __nccwpck_require__(6200);
 const codegen_1 = __nccwpck_require__(1436);
 const names_1 = __nccwpck_require__(630);
-const resolve_1 = __nccwpck_require__(1709);
+const resolve_1 = __nccwpck_require__(4090);
 const util_1 = __nccwpck_require__(4464);
 const errors_1 = __nccwpck_require__(1283);
 // schema compilation - generates validation function, subschemaCode (below) is used for subschemas
@@ -3304,7 +3304,7 @@ const ref_error_1 = __nccwpck_require__(3162);
 const rules_1 = __nccwpck_require__(7353);
 const compile_1 = __nccwpck_require__(2718);
 const codegen_2 = __nccwpck_require__(1436);
-const resolve_1 = __nccwpck_require__(1709);
+const resolve_1 = __nccwpck_require__(4090);
 const dataType_1 = __nccwpck_require__(6685);
 const util_1 = __nccwpck_require__(4464);
 const $dataRefSchema = __nccwpck_require__(3837);
@@ -65196,6 +65196,25 @@ const log = {
     debug: (message) => currentLogger.debug(message),
 };
 
+;// CONCATENATED MODULE: ./package.json
+const package_namespaceObject = {"rE":"3.0.0-rc.0"};
+;// CONCATENATED MODULE: ./src/version.ts
+/**
+ * Single source of truth for the package version, read from package.json
+ * at build time. ncc inlines the JSON into the bundle, so the constant is
+ * available in both `dist/index.js` (the action) and `dist/cli/index.js`
+ * (the CLI) without any filesystem lookups at runtime.
+ *
+ * Consumers:
+ *   - `cli.ts` for `--version` output
+ *   - `probe.ts` for the wire-level `clientInfo.version` advertised on both
+ *     the stateless `server/discover` path and the legacy `initialize`
+ *     fallback (kept consistent so packet captures show the same version
+ *     no matter which probe path was taken)
+ */
+
+const PACKAGE_VERSION = package_namespaceObject.rE;
+
 ;// CONCATENATED MODULE: ./src/probe.ts
 /**
  * MCP Server Probe
@@ -65209,14 +65228,20 @@ const log = {
 
 
 
+
 /**
- * Stateless probe client identity. Sent as
- * `_meta["io.modelcontextprotocol/clientInfo"]` on every stateless request
- * per SEP-2243 (reserved `_meta` keys on the stateless path).
+ * Single source of truth for client identity, used both on the stateless
+ * `server/discover` path (inside the reserved `_meta.io.modelcontextprotocol/
+ * clientInfo` block per SEP-2243) and on the legacy `initialize` fallback
+ * (the SDK `Client` constructor). Wire captures should show the same
+ * name/version regardless of which probe path was taken.
+ *
+ * `version` is read from package.json at build time so this stays aligned
+ * with the published package version.
  */
 const PROBE_CLIENT_INFO = {
     name: "mcp-server-diff-probe",
-    version: "3.0",
+    version: PACKAGE_VERSION,
 };
 /**
  * Protocol version we advertise on the stateless `server/discover` path. The
@@ -65338,7 +65363,7 @@ function openStatelessStdio(command, args, env, workingDir, protocolVersion) {
     });
     // Surface stderr for debuggability without spamming on healthy probes.
     child.stderr.on("data", (chunk) => {
-        log.info(`  [stdio stderr] ${chunk.toString("utf8").trimEnd()}`);
+        log.debug(`  [stdio stderr] ${chunk.toString("utf8").trimEnd()}`);
     });
     const rl = (0,external_node_readline_namespaceObject.createInterface)({ input: child.stdout, crlfDelay: Infinity });
     const pending = new Map();
@@ -65641,10 +65666,7 @@ async function probeViaDiscover(options, result) {
  * release). Caps negotiated version at the SDK's `LATEST_PROTOCOL_VERSION`.
  */
 async function probeViaInitialize(options, result) {
-    const client = new Client({
-        name: "mcp-server-diff-probe",
-        version: "2.0.0",
-    }, {
+    const client = new Client({ ...PROBE_CLIENT_INFO }, {
         capabilities: {},
     });
     let transport;
@@ -66312,6 +66334,7 @@ function diffsToMap(diffs) {
 
 
 
+
 /**
  * Parse command line arguments
  */
@@ -66780,7 +66803,7 @@ async function main() {
         process.exit(0);
     }
     if (values.version) {
-        console.log("mcp-server-diff v2.1.1");
+        console.log(`mcp-server-diff v${PACKAGE_VERSION}`);
         process.exit(0);
     }
     // Set up logger - CLI uses console logger by default
