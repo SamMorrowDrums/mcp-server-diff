@@ -65197,7 +65197,7 @@ const log = {
 };
 
 ;// CONCATENATED MODULE: ./package.json
-const package_namespaceObject = {"rE":"3.0.0-rc.0"};
+const package_namespaceObject = {"rE":"3.0.0"};
 ;// CONCATENATED MODULE: ./src/version.ts
 /**
  * Single source of truth for the package version, read from package.json
