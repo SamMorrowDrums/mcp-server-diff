@@ -66692,8 +66692,21 @@ function compareResults(branchFiles, baseFiles) {
  * - Neither side errored -> normal comparison.
  */
 function compareConfigResults(configName, branchResult, baseResult, compareRef) {
-    const branchError = branchResult?.error;
-    const baseError = baseResult?.error;
+    // Defensive guard: a missing probe result entirely (e.g. a runner refactor
+    // forgetting to populate the map) is treated as a fatal error rather than
+    // crashing later on `.error`/`.tools`/etc. dereferences.
+    if (!branchResult || !baseResult) {
+        const diffs = new Map();
+        const missingSides = [];
+        if (!branchResult)
+            missingSides.push("current branch");
+        if (!baseResult)
+            missingSides.push(`base ref (${compareRef})`);
+        diffs.set("error", `Probe result missing for ${configName} on: ${missingSides.join(", ")}.`);
+        return { diffs, fatalError: true };
+    }
+    const branchError = branchResult.error;
+    const baseError = baseResult.error;
     // Both sides failed to start: a genuine probe failure.
     if (branchError && baseError) {
         const diffs = new Map();
@@ -67210,6 +67223,14 @@ function missingSideLabel(report, result) {
     return `compare ref (${report.compareRef})`;
 }
 /**
+ * Flatten an error string for safe rendering inside an inline-code span:
+ * collapse whitespace/newlines and replace backticks so they can't break out
+ * of the code span (or inject Markdown).
+ */
+function sanitizeErrorForInlineCode(error) {
+    return error.replace(/`/g, "'").replace(/\s+/g, " ").trim();
+}
+/**
  * Generate a diff report from test results
  */
 function generateReport(results, currentBranch, compareRef) {
@@ -67350,7 +67371,7 @@ function generateMarkdownReport(report) {
             }
             if (result.configMissing?.error) {
                 lines.push(`>`);
-                lines.push(`> Startup error: \`${result.configMissing.error}\``);
+                lines.push(`> Startup error: \`${sanitizeErrorForInlineCode(result.configMissing.error)}\``);
             }
             lines.push("");
         }
