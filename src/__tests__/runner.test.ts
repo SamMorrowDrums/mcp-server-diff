@@ -523,4 +523,22 @@ describe("compareConfigResults", () => {
     expect(outcome.configMissing).toBeUndefined();
     expect(outcome.diffs.size).toBe(0);
   });
+
+  it("treats a missing probe result as a fatal error rather than crashing", () => {
+    const branch = makeProbeResult({ tools: toolsResult(["a"]) });
+
+    const outcome = compareConfigResults("scope-x", branch, undefined, compareRef);
+
+    expect(outcome.fatalError).toBe(true);
+    expect(outcome.configMissing).toBeUndefined();
+    expect(outcome.diffs.get("error")).toMatch(/missing/i);
+    expect(outcome.diffs.get("error")).toContain(compareRef);
+  });
+
+  it("treats both probe results missing as a fatal error", () => {
+    const outcome = compareConfigResults("scope-x", undefined, undefined, compareRef);
+
+    expect(outcome.fatalError).toBe(true);
+    expect(outcome.diffs.get("error")).toMatch(/missing/i);
+  });
 });

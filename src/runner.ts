@@ -419,8 +419,20 @@ export function compareConfigResults(
   baseResult: ProbeResult | undefined,
   compareRef: string
 ): ComparisonOutcome {
-  const branchError = branchResult?.error;
-  const baseError = baseResult?.error;
+  // Defensive guard: a missing probe result entirely (e.g. a runner refactor
+  // forgetting to populate the map) is treated as a fatal error rather than
+  // crashing later on `.error`/`.tools`/etc. dereferences.
+  if (!branchResult || !baseResult) {
+    const diffs = new Map<string, string>();
+    const missingSides: string[] = [];
+    if (!branchResult) missingSides.push("current branch");
+    if (!baseResult) missingSides.push(`base ref (${compareRef})`);
+    diffs.set("error", `Probe result missing for ${configName} on: ${missingSides.join(", ")}.`);
+    return { diffs, fatalError: true };
+  }
+
+  const branchError = branchResult.error;
+  const baseError = baseResult.error;
 
   // Both sides failed to start: a genuine probe failure.
   if (branchError && baseError) {
@@ -438,8 +450,8 @@ export function compareConfigResults(
     const side: "branch" | "base" = branchError ? "branch" : "base";
     const error = String(branchError || baseError);
 
-    const branchFiles = branchError ? new Map<string, string>() : probeResultToFiles(branchResult!);
-    const baseFiles = baseError ? new Map<string, string>() : probeResultToFiles(baseResult!);
+    const branchFiles = branchError ? new Map<string, string>() : probeResultToFiles(branchResult);
+    const baseFiles = baseError ? new Map<string, string>() : probeResultToFiles(baseResult);
 
     const diffs = compareResults(branchFiles, baseFiles);
 
@@ -456,8 +468,8 @@ export function compareConfigResults(
   }
 
   // Both sides started: normal comparison.
-  const branchFiles = probeResultToFiles(branchResult!);
-  const baseFiles = probeResultToFiles(baseResult!);
+  const branchFiles = probeResultToFiles(branchResult);
+  const baseFiles = probeResultToFiles(baseResult);
   return { diffs: compareResults(branchFiles, baseFiles), fatalError: false };
 }
 function generateJsonDiff(name: string, base: string, branch: string): string | null {

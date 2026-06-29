@@ -275,6 +275,49 @@ describe("generateMarkdownReport", () => {
     // The marker itself is not rendered as a diff block header.
     expect(markdown).not.toContain("**config-missing**");
   });
+
+  it("sanitizes backticks and newlines in startup error to prevent markdown injection", () => {
+    const results: TestResult[] = [
+      {
+        configName: "scope-injection",
+        branchTime: 0,
+        baseTime: 100,
+        transport: "stdio",
+        hasDifferences: true,
+        diffs: new Map([
+          [
+            "config-missing",
+            'Configuration "scope-injection" did not start on the current branch; it may not exist on this version. Diffed the compare ref (main) against an empty baseline.',
+          ],
+        ]),
+        configMissing: {
+          side: "branch",
+          error: "Bad `code` here\nand a second line\n```js\nalert(1)\n```",
+        },
+      },
+    ];
+
+    const report: ConformanceReport = {
+      generatedAt: "2024-01-01T00:00:00.000Z",
+      currentBranch: "feature",
+      compareRef: "main",
+      results,
+      totalBranchTime: 0,
+      totalBaseTime: 100,
+      passedCount: 0,
+      diffCount: 1,
+    };
+
+    const markdown = generateMarkdownReport(report);
+
+    // No raw backticks from the error in the rendered output.
+    expect(markdown).not.toContain("Bad `code`");
+    expect(markdown).not.toContain("```js");
+    // The error is still present but flattened and inline-code-safe.
+    expect(markdown).toContain(
+      "Startup error: `Bad 'code' here and a second line '''js alert(1) '''`"
+    );
+  });
 });
 
 describe("generatePRSummary", () => {

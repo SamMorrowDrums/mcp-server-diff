@@ -37,6 +37,15 @@ function missingSideLabel(report: ConformanceReport, result: TestResult): string
 }
 
 /**
+ * Flatten an error string for safe rendering inside an inline-code span:
+ * collapse whitespace/newlines and replace backticks so they can't break out
+ * of the code span (or inject Markdown).
+ */
+function sanitizeErrorForInlineCode(error: string): string {
+  return error.replace(/`/g, "'").replace(/\s+/g, " ").trim();
+}
+
+/**
  * Generate a diff report from test results
  */
 export function generateReport(
@@ -192,7 +201,9 @@ export function generateMarkdownReport(report: ConformanceReport): string {
       }
       if (result.configMissing?.error) {
         lines.push(`>`);
-        lines.push(`> Startup error: \`${result.configMissing.error}\``);
+        lines.push(
+          `> Startup error: \`${sanitizeErrorForInlineCode(result.configMissing.error)}\``
+        );
       }
       lines.push("");
     }
