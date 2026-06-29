@@ -662,8 +662,10 @@ Version 3.0 is a maintenance release that refreshes the dependency tree and prep
 - `diff` v8 → v9
 - `@actions/core`, `@actions/exec`, `@actions/io` v1 → v3
 - `eslint` / `@eslint/js` v9 → v10, `typescript` v5 → v6, `jest` / `@types/jest` v29 → v30
-- `@types/node` v22 → v24 (the action and CLI are still tested on Node 20 + 22)
+- `@types/node` v22 → v24 (the action and CLI are tested on Node 22 + 24)
 - `@vercel/ncc` 0.38 → 0.44
+
+**Dropped support: Node.js 20.** Node 20 reached end-of-life on 2026-04-30 and `undici` v8 requires Node 22+. The action and CLI now require Node.js 22 or newer; the action defaults to Node 22 when `setup_node: true` is supplied without an explicit `node_version`.
 
 If you consume `mcp-server-diff` as a GitHub Action or via `npx`, nothing in your workflow should change.
 

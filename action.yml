@@ -12,9 +12,9 @@ inputs:
     required: false
     default: 'false'
   node_version:
-    description: 'Node.js version (default: 20)'
+    description: 'Node.js version (default: 22)'
     required: false
-    default: '20'
+    default: '22'
   setup_python:
     description: 'Set up Python environment'
     required: false

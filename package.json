@@ -12,6 +12,9 @@
     "LICENSE"
   ],
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "npm run build:action && npm run build:cli",
     "build:action": "ncc build src/index.ts -o dist --license licenses.txt --no-source-map-register",
