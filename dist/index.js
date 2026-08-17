@@ -65440,6 +65440,90 @@ const log = {
     debug: (message) => currentLogger.debug(message),
 };
 
+;// CONCATENATED MODULE: ./src/client-capabilities.ts
+/**
+ * Interface-discovery profile used when callers do not provide an override.
+ *
+ * This advertises every standardized core client capability in MCP 2026-07-28:
+ * roots, full sampling, and both elicitation modes. It deliberately does not
+ * opt into extensions such as Tasks, which have their own behavior contracts.
+ */
+const DEFAULT_CLIENT_CAPABILITIES = Object.freeze({
+    roots: Object.freeze({}),
+    sampling: Object.freeze({
+        context: Object.freeze({}),
+        tools: Object.freeze({}),
+    }),
+    elicitation: Object.freeze({
+        form: Object.freeze({}),
+        url: Object.freeze({}),
+    }),
+});
+function isJsonValue(value) {
+    if (value === null || typeof value === "string" || typeof value === "boolean") {
+        return true;
+    }
+    if (typeof value === "number") {
+        return Number.isFinite(value);
+    }
+    if (Array.isArray(value)) {
+        return value.every(isJsonValue);
+    }
+    if (typeof value !== "object" ||
+        (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+        return false;
+    }
+    return Object.values(value).every(isJsonValue);
+}
+function cloneCapabilities(capabilities) {
+    return structuredClone(capabilities);
+}
+/**
+ * Validate a programmatic capability object. Top-level capability values must
+ * be JSON objects, matching the MCP capability schema's open-set contract.
+ */
+function validateClientCapabilities(value, source = "client capabilities") {
+    if (typeof value !== "object" ||
+        value === null ||
+        Array.isArray(value) ||
+        (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+        throw new Error(`${source} must be a JSON object`);
+    }
+    for (const [name, capability] of Object.entries(value)) {
+        if (typeof capability !== "object" ||
+            capability === null ||
+            Array.isArray(capability) ||
+            (Object.getPrototypeOf(capability) !== Object.prototype &&
+                Object.getPrototypeOf(capability) !== null) ||
+            !isJsonValue(capability)) {
+            throw new Error(`${source}.${name} must be a JSON object`);
+        }
+    }
+    return cloneCapabilities(value);
+}
+/**
+ * Parse a JSON capability declaration. Empty input selects the standard core
+ * discovery profile; any provided object replaces that profile completely.
+ */
+function parseClientCapabilities(input, source = "client capabilities") {
+    if (!input || input.trim() === "") {
+        return cloneCapabilities(DEFAULT_CLIENT_CAPABILITIES);
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(input);
+    }
+    catch (error) {
+        throw new Error(`${source} must be valid JSON: ${error}`, { cause: error });
+    }
+    return validateClientCapabilities(parsed, source);
+}
+function resolveClientCapabilities(capabilities) {
+    return capabilities === undefined
+        ? cloneCapabilities(DEFAULT_CLIENT_CAPABILITIES)
+        : validateClientCapabilities(capabilities);
+}
+
 ;// CONCATENATED MODULE: ./package.json
 const package_namespaceObject = {"rE":"3.0.0"};
 ;// CONCATENATED MODULE: ./src/version.ts
@@ -65465,6 +65549,7 @@ const PACKAGE_VERSION = package_namespaceObject.rE;
  *
  * Probes an MCP server and collects capability snapshots.
  */
+
 
 
 
@@ -65499,11 +65584,11 @@ const STATELESS_PROBE_PROTOCOL_VERSION = "2026-07-28";
  * must carry per SEP-2243. Omitting any of these three keys causes the
  * server to reject the request with -32602.
  */
-function buildStatelessReservedMeta(protocolVersion) {
+function buildStatelessReservedMeta(protocolVersion, clientCapabilities) {
     return {
         "io.modelcontextprotocol/protocolVersion": protocolVersion,
         "io.modelcontextprotocol/clientInfo": { ...PROBE_CLIENT_INFO },
-        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientCapabilities": structuredClone(clientCapabilities),
     };
 }
 /**
@@ -65545,9 +65630,9 @@ class JsonRpcRemoteError extends Error {
  * and required reserved `_meta`. Responses come back as a single SSE frame
  * with Content-Type: text/event-stream — we parse the `data:` line as JSON.
  */
-function openStatelessHttp(url, baseHeaders, protocolVersion) {
+function openStatelessHttp(url, baseHeaders, protocolVersion, clientCapabilities) {
     let nextId = 1;
-    const reservedMeta = buildStatelessReservedMeta(protocolVersion);
+    const reservedMeta = buildStatelessReservedMeta(protocolVersion, clientCapabilities);
     return {
         async request(method, params) {
             const id = nextId++;
@@ -65599,7 +65684,7 @@ function openStatelessHttp(url, baseHeaders, protocolVersion) {
  * JSON-RPC responses from stdout, correlating by `id`. There are no
  * SEP-2243 HTTP headers over stdio — only the reserved `_meta` on params.
  */
-function openStatelessStdio(command, args, env, workingDir, protocolVersion) {
+function openStatelessStdio(command, args, env, workingDir, protocolVersion, clientCapabilities) {
     const child = (0,external_node_child_process_namespaceObject.spawn)(command, args, {
         env,
         cwd: workingDir,
@@ -65649,7 +65734,7 @@ function openStatelessStdio(command, args, env, workingDir, protocolVersion) {
         pending.clear();
     });
     let nextId = 1;
-    const reservedMeta = buildStatelessReservedMeta(protocolVersion);
+    const reservedMeta = buildStatelessReservedMeta(protocolVersion, clientCapabilities);
     return {
         request(method, params) {
             return new Promise((resolve, reject) => {
@@ -65717,6 +65802,7 @@ function isMethodNotFound(error) {
  * rather than silently negotiating both sides down onto initialize.
  */
 async function probeServer(options) {
+    const clientCapabilities = resolveClientCapabilities(options.clientCapabilities);
     const result = {
         initialize: null,
         instructions: null,
@@ -65729,12 +65815,12 @@ async function probeServer(options) {
     // First, try the stateless discover path. If it succeeds we get the new
     // spec's honest surface. If it fails for any reason we fall back to the
     // legacy SDK initialize path on a fresh client.
-    const discoverOutcome = await probeViaDiscover(options, result);
+    const discoverOutcome = await probeViaDiscover(options, result, clientCapabilities);
     if (discoverOutcome === "ok") {
         return result;
     }
     log.info(`  server/discover not supported (${discoverOutcome}); falling back to initialize`);
-    await probeViaInitialize(options, result);
+    await probeViaInitialize(options, result, clientCapabilities);
     return result;
 }
 /**
@@ -65742,7 +65828,7 @@ async function probeServer(options) {
  * `result` in place and returns "ok" on success, or a short reason string
  * when the orchestrator should fall back to the initialize path.
  */
-async function probeViaDiscover(options, result) {
+async function probeViaDiscover(options, result, clientCapabilities) {
     let connection;
     try {
         if (options.transport === "stdio") {
@@ -65756,13 +65842,13 @@ async function probeViaDiscover(options, result) {
             }
             for (const [key, value] of Object.entries(options.envVars || {}))
                 env[key] = value;
-            connection = openStatelessStdio(options.command, options.args || [], env, options.workingDir, STATELESS_PROBE_PROTOCOL_VERSION);
+            connection = openStatelessStdio(options.command, options.args || [], env, options.workingDir, STATELESS_PROBE_PROTOCOL_VERSION, clientCapabilities);
         }
         else {
             if (!options.url)
                 return "http url missing";
             log.info(`  Probing via server/discover (http): ${options.url}`);
-            connection = openStatelessHttp(options.url, options.headers ?? {}, STATELESS_PROBE_PROTOCOL_VERSION);
+            connection = openStatelessHttp(options.url, options.headers ?? {}, STATELESS_PROBE_PROTOCOL_VERSION, clientCapabilities);
         }
     }
     catch (err) {
@@ -65909,9 +65995,11 @@ async function probeViaDiscover(options, result) {
  * servers that don't yet implement `server/discover` (every pre-2026 SDK
  * release). Caps negotiated version at the SDK's `LATEST_PROTOCOL_VERSION`.
  */
-async function probeViaInitialize(options, result) {
+async function probeViaInitialize(options, result, clientCapabilities) {
     const client = new Client({ ...PROBE_CLIENT_INFO }, {
-        capabilities: {},
+        // The published SDK type enumerates capabilities from its bundled spec,
+        // while MCP explicitly permits additional top-level capability objects.
+        capabilities: clientCapabilities,
     });
     let transport;
     try {
@@ -66603,11 +66691,12 @@ async function runPostTestCommand(config, workDir) {
  * @param overrideCommand - If provided, use this command instead of config.start_command (for base_start_command)
  * @param overrideUrl - If provided, use this URL instead of config.server_url (for base_server_url)
  */
-async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, globalCustomMessages, useSharedServer = false, overrideCommand, overrideUrl) {
+async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, useSharedServer = false, overrideCommand, overrideUrl) {
     const configEnvVars = parseEnvVars(config.env_vars);
     const envVars = { ...globalEnvVars, ...configEnvVars };
     const headers = { ...globalHeaders, ...config.headers };
     const customMessages = config.custom_messages || globalCustomMessages;
+    const clientCapabilities = config.client_capabilities ?? globalClientCapabilities;
     // Run pre-test command before probing
     await runPreTestCommand(config, workDir);
     if (config.transport === "stdio") {
@@ -66626,6 +66715,7 @@ async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, gl
             workingDir: workDir,
             envVars,
             customMessages,
+            clientCapabilities,
         });
     }
     else {
@@ -66646,6 +66736,7 @@ async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, gl
                 headers,
                 envVars,
                 customMessages,
+                clientCapabilities,
             });
         }
         finally {
@@ -66968,7 +67059,7 @@ async function startSharedHttpServer(command, workDir, waitMs, envVars) {
  * @param overrideCommand - If provided, use this command instead of config.start_command
  * @param overrideUrl - If provided, use this URL instead of config.server_url
  */
-async function probeConfig(config, workDir, envVars, headers, customMessages, useSharedServer, overrideCommand, overrideUrl) {
+async function probeConfig(config, workDir, envVars, headers, customMessages, clientCapabilities, useSharedServer, overrideCommand, overrideUrl) {
     const displayName = overrideCommand
         ? `${config.name} (base: ${overrideCommand.slice(0, 50)}${overrideCommand.length > 50 ? "..." : ""})`
         : config.name;
@@ -66976,7 +67067,7 @@ async function probeConfig(config, workDir, envVars, headers, customMessages, us
     const start = Date.now();
     let result;
     try {
-        result = await probeWithConfig(config, workDir, envVars, headers, customMessages, useSharedServer, overrideCommand, overrideUrl);
+        result = await probeWithConfig(config, workDir, envVars, headers, customMessages, clientCapabilities, useSharedServer, overrideCommand, overrideUrl);
     }
     finally {
         await runPostTestCommand(config, workDir);
@@ -66990,6 +67081,7 @@ async function runAllTests(ctx) {
     const globalEnvVars = parseEnvVars(ctx.inputs.envVars);
     const globalHeaders = ctx.inputs.headers || {};
     const globalCustomMessages = ctx.inputs.customMessages || [];
+    const globalClientCapabilities = ctx.inputs.clientCapabilities;
     // Check if we have a shared HTTP server to manage
     const httpStartCommand = ctx.inputs.httpStartCommand;
     const httpStartupWaitMs = ctx.inputs.httpStartupWaitMs || 2000;
@@ -67011,7 +67103,7 @@ async function runAllTests(ctx) {
         for (const config of ctx.inputs.configurations) {
             const configUsesSharedServer = useSharedServer && config.transport === "streamable-http";
             try {
-                const probeData = await probeConfig(config, ctx.workDir, globalEnvVars, globalHeaders, globalCustomMessages, configUsesSharedServer);
+                const probeData = await probeConfig(config, ctx.workDir, globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, configUsesSharedServer);
                 branchResults.set(config.name, probeData);
             }
             catch (error) {
@@ -67053,7 +67145,7 @@ async function runAllTests(ctx) {
             try {
                 // Use base_start_command/base_server_url for comparison
                 const probeData = await probeConfig(config, ctx.workDir, // Use current workdir since we're not checking out
-                globalEnvVars, globalHeaders, globalCustomMessages, false, // Don't use shared server for base commands
+                globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, false, // Don't use shared server for base commands
                 config.base_start_command, config.base_server_url);
                 baseResults.set(config.name, probeData);
             }
@@ -67100,7 +67192,7 @@ async function runAllTests(ctx) {
                 for (const config of configsNeedingGit) {
                     const configUsesSharedServer = useSharedServer && config.transport === "streamable-http";
                     try {
-                        const probeData = await probeConfig(config, baseWorkDir, globalEnvVars, globalHeaders, globalCustomMessages, configUsesSharedServer);
+                        const probeData = await probeConfig(config, baseWorkDir, globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, configUsesSharedServer);
                         baseResults.set(config.name, probeData);
                     }
                     catch (error) {
@@ -67553,6 +67645,7 @@ function generatePRSummary(report) {
 
 
 
+
 /**
  * Get all inputs from the action (composite action style - INPUT_* env vars)
  */
@@ -67600,6 +67693,7 @@ function getInputs() {
         headers,
         configurations,
         customMessages,
+        clientCapabilities: parseClientCapabilities(getInput("client_capabilities"), "client_capabilities"),
         // Shared HTTP server configuration
         httpStartCommand: getInput("http_start_command"),
         httpStartupWaitMs: parseInt(getInput("http_startup_wait_ms") || "2000", 10),

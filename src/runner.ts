@@ -8,6 +8,7 @@ import * as path from "path";
 import * as fs from "fs";
 import { spawn, ChildProcess } from "child_process";
 import { probeServer, probeResultToFiles } from "./probe.js";
+import type { ClientCapabilities } from "./client-capabilities.js";
 import { createWorktree, removeWorktree, checkout, checkoutPrevious } from "./git.js";
 import type {
   TestConfiguration,
@@ -297,6 +298,7 @@ async function probeWithConfig(
   globalEnvVars: Record<string, string>,
   globalHeaders: Record<string, string>,
   globalCustomMessages: CustomMessage[],
+  globalClientCapabilities: ClientCapabilities,
   useSharedServer: boolean = false,
   overrideCommand?: string,
   overrideUrl?: string
@@ -305,6 +307,7 @@ async function probeWithConfig(
   const envVars = { ...globalEnvVars, ...configEnvVars };
   const headers = { ...globalHeaders, ...config.headers };
   const customMessages = config.custom_messages || globalCustomMessages;
+  const clientCapabilities = config.client_capabilities ?? globalClientCapabilities;
 
   // Run pre-test command before probing
   await runPreTestCommand(config, workDir);
@@ -327,6 +330,7 @@ async function probeWithConfig(
       workingDir: workDir,
       envVars,
       customMessages,
+      clientCapabilities,
     });
   } else {
     // For HTTP transport, optionally start the server if start_command is provided
@@ -347,6 +351,7 @@ async function probeWithConfig(
         headers,
         envVars,
         customMessages,
+        clientCapabilities,
       });
     } finally {
       // Always stop the server if we started it
@@ -753,6 +758,7 @@ async function probeConfig(
   envVars: Record<string, string>,
   headers: Record<string, string>,
   customMessages: CustomMessage[],
+  clientCapabilities: ClientCapabilities,
   useSharedServer: boolean,
   overrideCommand?: string,
   overrideUrl?: string
@@ -770,6 +776,7 @@ async function probeConfig(
       envVars,
       headers,
       customMessages,
+      clientCapabilities,
       useSharedServer,
       overrideCommand,
       overrideUrl
@@ -787,6 +794,7 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
   const globalEnvVars = parseEnvVars(ctx.inputs.envVars);
   const globalHeaders = ctx.inputs.headers || {};
   const globalCustomMessages = ctx.inputs.customMessages || [];
+  const globalClientCapabilities = ctx.inputs.clientCapabilities;
 
   // Check if we have a shared HTTP server to manage
   const httpStartCommand = ctx.inputs.httpStartCommand;
@@ -824,6 +832,7 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
           globalEnvVars,
           globalHeaders,
           globalCustomMessages,
+          globalClientCapabilities,
           configUsesSharedServer
         );
         branchResults.set(config.name, probeData);
@@ -875,6 +884,7 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
           globalEnvVars,
           globalHeaders,
           globalCustomMessages,
+          globalClientCapabilities,
           false, // Don't use shared server for base commands
           config.base_start_command,
           config.base_server_url
@@ -941,6 +951,7 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
               globalEnvVars,
               globalHeaders,
               globalCustomMessages,
+              globalClientCapabilities,
               configUsesSharedServer
             );
             baseResults.set(config.name, probeData);

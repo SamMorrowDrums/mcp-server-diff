@@ -4,6 +4,7 @@
  * Probes an MCP server and collects capability snapshots.
  */
 import type { ProbeResult, CustomMessage } from "./types.js";
+import { type ClientCapabilities } from "./client-capabilities.js";
 export interface ProbeOptions {
     transport: "stdio" | "streamable-http";
     command?: string;
@@ -13,6 +14,7 @@ export interface ProbeOptions {
     workingDir?: string;
     envVars?: Record<string, string>;
     customMessages?: CustomMessage[];
+    clientCapabilities?: ClientCapabilities;
 }
 /**
  * Probes an MCP server and returns capability snapshots.

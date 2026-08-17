@@ -74,7 +74,7 @@ inputs:
   configurations:
     description: |
       JSON array of test configurations for multiple transports/scenarios. 
-      Each object supports: name, transport, start_command, args, server_url, headers, env_vars, custom_messages.
+      Each object supports: name, transport, start_command, args, server_url, headers, env_vars, custom_messages, client_capabilities.
       
       For HTTP transport, use start_command to have the action manage server lifecycle:
         - start_command: Command to start the server (action spawns, probes, then kills it)
@@ -92,6 +92,13 @@ inputs:
     default: ''
   headers:
     description: 'HTTP headers to send with streamable-http requests. JSON object or newline-separated "Header: value" pairs. Applied to all HTTP configurations unless overridden per-config.'
+    required: false
+    default: ''
+  client_capabilities:
+    description: |
+      JSON object advertised as MCP client capabilities. Empty uses the standard interface-discovery profile:
+      roots, full sampling, and form+URL elicitation. A provided object replaces the profile entirely.
+      Per-configuration client_capabilities overrides this input.
     required: false
     default: ''
 
@@ -210,6 +217,7 @@ runs:
         INPUT_CONFIGURATIONS: ${{ inputs.configurations }}
         INPUT_CUSTOM_MESSAGES: ${{ inputs.custom_messages }}
         INPUT_HEADERS: ${{ inputs.headers }}
+        INPUT_CLIENT_CAPABILITIES: ${{ inputs.client_capabilities }}
         INPUT_ENV_VARS: ${{ inputs.env_vars }}
         INPUT_HTTP_START_COMMAND: ${{ inputs.http_start_command }}
         INPUT_HTTP_STARTUP_WAIT_MS: ${{ inputs.http_startup_wait_ms }}

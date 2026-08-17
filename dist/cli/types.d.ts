@@ -1,6 +1,7 @@
 /**
  * Type definitions for MCP Conformance Action
  */
+import type { ClientCapabilities } from "./client-capabilities.js";
 export interface TestConfiguration {
     name: string;
     transport: "stdio" | "streamable-http";
@@ -10,6 +11,8 @@ export interface TestConfiguration {
     headers?: Record<string, string>;
     env_vars?: string;
     custom_messages?: CustomMessage[];
+    /** Client capability declaration for this configuration; replaces the global/default profile */
+    client_capabilities?: ClientCapabilities;
     /** Command to run before starting the MCP server for this config */
     pre_test_command?: string;
     /** Milliseconds to wait after pre_test_command before starting the server */
@@ -51,6 +54,7 @@ export interface ActionInputs {
     headers: Record<string, string>;
     configurations: TestConfiguration[];
     customMessages: CustomMessage[];
+    clientCapabilities: ClientCapabilities;
     compareRef: string;
     failOnError: boolean;
     failOnDiff: boolean;

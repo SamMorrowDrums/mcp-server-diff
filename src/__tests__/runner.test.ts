@@ -166,6 +166,24 @@ describe("parseConfigurations", () => {
       args: "--read-only",
     });
   });
+
+  it("preserves per-configuration client capability overrides", () => {
+    const clientCapabilities = {
+      extensions: {
+        "com.example/future-client": { version: 2 },
+      },
+    };
+    const input = JSON.stringify([
+      {
+        name: "future-client",
+        client_capabilities: clientCapabilities,
+      },
+    ]);
+
+    const result = parseConfigurations(input, defaultTransport, defaultCommand, defaultUrl);
+
+    expect(result[0].client_capabilities).toEqual(clientCapabilities);
+  });
 });
 
 describe("normalizeProbeResult", () => {

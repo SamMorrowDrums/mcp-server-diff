@@ -195,6 +195,7 @@ Test both stdio and HTTP transports in a single run using the `configurations` i
 | `configurations` | JSON array of test configurations for testing multiple transports | `""` |
 | `server_timeout` | Timeout in seconds to wait for server response | `10` |
 | `env_vars` | Environment variables as newline-separated `KEY=VALUE` pairs | `""` |
+| `client_capabilities` | JSON object advertised as the MCP client's capabilities. See [Client Capability Profile](#client-capability-profile). | Standard core profile |
 
 Either `start_command` (for stdio) or `server_url` (for HTTP) must be provided, unless using `configurations`.
 
@@ -223,8 +224,76 @@ When using `configurations`, each object supports:
 | `headers` | HTTP headers for this configuration | No |
 | `env_vars` | Additional environment variables | No |
 | `custom_messages` | Config-specific custom messages | No |
+| `client_capabilities` | Config-specific capability object; replaces the global/default profile | No |
 | `base_start_command` | Command for baseline comparison (skips git checkout for this config) | No |
 | `base_server_url` | URL for baseline HTTP server (used with `base_start_command`) | No |
+
+### Client Capability Profile
+
+Servers can conditionally expose public-interface elements based on what an MCP client
+advertises. The probe sends the same client capability object through both protocol paths:
+
+- On MCP 2026-07-28+, every stateless request includes it at
+  `_meta.io.modelcontextprotocol/clientCapabilities`, including `server/discover`,
+  list requests, and custom requests.
+- On earlier protocols, the SDK client includes it in `initialize.params.capabilities`.
+
+When `client_capabilities` is empty or omitted, the probe advertises every standardized
+core client capability from MCP 2026-07-28:
+
+```json
+{
+  "roots": {},
+  "sampling": {
+    "context": {},
+    "tools": {}
+  },
+  "elicitation": {
+    "form": {},
+    "url": {}
+  }
+}
+```
+
+This default makes capability-gated interface surfaces visible, including tools that
+require form elicitation. It intentionally does not opt into extensions such as Tasks.
+
+Provide a JSON object to replace the profile completely. Use `{}` to advertise no optional
+capabilities. Capability names are open-ended and each top-level value must be a JSON object,
+so future and vendor-defined capabilities round-trip without a release of this action:
+
+```yaml
+- uses: SamMorrowDrums/mcp-server-diff@v3
+  with:
+    start_command: ./server
+    client_capabilities: |
+      {
+        "elicitation": {
+          "form": {}
+        },
+        "extensions": {
+          "io.modelcontextprotocol/tasks": {},
+          "com.example/future-client": {
+            "version": 2
+          }
+        },
+        "com.example/top-level": {
+          "enabled": true
+        }
+      }
+```
+
+`client_capabilities` inside a `configurations` entry overrides the global input for that
+configuration, which is useful when intentionally comparing capability-dependent surfaces.
+
+> [!IMPORTANT]
+> Capabilities are an **interface-discovery declaration**, not an interactive client
+> implementation. The probe sends discovery and list requests; it does not invoke tools,
+> provide model sampling, collect elicited user input, follow elicitation URLs, or execute
+> extension workflows. Advertising additional capabilities is safe for inspecting conditional
+> interface visibility, but a server that actively exercises a client callback while handling
+> discovery/list requests can cause that probe to fail. Only declare extensions whose
+> conditional surface you intend to validate.
 
 ### Comparing Against External Servers
 
@@ -588,6 +657,10 @@ npx mcp-server-diff -b "python -m mcp_server" -t "node dist/stdio.js"
 # Compare local server vs remote HTTP endpoint
 npx mcp-server-diff -b "go run ./cmd/server stdio" -t "https://mcp.example.com/api"
 
+# Replace the default capability profile for both servers
+npx mcp-server-diff -b "./server-v1" -t "./server-v2" \
+  --client-capabilities '{"elicitation":{"form":{}}}'
+
 # Output formats
 npx mcp-server-diff -b "..." -t "..." -o diff      # Raw diff hunks only
 npx mcp-server-diff -b "..." -t "..." -o json      # Full JSON with details
@@ -629,6 +702,16 @@ npx mcp-server-diff -c servers.json -o diff
 
 ```json
 {
+  "client_capabilities": {
+    "elicitation": {
+      "form": {}
+    },
+    "extensions": {
+      "com.example/future-client": {
+        "version": 2
+      }
+    }
+  },
   "base": {
     "name": "python-server",
     "transport": "stdio",
@@ -662,11 +745,17 @@ npx mcp-server-diff -c servers.json -o diff
 | `-B, --base-header <header>` | HTTP header for base server (repeatable) |
 | `-T, --target-header <header>` | HTTP header for target (same as `-H`) |
 | `-c, --config <file>` | Config file with base and targets |
+| `--client-capabilities <json>` | Capability object for both direct-mode servers; replaces the default profile |
 | `-o, --output <format>` | Output: `diff`, `json`, `markdown`, `summary` (default) |
 | `-v, --verbose` | Verbose output |
 | `-q, --quiet` | Quiet mode (only output result) |
 | `-h, --help` | Show help |
 | `--version` | Show version |
+
+Config files support a top-level `client_capabilities` object applied to the base and all
+targets. A server entry can set its own `client_capabilities` to override that object. The
+same validation, default profile, and safety contract described in
+[Client Capability Profile](#client-capability-profile) apply to the CLI.
 
 **Header value patterns:**
 - `Bearer your-token` — literal value
