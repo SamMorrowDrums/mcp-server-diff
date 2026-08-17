@@ -11,6 +11,7 @@ import { getCurrentBranch, determineCompareRef, getRefDisplayName } from "./git.
 import { parseConfigurations, parseCustomMessages, parseHeaders, runAllTests } from "./runner.js";
 import { generateReport, generateMarkdownReport, saveReport } from "./reporter.js";
 import type { ActionInputs } from "./types.js";
+import { parseClientCapabilities } from "./client-capabilities.js";
 
 /**
  * Get all inputs from the action (composite action style - INPUT_* env vars)
@@ -72,6 +73,10 @@ function getInputs(): ActionInputs {
     headers,
     configurations,
     customMessages,
+    clientCapabilities: parseClientCapabilities(
+      getInput("client_capabilities"),
+      "client_capabilities"
+    ),
 
     // Shared HTTP server configuration
     httpStartCommand: getInput("http_start_command"),

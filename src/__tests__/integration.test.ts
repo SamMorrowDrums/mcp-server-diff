@@ -9,6 +9,7 @@ import { spawn, ChildProcess } from "child_process";
 import * as path from "path";
 import { fileURLToPath } from "url";
 import { jest } from "@jest/globals";
+import { DEFAULT_CLIENT_CAPABILITIES, type ClientCapabilities } from "../client-capabilities.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = path.join(__dirname, "fixtures");
@@ -304,3 +305,59 @@ describe("Integration: environment variables", () => {
     expect(result.initialize?.serverInfo?.name).toBe("test-stdio-server");
   });
 });
+
+describe.each(["discover", "legacy"] as const)(
+  "Integration: client capabilities via %s path",
+  (mode) => {
+    async function probeCapabilities(clientCapabilities?: ClientCapabilities) {
+      return probeServer({
+        transport: "stdio",
+        command: "npx",
+        args: ["tsx", path.join(FIXTURES_DIR, "capability-server.ts"), mode],
+        workingDir: FIXTURES_DIR,
+        clientCapabilities,
+      });
+    }
+
+    function capabilitiesSeenByServer(result: Awaited<ReturnType<typeof probeCapabilities>>) {
+      const discoverOrInitializeCapabilities = JSON.parse(
+        result.initialize?.serverInfo?.version ?? "{}"
+      );
+      const listCapabilities = JSON.parse(result.tools?.tools[0].description ?? "{}");
+      return { discoverOrInitializeCapabilities, listCapabilities };
+    }
+
+    it("advertises the core default on the handshake and list request", async () => {
+      const result = await probeCapabilities();
+
+      expect(result.error).toBeUndefined();
+      expect(capabilitiesSeenByServer(result)).toEqual({
+        discoverOrInitializeCapabilities: DEFAULT_CLIENT_CAPABILITIES,
+        listCapabilities: DEFAULT_CLIENT_CAPABILITIES,
+      });
+    });
+
+    it("round-trips configured unknown extension capabilities", async () => {
+      const clientCapabilities: ClientCapabilities = {
+        elicitation: { form: { applyDefaults: true } },
+        extensions: {
+          "com.example/future-client": {
+            version: 2,
+            options: { mode: "strict" },
+          },
+        },
+        "com.example/top-level": {
+          enabled: true,
+        },
+      };
+
+      const result = await probeCapabilities(clientCapabilities);
+
+      expect(result.error).toBeUndefined();
+      expect(capabilitiesSeenByServer(result)).toEqual({
+        discoverOrInitializeCapabilities: clientCapabilities,
+        listCapabilities: clientCapabilities,
+      });
+    });
+  }
+);

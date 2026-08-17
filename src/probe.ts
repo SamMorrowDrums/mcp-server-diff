@@ -7,6 +7,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { ClientCapabilities as SdkClientCapabilities } from "@modelcontextprotocol/sdk/types.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import { z } from "zod";
@@ -20,6 +21,7 @@ import type {
   CustomMessage,
 } from "./types.js";
 import { log } from "./logger.js";
+import { resolveClientCapabilities, type ClientCapabilities } from "./client-capabilities.js";
 
 export interface ProbeOptions {
   transport: "stdio" | "streamable-http";
@@ -30,6 +32,7 @@ export interface ProbeOptions {
   workingDir?: string;
   envVars?: Record<string, string>;
   customMessages?: CustomMessage[];
+  clientCapabilities?: ClientCapabilities;
 }
 
 import { PACKAGE_VERSION } from "./version.js";
@@ -62,11 +65,14 @@ const STATELESS_PROBE_PROTOCOL_VERSION = "2026-07-28";
  * must carry per SEP-2243. Omitting any of these three keys causes the
  * server to reject the request with -32602.
  */
-function buildStatelessReservedMeta(protocolVersion: string): Record<string, unknown> {
+function buildStatelessReservedMeta(
+  protocolVersion: string,
+  clientCapabilities: ClientCapabilities
+): Record<string, unknown> {
   return {
     "io.modelcontextprotocol/protocolVersion": protocolVersion,
     "io.modelcontextprotocol/clientInfo": { ...PROBE_CLIENT_INFO },
-    "io.modelcontextprotocol/clientCapabilities": {},
+    "io.modelcontextprotocol/clientCapabilities": structuredClone(clientCapabilities),
   };
 }
 
@@ -138,10 +144,11 @@ class JsonRpcRemoteError extends Error {
 function openStatelessHttp(
   url: string,
   baseHeaders: Record<string, string>,
-  protocolVersion: string
+  protocolVersion: string,
+  clientCapabilities: ClientCapabilities
 ): StatelessConnection {
   let nextId = 1;
-  const reservedMeta = buildStatelessReservedMeta(protocolVersion);
+  const reservedMeta = buildStatelessReservedMeta(protocolVersion, clientCapabilities);
   return {
     async request(method, params) {
       const id = nextId++;
@@ -202,7 +209,8 @@ function openStatelessStdio(
   args: string[],
   env: Record<string, string>,
   workingDir: string | undefined,
-  protocolVersion: string
+  protocolVersion: string,
+  clientCapabilities: ClientCapabilities
 ): StatelessConnection {
   const child = spawn(command, args, {
     env,
@@ -250,7 +258,7 @@ function openStatelessStdio(
   });
 
   let nextId = 1;
-  const reservedMeta = buildStatelessReservedMeta(protocolVersion);
+  const reservedMeta = buildStatelessReservedMeta(protocolVersion, clientCapabilities);
   return {
     request(method, params) {
       return new Promise((resolve, reject) => {
@@ -316,6 +324,7 @@ function isMethodNotFound(error: unknown): boolean {
  * rather than silently negotiating both sides down onto initialize.
  */
 export async function probeServer(options: ProbeOptions): Promise<ProbeResult> {
+  const clientCapabilities = resolveClientCapabilities(options.clientCapabilities);
   const result: ProbeResult = {
     initialize: null,
     instructions: null,
@@ -329,12 +338,12 @@ export async function probeServer(options: ProbeOptions): Promise<ProbeResult> {
   // First, try the stateless discover path. If it succeeds we get the new
   // spec's honest surface. If it fails for any reason we fall back to the
   // legacy SDK initialize path on a fresh client.
-  const discoverOutcome = await probeViaDiscover(options, result);
+  const discoverOutcome = await probeViaDiscover(options, result, clientCapabilities);
   if (discoverOutcome === "ok") {
     return result;
   }
   log.info(`  server/discover not supported (${discoverOutcome}); falling back to initialize`);
-  await probeViaInitialize(options, result);
+  await probeViaInitialize(options, result, clientCapabilities);
   return result;
 }
 
@@ -345,7 +354,8 @@ export async function probeServer(options: ProbeOptions): Promise<ProbeResult> {
  */
 async function probeViaDiscover(
   options: ProbeOptions,
-  result: ProbeResult
+  result: ProbeResult,
+  clientCapabilities: ClientCapabilities
 ): Promise<"ok" | string> {
   let connection: StatelessConnection;
   try {
@@ -364,7 +374,8 @@ async function probeViaDiscover(
         options.args || [],
         env,
         options.workingDir,
-        STATELESS_PROBE_PROTOCOL_VERSION
+        STATELESS_PROBE_PROTOCOL_VERSION,
+        clientCapabilities
       );
     } else {
       if (!options.url) return "http url missing";
@@ -372,7 +383,8 @@ async function probeViaDiscover(
       connection = openStatelessHttp(
         options.url,
         options.headers ?? {},
-        STATELESS_PROBE_PROTOCOL_VERSION
+        STATELESS_PROBE_PROTOCOL_VERSION,
+        clientCapabilities
       );
     }
   } catch (err) {
@@ -517,11 +529,17 @@ async function probeViaDiscover(
  * servers that don't yet implement `server/discover` (every pre-2026 SDK
  * release). Caps negotiated version at the SDK's `LATEST_PROTOCOL_VERSION`.
  */
-async function probeViaInitialize(options: ProbeOptions, result: ProbeResult): Promise<void> {
+async function probeViaInitialize(
+  options: ProbeOptions,
+  result: ProbeResult,
+  clientCapabilities: ClientCapabilities
+): Promise<void> {
   const client = new Client(
     { ...PROBE_CLIENT_INFO },
     {
-      capabilities: {},
+      // The published SDK type enumerates capabilities from its bundled spec,
+      // while MCP explicitly permits additional top-level capability objects.
+      capabilities: clientCapabilities as SdkClientCapabilities,
     }
   );
 

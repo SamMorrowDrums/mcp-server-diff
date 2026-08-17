@@ -13,6 +13,11 @@ import { compareProbeResults, extractCounts, type DiffResult } from "./diff.js";
 import { ConsoleLogger, QuietLogger, setLogger, log } from "./logger.js";
 import type { ProbeResult, PrimitiveCounts } from "./types.js";
 import { PACKAGE_VERSION } from "./version.js";
+import {
+  parseClientCapabilities,
+  resolveClientCapabilities,
+  type ClientCapabilities,
+} from "./client-capabilities.js";
 
 interface ServerConfig {
   name: string;
@@ -21,11 +26,13 @@ interface ServerConfig {
   server_url?: string;
   headers?: Record<string, string>;
   env_vars?: Record<string, string>;
+  client_capabilities?: ClientCapabilities;
 }
 
 interface DiffConfig {
   base: ServerConfig;
   targets: ServerConfig[];
+  client_capabilities?: ClientCapabilities;
 }
 
 interface ComparisonResult {
@@ -50,6 +57,7 @@ function parseCliArgs() {
       "base-header": { type: "string", short: "B", multiple: true },
       "target-header": { type: "string", short: "T", multiple: true },
       config: { type: "string", short: "c" },
+      "client-capabilities": { type: "string" },
       output: { type: "string", short: "o", default: "summary" },
       verbose: { type: "boolean", short: "v", default: false },
       quiet: { type: "boolean", short: "q", default: false },
@@ -83,6 +91,8 @@ OPTIONS:
   -T, --target-header <hdr>  HTTP header for target server (repeatable, same as -H)
                              Values support: env:VAR_NAME, secret:name, "Bearer secret:token"
   -c, --config <file>        Config file with base and targets
+      --client-capabilities <json>
+                             JSON object advertised by both direct-mode clients
   -o, --output <format>      Output format: diff, json, markdown, summary (default: summary)
   -v, --verbose              Verbose output
   -q, --quiet                Quiet mode (only output diffs)
@@ -95,6 +105,9 @@ CONFIG FILE FORMAT:
       "name": "python-server",
       "transport": "stdio",
       "start_command": "python -m mcp_server"
+    },
+    "client_capabilities": {
+      "elicitation": { "form": {}, "url": {} }
     },
     "targets": [
       {
@@ -318,7 +331,13 @@ async function promptSecrets(
 /**
  * Probe a server and return results
  */
-async function probeServerConfig(config: ServerConfig): Promise<ProbeResult> {
+async function probeServerConfig(
+  config: ServerConfig,
+  defaultClientCapabilities: ClientCapabilities
+): Promise<ProbeResult> {
+  const clientCapabilities = resolveClientCapabilities(
+    config.client_capabilities ?? defaultClientCapabilities
+  );
   if (config.transport === "stdio") {
     if (!config.start_command) {
       throw new Error(`No start_command for stdio server: ${config.name}`);
@@ -333,6 +352,7 @@ async function probeServerConfig(config: ServerConfig): Promise<ProbeResult> {
       command,
       args,
       envVars: config.env_vars,
+      clientCapabilities,
     });
   } else {
     if (!config.server_url) {
@@ -344,6 +364,7 @@ async function probeServerConfig(config: ServerConfig): Promise<ProbeResult> {
       url: config.server_url,
       headers: config.headers,
       envVars: config.env_vars,
+      clientCapabilities,
     });
   }
 }
@@ -353,11 +374,12 @@ async function probeServerConfig(config: ServerConfig): Promise<ProbeResult> {
  */
 async function runComparisons(config: DiffConfig): Promise<ComparisonResult[]> {
   const results: ComparisonResult[] = [];
+  const clientCapabilities = resolveClientCapabilities(config.client_capabilities);
 
   log.info(`\n📍 Probing base: ${config.base.name}`);
   let baseResult: ProbeResult;
   try {
-    baseResult = await probeServerConfig(config.base);
+    baseResult = await probeServerConfig(config.base, clientCapabilities);
     if (baseResult.error) {
       throw new Error(baseResult.error);
     }
@@ -389,7 +411,7 @@ async function runComparisons(config: DiffConfig): Promise<ComparisonResult[]> {
     };
 
     try {
-      const targetResult = await probeServerConfig(target);
+      const targetResult = await probeServerConfig(target, clientCapabilities);
 
       if (targetResult.error) {
         result.hasDifferences = true;
@@ -587,6 +609,10 @@ async function main(): Promise<void> {
     config = {
       base: commandToConfig(values.base, "base", baseHeaders),
       targets: [commandToConfig(values.target, "target", targetHeaders)],
+      client_capabilities: parseClientCapabilities(
+        values["client-capabilities"],
+        "--client-capabilities"
+      ),
     };
   } else {
     console.error("Error: Must provide --config or both --base and --target");
