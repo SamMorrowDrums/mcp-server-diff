@@ -65215,7 +65215,7 @@ const DEFAULT_CLIENT_CAPABILITIES = Object.freeze({
         url: Object.freeze({}),
     }),
 });
-function isJsonValue(value) {
+function isJsonValue(value, stack = new WeakSet()) {
     if (value === null || typeof value === "string" || typeof value === "boolean") {
         return true;
     }
@@ -65223,13 +65223,30 @@ function isJsonValue(value) {
         return Number.isFinite(value);
     }
     if (Array.isArray(value)) {
-        return value.every(isJsonValue);
+        if (stack.has(value))
+            return false;
+        stack.add(value);
+        try {
+            return value.every((entry) => isJsonValue(entry, stack));
+        }
+        finally {
+            stack.delete(value);
+        }
     }
     if (typeof value !== "object" ||
         (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
         return false;
     }
-    return Object.values(value).every(isJsonValue);
+    const obj = value;
+    if (stack.has(obj))
+        return false;
+    stack.add(obj);
+    try {
+        return Object.values(obj).every((entry) => isJsonValue(entry, stack));
+    }
+    finally {
+        stack.delete(obj);
+    }
 }
 function cloneCapabilities(capabilities) {
     return structuredClone(capabilities);
