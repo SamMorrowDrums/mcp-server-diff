@@ -29,7 +29,7 @@ export const DEFAULT_CLIENT_CAPABILITIES: Readonly<ClientCapabilities> = Object.
   }),
 });
 
-function isJsonValue(value: unknown): value is JsonValue {
+function isJsonValue(value: unknown, stack: WeakSet<object> = new WeakSet()): value is JsonValue {
   if (value === null || typeof value === "string" || typeof value === "boolean") {
     return true;
   }
@@ -37,7 +37,13 @@ function isJsonValue(value: unknown): value is JsonValue {
     return Number.isFinite(value);
   }
   if (Array.isArray(value)) {
-    return value.every(isJsonValue);
+    if (stack.has(value)) return false;
+    stack.add(value);
+    try {
+      return value.every((entry) => isJsonValue(entry, stack));
+    } finally {
+      stack.delete(value);
+    }
   }
   if (
     typeof value !== "object" ||
@@ -45,7 +51,14 @@ function isJsonValue(value: unknown): value is JsonValue {
   ) {
     return false;
   }
-  return Object.values(value as Record<string, unknown>).every(isJsonValue);
+  const obj = value as Record<string, unknown>;
+  if (stack.has(obj)) return false;
+  stack.add(obj);
+  try {
+    return Object.values(obj).every((entry) => isJsonValue(entry, stack));
+  } finally {
+    stack.delete(obj);
+  }
 }
 
 function cloneCapabilities(capabilities: ClientCapabilities): ClientCapabilities {
