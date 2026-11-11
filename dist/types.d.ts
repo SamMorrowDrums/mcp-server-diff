@@ -59,6 +59,7 @@ export interface ActionInputs {
     failOnError: boolean;
     failOnDiff: boolean;
     envVars: string;
+    /** Maximum wait for each server response, in seconds */
     serverTimeout: number;
     httpStartCommand: string;
     httpStartupWaitMs: number;

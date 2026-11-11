@@ -33,6 +33,7 @@ export interface ProbeOptions {
   envVars?: Record<string, string>;
   customMessages?: CustomMessage[];
   clientCapabilities?: ClientCapabilities;
+  timeoutMs?: number;
 }
 
 import { PACKAGE_VERSION } from "./version.js";
@@ -145,7 +146,8 @@ function openStatelessHttp(
   url: string,
   baseHeaders: Record<string, string>,
   protocolVersion: string,
-  clientCapabilities: ClientCapabilities
+  clientCapabilities: ClientCapabilities,
+  timeoutMs?: number
 ): StatelessConnection {
   let nextId = 1;
   const reservedMeta = buildStatelessReservedMeta(protocolVersion, clientCapabilities);
@@ -170,6 +172,7 @@ function openStatelessHttp(
           "Mcp-Method": method,
         },
         body,
+        ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
       });
       const rawBody = await resp.text();
       if (!resp.ok) {
@@ -210,7 +213,8 @@ function openStatelessStdio(
   env: Record<string, string>,
   workingDir: string | undefined,
   protocolVersion: string,
-  clientCapabilities: ClientCapabilities
+  clientCapabilities: ClientCapabilities,
+  timeoutMs?: number
 ): StatelessConnection {
   const child = spawn(command, args, {
     env,
@@ -224,7 +228,11 @@ function openStatelessStdio(
   const rl: ReadlineInterface = createInterface({ input: child.stdout, crlfDelay: Infinity });
   const pending = new Map<
     number,
-    { resolve: (value: unknown) => void; reject: (reason: Error) => void }
+    {
+      resolve: (value: unknown) => void;
+      reject: (reason: Error) => void;
+      timeout?: ReturnType<typeof setTimeout>;
+    }
   >();
   rl.on("line", (line: string) => {
     const trimmed = line.trim();
@@ -241,6 +249,7 @@ function openStatelessStdio(
     const handler = pending.get(msg.id);
     if (!handler) return;
     pending.delete(msg.id);
+    if (handler.timeout) clearTimeout(handler.timeout);
     if (msg.error) {
       handler.reject(new JsonRpcRemoteError(msg.error.code, msg.error.message));
     } else {
@@ -248,12 +257,18 @@ function openStatelessStdio(
     }
   });
   child.on("error", (err: Error) => {
-    for (const { reject } of pending.values()) reject(err);
+    for (const { reject, timeout } of pending.values()) {
+      if (timeout) clearTimeout(timeout);
+      reject(err);
+    }
     pending.clear();
   });
   child.on("exit", (code: number | null) => {
     const err = new Error(`stdio child exited prematurely with code ${code}`);
-    for (const { reject } of pending.values()) reject(err);
+    for (const { reject, timeout } of pending.values()) {
+      if (timeout) clearTimeout(timeout);
+      reject(err);
+    }
     pending.clear();
   });
 
@@ -271,9 +286,19 @@ function openStatelessStdio(
           ...reservedMeta,
         };
         const line = JSON.stringify({ jsonrpc: "2.0", id, method, params: mergedParams }) + "\n";
-        pending.set(id, { resolve, reject });
+        const timeout =
+          timeoutMs === undefined
+            ? undefined
+            : setTimeout(() => {
+                if (pending.delete(id)) {
+                  reject(new Error(`Request '${method}' timed out after ${timeoutMs}ms`));
+                }
+              }, timeoutMs);
+        pending.set(id, { resolve, reject, timeout });
         child.stdin.write(line, (err: Error | null | undefined) => {
           if (err) {
+            const handler = pending.get(id);
+            if (handler?.timeout) clearTimeout(handler.timeout);
             pending.delete(id);
             reject(err);
           }
@@ -375,7 +400,8 @@ async function probeViaDiscover(
         env,
         options.workingDir,
         STATELESS_PROBE_PROTOCOL_VERSION,
-        clientCapabilities
+        clientCapabilities,
+        options.timeoutMs
       );
     } else {
       if (!options.url) return "http url missing";
@@ -384,7 +410,8 @@ async function probeViaDiscover(
         options.url,
         options.headers ?? {},
         STATELESS_PROBE_PROTOCOL_VERSION,
-        clientCapabilities
+        clientCapabilities,
+        options.timeoutMs
       );
     }
   } catch (err) {
@@ -542,6 +569,8 @@ async function probeViaInitialize(
       capabilities: clientCapabilities as SdkClientCapabilities,
     }
   );
+  const requestOptions =
+    options.timeoutMs === undefined ? undefined : { timeout: options.timeoutMs };
 
   let transport: StdioClientTransport | StreamableHTTPClientTransport;
 
@@ -599,7 +628,7 @@ async function probeViaInitialize(
     };
 
     // Connect to the server
-    await client.connect(transport);
+    await client.connect(transport, requestOptions);
     log.info("  Connected successfully");
 
     // Get server info and capabilities
@@ -626,7 +655,7 @@ async function probeViaInitialize(
     // Probe tools if supported
     if (serverCapabilities?.tools) {
       try {
-        const toolsResult = await client.listTools();
+        const toolsResult = await client.listTools(undefined, requestOptions);
         result.tools = toolsResult as ToolsResult;
         log.info(`  Listed ${result.tools.tools.length} tools`);
       } catch (error) {
@@ -643,7 +672,7 @@ async function probeViaInitialize(
     // Probe prompts if supported
     if (serverCapabilities?.prompts) {
       try {
-        const promptsResult = await client.listPrompts();
+        const promptsResult = await client.listPrompts(undefined, requestOptions);
         result.prompts = promptsResult as PromptsResult;
         log.info(`  Listed ${result.prompts.prompts.length} prompts`);
       } catch (error) {
@@ -660,7 +689,7 @@ async function probeViaInitialize(
     // Probe resources if supported
     if (serverCapabilities?.resources) {
       try {
-        const resourcesResult = await client.listResources();
+        const resourcesResult = await client.listResources(undefined, requestOptions);
         result.resources = resourcesResult as ResourcesResult;
         log.info(`  Listed ${result.resources.resources.length} resources`);
       } catch (error) {
@@ -673,7 +702,7 @@ async function probeViaInitialize(
 
       // Also try resource templates - some servers support resources but not templates
       try {
-        const templatesResult = await client.listResourceTemplates();
+        const templatesResult = await client.listResourceTemplates(undefined, requestOptions);
         result.resourceTemplates = templatesResult as ResourceTemplatesResult;
         log.info(
           `  Listed ${result.resourceTemplates.resourceTemplates.length} resource templates`
@@ -699,7 +728,8 @@ async function probeViaInitialize(
           // Cast message to the expected request type - custom messages should have a method field
           const response = await client.request(
             customMsg.message as { method: string; params?: Record<string, unknown> },
-            anyResponseSchema
+            anyResponseSchema,
+            requestOptions
           );
           result.customResponses.set(customMsg.name, response);
           log.info(`  Custom message '${customMsg.name}' successful`);

@@ -18,10 +18,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -47,5 +47,5 @@ jobs:
       - name: Verify dist is up to date
         if: matrix.node-version == 22
         run: |
-          # Check if dist files are up to date
-          git diff --exit-code dist/ || (echo "::error::dist/ is out of date. Run 'npm run build' and commit the changes." && exit 1)
+          # Check if bundled action files are up to date
+          git diff --exit-code dist/ comment/dist/ || (echo "::error::bundled action files are out of date. Run 'npm run build' and commit the changes." && exit 1)

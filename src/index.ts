@@ -49,10 +49,20 @@ function getInputs(): ActionInputs {
   const headersInput = getInput("headers");
   const headers = parseHeaders(headersInput);
 
+  const serverTimeoutInput = getInput("server_timeout").trim();
+  const serverTimeout = serverTimeoutInput ? Number(serverTimeoutInput) : 10;
+  if (
+    !Number.isSafeInteger(serverTimeout) ||
+    serverTimeout <= 0 ||
+    !Number.isSafeInteger(serverTimeout * 1000)
+  ) {
+    throw new Error("server_timeout must be a positive whole number of seconds");
+  }
+
   return {
     // Language setup
     setupNode: getBooleanInput("setup_node"),
-    nodeVersion: getInput("node_version") || "20",
+    nodeVersion: getInput("node_version") || "22",
     setupPython: getBooleanInput("setup_python"),
     pythonVersion: getInput("python_version") || "3.11",
     setupGo: getBooleanInput("setup_go"),
@@ -87,7 +97,7 @@ function getInputs(): ActionInputs {
     failOnError: getBooleanInput("fail_on_error") !== false, // default true
     failOnDiff: getBooleanInput("fail_on_diff") === true, // default false
     envVars: getInput("env_vars"),
-    serverTimeout: parseInt(getInput("server_timeout") || "30000", 10),
+    serverTimeout,
   };
 }
 

@@ -299,6 +299,7 @@ async function probeWithConfig(
   globalHeaders: Record<string, string>,
   globalCustomMessages: CustomMessage[],
   globalClientCapabilities: ClientCapabilities,
+  timeoutMs: number,
   useSharedServer: boolean = false,
   overrideCommand?: string,
   overrideUrl?: string
@@ -331,6 +332,7 @@ async function probeWithConfig(
       envVars,
       customMessages,
       clientCapabilities,
+      timeoutMs,
     });
   } else {
     // For HTTP transport, optionally start the server if start_command is provided
@@ -352,6 +354,7 @@ async function probeWithConfig(
         envVars,
         customMessages,
         clientCapabilities,
+        timeoutMs,
       });
     } finally {
       // Always stop the server if we started it
@@ -759,6 +762,7 @@ async function probeConfig(
   headers: Record<string, string>,
   customMessages: CustomMessage[],
   clientCapabilities: ClientCapabilities,
+  timeoutMs: number,
   useSharedServer: boolean,
   overrideCommand?: string,
   overrideUrl?: string
@@ -777,6 +781,7 @@ async function probeConfig(
       headers,
       customMessages,
       clientCapabilities,
+      timeoutMs,
       useSharedServer,
       overrideCommand,
       overrideUrl
@@ -833,6 +838,7 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
           globalHeaders,
           globalCustomMessages,
           globalClientCapabilities,
+          ctx.inputs.serverTimeout * 1000,
           configUsesSharedServer
         );
         branchResults.set(config.name, probeData);
@@ -885,6 +891,7 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
           globalHeaders,
           globalCustomMessages,
           globalClientCapabilities,
+          ctx.inputs.serverTimeout * 1000,
           false, // Don't use shared server for base commands
           config.base_start_command,
           config.base_server_url
@@ -952,6 +959,7 @@ export async function runAllTests(ctx: RunContext): Promise<TestResult[]> {
               globalHeaders,
               globalCustomMessages,
               globalClientCapabilities,
+              ctx.inputs.serverTimeout * 1000,
               configUsesSharedServer
             );
             baseResults.set(config.name, probeData);

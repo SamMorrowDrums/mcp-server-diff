@@ -8600,7 +8600,6 @@ const { addAbortListener } = __nccwpck_require__(8474)
 const { Readable } = __nccwpck_require__(7075)
 const { RequestAbortedError, NotSupportedError, InvalidArgumentError, AbortError } = __nccwpck_require__(8707)
 const util = __nccwpck_require__(3440)
-const { ReadableStreamFrom } = __nccwpck_require__(3440)
 
 const kConsume = Symbol('kConsume')
 const kReading = Symbol('kReading')
@@ -8841,7 +8840,7 @@ class BodyReadable extends Readable {
    */
   get body () {
     if (!this[kBody]) {
-      this[kBody] = ReadableStreamFrom(this)
+      this[kBody] = ReadableStream.from(this)
       if (this[kConsume]) {
         // TODO: Is this the best way to force a lock?
         this[kBody].getReader() // Ensure stream is locked.
@@ -9305,7 +9304,7 @@ class MemoryCacheStore extends EventEmitter {
   }
 
   /**
-   * @param {import('../../types/cache-interceptor.d.ts').default.CacheKey} req
+   * @param {import('../../types/cache-interceptor.d.ts').default.CacheKey} key
    * @returns {import('../../types/cache-interceptor.d.ts').default.GetResult | undefined}
    */
   get (key) {
@@ -9317,6 +9316,11 @@ class MemoryCacheStore extends EventEmitter {
     const entries = this.#entries.get(topLevelKey)
 
     const entry = entries ? findEntry(key, entries, now) : null
+
+    if (entry != null) {
+      this.#entries.delete(topLevelKey)
+      this.#entries.set(topLevelKey, entries)
+    }
 
     return entry == null
       ? undefined
@@ -9366,11 +9370,13 @@ class MemoryCacheStore extends EventEmitter {
       },
       final (callback) {
         let entries = store.#entries.get(topLevelKey)
-        if (!entries) {
+        if (entries) {
+          store.#entries.delete(topLevelKey)
+        } else {
           entries = []
-          store.#entries.set(topLevelKey, entries)
         }
-        const previousEntry = findEntry(key, entries, Date.now())
+        store.#entries.set(topLevelKey, entries)
+        const previousEntry = findEntry(key, entries, -Infinity)
         if (previousEntry) {
           const index = entries.indexOf(previousEntry)
           entries.splice(index, 1, entry)
@@ -9395,16 +9401,7 @@ class MemoryCacheStore extends EventEmitter {
             store.#hasEmittedMaxSizeEvent = true
           }
 
-          // Perform eviction
-          for (const [key, entries] of store.#entries) {
-            for (const entry of entries.splice(0, entries.length / 2)) {
-              store.#size -= entry.size
-              store.#count -= 1
-            }
-            if (entries.length === 0) {
-              store.#entries.delete(key)
-            }
-          }
+          store.#evict(entry)
 
           // Reset the event flag after eviction
           if (store.#size < store.#maxSize && store.#count < store.#maxCount) {
@@ -9415,6 +9412,43 @@ class MemoryCacheStore extends EventEmitter {
         callback(null)
       }
     })
+  }
+
+  #evict (keep) {
+    const targetSize = this.#maxSize / 2
+    const targetCount = this.#maxCount / 2
+
+    for (const [key, entries] of this.#entries) {
+      for (let i = 0; i < entries.length && (this.#size > targetSize || this.#count > targetCount);) {
+        const entry = entries[i]
+        if (entry === keep) {
+          i++
+          continue
+        }
+        entries.splice(i, 1)
+        this.#size -= entry.size
+        this.#count -= 1
+      }
+
+      if (entries.length === 0) {
+        this.#entries.delete(key)
+      }
+
+      if (this.#size <= targetSize && this.#count <= targetCount) {
+        return
+      }
+    }
+
+    if (this.#size > this.#maxSize || this.#count > this.#maxCount) {
+      const topLevelKey = `${keep.origin}:${keep.path}`
+      const entries = this.#entries.get(topLevelKey)
+      entries.splice(entries.indexOf(keep), 1)
+      this.#size -= keep.size
+      this.#count -= 1
+      if (entries.length === 0) {
+        this.#entries.delete(topLevelKey)
+      }
+    }
   }
 
   /**
@@ -9506,13 +9540,37 @@ module.exports = MemoryCacheStore
 
 const { Writable } = __nccwpck_require__(7075)
 const { assertCacheKey, assertCacheValue } = __nccwpck_require__(7659)
+const { zstdCompressSync, zstdDecompressSync } = __nccwpck_require__(8522)
 
 let DatabaseSync
 
-const VERSION = 3
+// Bump when entries written by an older cache policy are unsafe to reuse.
+// Version 5 invalidates entries that may have been poisoned through redirects.
+const VERSION = 5
 
 // 2gb
 const MAX_ENTRY_SIZE = 2 * 1000 * 1000 * 1000
+
+// 1MiB
+const COMPRESS_THRESHOLD = 1024 * 1024
+
+// zstd support landed in Node 22.19.0/23.4.0, so it may be missing even when
+// node:sqlite is available.
+const hasZstd = typeof zstdCompressSync === 'function' && typeof zstdDecompressSync === 'function'
+
+// SQLite reports a database that another connection is writing as SQLITE_BUSY
+// (5) or SQLITE_LOCKED (6).
+// https://www.sqlite.org/rescode.html#busy
+const SQLITE_BUSY = 5
+const SQLITE_LOCKED = 6
+
+/**
+ * @param {Error & { errcode?: number }} err
+ * @returns {boolean}
+ */
+function isLockedError (err) {
+  return err?.errcode === SQLITE_BUSY || err?.errcode === SQLITE_LOCKED
+}
 
 /**
  * @typedef {import('../../types/cache-interceptor.d.ts').default.CacheStore} CacheStore
@@ -9521,6 +9579,7 @@ const MAX_ENTRY_SIZE = 2 * 1000 * 1000 * 1000
  * @typedef {{
  *  id: Readonly<number>,
  *  body?: Uint8Array
+ *  compressed?: string
  *  statusCode: number
  *  statusMessage: string
  *  headers?: string
@@ -9535,6 +9594,7 @@ const MAX_ENTRY_SIZE = 2 * 1000 * 1000 * 1000
 module.exports = class SqliteCacheStore {
   #maxEntrySize = MAX_ENTRY_SIZE
   #maxCount = Infinity
+  #compressThreshold = COMPRESS_THRESHOLD
 
   /**
    * @type {import('node:sqlite').DatabaseSync}
@@ -9611,6 +9671,17 @@ module.exports = class SqliteCacheStore {
         }
         this.#maxCount = opts.maxCount
       }
+
+      if (opts.compressThreshold !== undefined) {
+        if (
+          typeof opts.compressThreshold !== 'number' ||
+          !Number.isInteger(opts.compressThreshold) ||
+          opts.compressThreshold < 0
+        ) {
+          throw new TypeError('SqliteCacheStore options.compressThreshold must be a non-negative integer')
+        }
+        this.#compressThreshold = opts.compressThreshold
+      }
     }
 
     if (!DatabaseSync) {
@@ -9632,6 +9703,7 @@ module.exports = class SqliteCacheStore {
 
         -- Data returned to the interceptor
         body BUF NULL,
+        compressed TEXT NULL,
         deleteAt INTEGER NOT NULL,
         statusCode INTEGER NOT NULL,
         statusMessage TEXT NOT NULL,
@@ -9651,6 +9723,7 @@ module.exports = class SqliteCacheStore {
       SELECT
         id,
         body,
+        compressed,
         deleteAt,
         statusCode,
         statusMessage,
@@ -9671,6 +9744,7 @@ module.exports = class SqliteCacheStore {
     this.#updateValueQuery = this.#db.prepare(`
       UPDATE cacheInterceptorV${VERSION} SET
         body = ?,
+        compressed = ?,
         deleteAt = ?,
         statusCode = ?,
         statusMessage = ?,
@@ -9689,6 +9763,7 @@ module.exports = class SqliteCacheStore {
         url,
         method,
         body,
+        compressed,
         deleteAt,
         statusCode,
         statusMessage,
@@ -9698,7 +9773,7 @@ module.exports = class SqliteCacheStore {
         vary,
         cachedAt,
         staleAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
 
     this.#deleteByUrlQuery = this.#db.prepare(
@@ -9738,10 +9813,14 @@ module.exports = class SqliteCacheStore {
   get (key) {
     assertCacheKey(key)
 
-    const value = this.#findValue(key)
+    const value = this.#lockSafe(() => this.#findValue(key))
     return value
       ? {
-          body: value.body ? Buffer.from(value.body.buffer, value.body.byteOffset, value.body.byteLength) : undefined,
+          body: value.body
+            ? value.compressed === 'zstd'
+              ? zstdDecompressSync(Buffer.from(value.body.buffer, value.body.byteOffset, value.body.byteLength))
+              : Buffer.from(value.body.buffer, value.body.byteOffset, value.body.byteLength)
+            : undefined,
           statusCode: value.statusCode,
           statusMessage: value.statusMessage,
           headers: value.headers ? JSON.parse(value.headers) : undefined,
@@ -9772,11 +9851,22 @@ module.exports = class SqliteCacheStore {
       return
     }
 
-    const existingValue = this.#findValue(key, true)
+    let compressed = null
+    let storedBody = body
+    if (body && hasZstd && (size > this.#compressThreshold || isCompressibleContentType(getContentType(value.headers)))) {
+      const candidate = zstdCompressSync(body)
+      if (candidate.byteLength < body.byteLength) {
+        storedBody = candidate
+        compressed = 'zstd'
+      }
+    }
+
+    const existingValue = this.#lockSafe(() => this.#findValue(key, true))
     if (existingValue) {
       // Updating an existing response, let's overwrite it
-      this.#updateValueQuery.run(
-        body,
+      this.#lockSafe(() => this.#updateValueQuery.run(
+        storedBody,
+        compressed,
         value.deleteAt,
         value.statusCode,
         value.statusMessage,
@@ -9787,13 +9877,14 @@ module.exports = class SqliteCacheStore {
         value.cachedAt,
         value.staleAt,
         existingValue.id
-      )
+      ))
     } else {
       // New response, let's insert it
-      this.#insertValueQuery.run(
+      this.#lockSafe(() => this.#insertValueQuery.run(
         url,
         key.method,
-        body,
+        storedBody,
+        compressed,
         value.deleteAt,
         value.statusCode,
         value.statusMessage,
@@ -9803,7 +9894,7 @@ module.exports = class SqliteCacheStore {
         value.vary ? JSON.stringify(value.vary) : null,
         value.cachedAt,
         value.staleAt
-      )
+      ))
       this.#prune()
     }
   }
@@ -9852,23 +9943,53 @@ module.exports = class SqliteCacheStore {
       throw new TypeError(`expected key to be object, got ${typeof key}`)
     }
 
-    this.#deleteByUrlQuery.run(this.#makeValueUrl(key))
+    this.#lockSafe(() => this.#deleteByUrlQuery.run(this.#makeValueUrl(key)))
+  }
+
+  /**
+   * Runs a database operation, skipping it when another connection holds the
+   * database lock.
+   *
+   * The cache store is meant to be shared between processes, and SQLite reports
+   * a concurrent writer as SQLITE_BUSY/SQLITE_LOCKED. Those errors are
+   * transient, and caching is best effort: the entry is skipped and the next
+   * request retries, rather than failing the request that triggered the write.
+   *
+   * @template T
+   * @param {() => T} fn
+   * @returns {T | undefined}
+   */
+  #lockSafe (fn) {
+    try {
+      return fn()
+    } catch (err) {
+      if (!isLockedError(err)) {
+        throw err
+      }
+
+      return undefined
+    }
   }
 
   #prune () {
-    if (Number.isFinite(this.#maxCount) && this.size <= this.#maxCount) {
-      return 0
+    if (Number.isFinite(this.#maxCount)) {
+      // A locked database cannot be measured, so skip pruning instead of
+      // failing the write that triggered it.
+      const size = this.#lockSafe(() => this.size)
+      if (size === undefined || size <= this.#maxCount) {
+        return 0
+      }
     }
 
     {
-      const removed = this.#deleteExpiredValuesQuery.run(Date.now()).changes
+      const removed = this.#lockSafe(() => this.#deleteExpiredValuesQuery.run(Date.now()).changes)
       if (removed) {
         return removed
       }
     }
 
     {
-      const removed = this.#deleteOldValuesQuery?.run(Math.max(Math.floor(this.#maxCount * 0.1), 1)).changes
+      const removed = this.#lockSafe(() => this.#deleteOldValuesQuery?.run(Math.max(Math.floor(this.#maxCount * 0.1), 1)).changes)
       if (removed) {
         return removed
       }
@@ -9972,6 +10093,43 @@ function headerValueEquals (lhs, rhs) {
   return lhs === rhs
 }
 
+/**
+ * @param {Record<string, string|string[]>|null|undefined} headers
+ * @returns {string|undefined}
+ */
+function getContentType (headers) {
+  if (headers == null) {
+    return undefined
+  }
+
+  for (const key in headers) {
+    if (key.toLowerCase() === 'content-type') {
+      const value = headers[key]
+      return Array.isArray(value) ? value[0] : value
+    }
+  }
+
+  return undefined
+}
+
+/**
+ * @param {string|undefined} contentType
+ * @returns {boolean}
+ */
+function isCompressibleContentType (contentType) {
+  if (contentType == null) {
+    return false
+  }
+
+  const type = contentType.toLowerCase()
+
+  // text/* and application/json, xml, javascript, ... are easily compressible
+  // even at smaller sizes, so ignore the compressThreshold for them.
+  return /^text\//.test(type) ||
+    /^application\/(json|xml|javascript|x-www-form-urlencoded|graphql)(\s|;|$)/.test(type) ||
+    /\+(json|xml)(\s|;|$)/.test(type)
+}
+
 
 /***/ }),
 
@@ -10021,16 +10179,22 @@ const SessionCache = class WeakSessionCache {
     if (this._sessionCache.has(sessionKey)) {
       this._sessionCache.delete(sessionKey)
     } else if (this._sessionCache.size >= this._maxCachedSessions) {
+      // Make room for the new session: prefer an entry whose session has
+      // already been collected, otherwise evict the oldest one.
+      let evicted = false
       for (const [key, ref] of this._sessionCache) {
         if (ref.deref() === undefined) {
           this._sessionCache.delete(key)
-          return
+          evicted = true
+          break
         }
       }
 
-      const oldest = this._sessionCache.keys().next()
-      if (!oldest.done) {
-        this._sessionCache.delete(oldest.value)
+      if (!evicted) {
+        const oldest = this._sessionCache.keys().next()
+        if (!oldest.done) {
+          this._sessionCache.delete(oldest.value)
+        }
       }
     }
 
@@ -10293,9 +10457,20 @@ for (let i = 0; i < wellknownHeaderNames.length; ++i) {
     lowerCasedKey
 }
 
+/**
+ * Default WebSocket receive limits (see `webSocket` in Client.md). Used by
+ * DispatcherBase#webSocketOptions and by the WebSocket parser when the
+ * dispatcher doesn't provide a value, so a dispatcher without
+ * `webSocketOptions` (a custom one, or a wrapper) doesn't remove the limits.
+ */
+const defaultWebSocketMaxFragments = 131072
+const defaultWebSocketMaxPayloadSize = 128 * 1024 * 1024 // 128 MB
+
 module.exports = {
   wellknownHeaderNames,
-  headerNameLowerCasedRecord
+  headerNameLowerCasedRecord,
+  defaultWebSocketMaxFragments,
+  defaultWebSocketMaxPayloadSize
 }
 
 
@@ -10846,6 +11021,22 @@ class BalancedPoolMissingUpstreamError extends UndiciError {
   }
 }
 
+const kWebAssemblyNotSupportedError = Symbol.for('undici.error.ERR_WEBASSEMBLY_NOT_SUPPORTED')
+class WebAssemblyNotSupportedError extends Error {
+  constructor (message) {
+    super(message || 'WebAssembly is not supported in this environment, but is required for HTTP/1 parsing')
+    this.code = 'ERR_WEBASSEMBLY_NOT_SUPPORTED'
+  }
+
+  static [Symbol.hasInstance] (instance) {
+    return instance && instance[kWebAssemblyNotSupportedError] === true
+  }
+
+  get [kWebAssemblyNotSupportedError] () {
+    return true
+  }
+}
+
 const kHTTPParserError = Symbol.for('undici.error.UND_ERR_HTTP_PARSER')
 class HTTPParserError extends Error {
   constructor (message, code, data) {
@@ -10905,13 +11096,14 @@ class RequestRetryError extends UndiciError {
 
 const kResponseError = Symbol.for('undici.error.UND_ERR_RESPONSE')
 class ResponseError extends UndiciError {
-  constructor (message, code, { headers, body }) {
+  constructor (message, code, { headers, body, bodyTruncated = false }) {
     super(message)
     this.name = 'ResponseError'
     this.message = message || 'Response error'
     this.code = 'UND_ERR_RESPONSE'
     this.statusCode = code
     this.body = body
+    this.bodyTruncated = bodyTruncated
     this.headers = headers
   }
 
@@ -10958,6 +11150,24 @@ class ProxyConnectionError extends UndiciError {
   }
 
   get [kProxyConnectionError] () {
+    return true
+  }
+}
+
+const kMaxRedirectsError = Symbol.for('undici.error.UND_ERR_REDIRECT_MAX')
+class MaxRedirectsError extends UndiciError {
+  constructor (message) {
+    super(message)
+    this.name = 'MaxRedirectsError'
+    this.message = message || 'max redirects'
+    this.code = 'UND_ERR_REDIRECT_MAX'
+  }
+
+  static [Symbol.hasInstance] (instance) {
+    return instance && instance[kMaxRedirectsError] === true
+  }
+
+  get [kMaxRedirectsError] () {
     return true
   }
 }
@@ -11009,6 +11219,7 @@ class MessageSizeExceededError extends UndiciError {
 
 module.exports = {
   AbortError,
+  WebAssemblyNotSupportedError,
   HTTPParserError,
   UndiciError,
   HeadersTimeoutError,
@@ -11032,6 +11243,7 @@ module.exports = {
   SecureProxyConnectionError,
   ProxyConnectionError,
   MaxOriginsReachedError,
+  MaxRedirectsError,
   Socks5ProxyError,
   MessageSizeExceededError
 }
@@ -11250,7 +11462,12 @@ class Request {
       this.body = body.byteLength ? Buffer.from(body) : null
     } else if (typeof body === 'string') {
       this.body = body.length ? Buffer.from(body) : null
-    } else if (isFormDataLike(body) || isIterable(body) || isBlobLike(body)) {
+    } else if (isFormDataLike(body)) {
+      if (!isUndiciFormData(body)) {
+        throw new InvalidArgumentError('body must be a FormData created by this undici package instance; FormData from other sources, such as the built-in FormData provided by Node.js, is not supported')
+      }
+      this.body = body
+    } else if (isIterable(body) || isBlobLike(body)) {
       this.body = body
     } else {
       throw new InvalidArgumentError('body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable')
@@ -11412,9 +11629,21 @@ class Request {
     }
   }
 
-  onRequestUpgrade (statusCode, headers, socket) {
+  /**
+   * @param {number} statusCode
+   * @param {Buffer[]|string[]|import('../../types/header.d.ts').IncomingHttpHeaders} headers
+   * @param {import('node:stream').Duplex} socket
+   * @param {string} [statusText]
+   */
+  onRequestUpgrade (statusCode, headers, socket, statusText = '') {
+    this.onFinally()
+
     assert(!this.aborted)
     assert(!this.completed)
+
+    if (channels.headers.hasSubscribers) {
+      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } })
+    }
 
     const controller = this[kController]
     if (controller) {
@@ -11423,7 +11652,16 @@ class Request {
 
     const parsedHeaders = Array.isArray(headers) ? parseHeaders(headers) : headers
 
-    return this[kHandler].onRequestUpgrade?.(controller, statusCode, parsedHeaders, socket)
+    const result = this[kHandler].onRequestUpgrade?.(controller, statusCode, parsedHeaders, socket)
+
+    if (!this.aborted) {
+      this.completed = true
+      if (channels.trailers.hasSubscribers) {
+        channels.trailers.publish({ request: this, trailers: [] })
+      }
+    }
+
+    return result
   }
 
   onResponseEnd (trailers) {
@@ -11585,6 +11823,16 @@ function processHeader (request, key, val) {
   } else {
     request.headers.push(key, val)
   }
+}
+
+let isFormData
+
+function isUndiciFormData (body) {
+  if (isFormData === undefined) {
+    __nccwpck_require__(5910)
+    isFormData = (__nccwpck_require__(7879).webidl).is.FormData
+  }
+  return isFormData(body)
 }
 
 module.exports = Request
@@ -12250,6 +12498,9 @@ module.exports = {
   kDestroy: Symbol('destroy'),
   kDispatch: Symbol('dispatch'),
   kUrl: Symbol('url'),
+  kRequestOrigin: Symbol('request origin'),
+  kRedirectCacheControl: Symbol('redirect cache control'),
+  kOriginless: Symbol('originless'),
   kWriting: Symbol('writing'),
   kResuming: Symbol('resuming'),
   kQueue: Symbol('queue'),
@@ -12315,6 +12566,7 @@ module.exports = {
   kRemoteSettings: Symbol('http2session remote settings'),
   kHTTP2Stream: Symbol('http2session client stream'),
   kPingInterval: Symbol('ping interval'),
+  kUseMilo: Symbol('use milo'),
   kNoProxyAgent: Symbol('no proxy agent'),
   kHttpProxyAgent: Symbol('http proxy agent'),
   kHttpsProxyAgent: Symbol('https proxy agent'),
@@ -12883,7 +13135,7 @@ function destroy (stream, err) {
   }
 }
 
-const KEEPALIVE_TIMEOUT_EXPR = /timeout=(\d+)/
+const KEEPALIVE_TIMEOUT_EXPR = /(?:^|,)[\t ]*timeout=(\d+)/i
 /**
  * @param {string} val
  * @returns {number | null}
@@ -12911,6 +13163,30 @@ function headerNameToString (value) {
  */
 function bufferToLowerCasedHeaderName (value) {
   return tree.lookup(value) ?? value.toString('latin1').toLowerCase()
+}
+
+/**
+ * Writes a header onto a plain object without going through the
+ * `Object.prototype` `__proto__` setter. Plain assignment there drops a string
+ * value and, when the value is an array, replaces the object's prototype
+ * instead of storing anything. Every other name is a normal assignment.
+ *
+ * @param {Record<string, string | string[]>} obj Accumulator to write onto
+ * @param {string} key Header name
+ * @param {string | string[]} value Header value
+ * @returns {void}
+ */
+function setHeader (obj, key, value) {
+  if (key === '__proto__') {
+    Object.defineProperty(obj, key, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true
+    })
+  } else {
+    obj[key] = value
+  }
 }
 
 /**
@@ -13138,44 +13414,6 @@ function getSocketInfo (socket) {
     bytesWritten: socket.bytesWritten,
     bytesRead: socket.bytesRead
   }
-}
-
-/**
- * @param {Iterable} iterable
- * @returns {ReadableStream}
- */
-function ReadableStreamFrom (iterable) {
-  // We cannot use ReadableStream.from here because it does not return a byte stream.
-
-  let iterator
-  return new ReadableStream(
-    {
-      start () {
-        iterator = iterable[Symbol.asyncIterator]()
-      },
-      pull (controller) {
-        return iterator.next().then(({ done, value }) => {
-          if (done) {
-            return queueMicrotask(() => {
-              controller.close()
-              controller.byobRequest?.respond(0)
-            })
-          } else {
-            const buf = Buffer.isBuffer(value) ? value : Buffer.from(value)
-            if (buf.byteLength) {
-              return controller.enqueue(new Uint8Array(buf))
-            } else {
-              return this.pull(controller)
-            }
-          }
-        })
-      },
-      cancel () {
-        return iterator.return()
-      },
-      type: 'bytes'
-    }
-  )
 }
 
 /**
@@ -13518,11 +13756,11 @@ module.exports = {
   toRawHeaders,
   encodeRawHeaders,
   parseHeaders,
+  setHeader,
   parseKeepAliveTimeout,
   destroy,
   bodyLength,
   deepClone,
-  ReadableStreamFrom,
   isBuffer,
   assertRequestHandler,
   getSocketInfo,
@@ -13553,7 +13791,7 @@ module.exports = {
 
 
 const { InvalidArgumentError, MaxOriginsReachedError } = __nccwpck_require__(8707)
-const { kBusy, kClients, kConnected, kRunning, kClose, kDestroy, kDispatch, kUrl } = __nccwpck_require__(6443)
+const { kBusy, kClients, kConnected, kRunning, kPending, kClose, kDestroy, kDispatch, kUrl } = __nccwpck_require__(6443)
 const DispatcherBase = __nccwpck_require__(1841)
 const Pool = __nccwpck_require__(628)
 const Client = __nccwpck_require__(3701)
@@ -13574,7 +13812,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxOrigins = Infinity, connect, ...options } = {}) {
+  constructor ({ factory = defaultFactory, maxOrigins = Infinity, connect, tls, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -13593,7 +13831,11 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
-    this[kOptions] = { ...util.deepClone(options), maxOrigins, connect }
+    if (tls && typeof tls !== 'function') {
+      tls = { ...tls }
+    }
+
+    this[kOptions] = { ...util.deepClone(options), maxOrigins, connect, tls }
     this[kFactory] = factory
     this[kClients] = new Map()
     this[kOrigins] = new Set()
@@ -13649,7 +13891,12 @@ class Agent extends DispatcherBase {
           return
         }
 
-        if (dispatcher[kConnected] > 0 || dispatcher[kBusy]) {
+        // A GOAWAY detaches the HTTP/2 session before requeued requests are
+        // dispatched on a replacement connection. At that point the pool has
+        // no connected clients and is not busy, but it still has pending work.
+        // Closing it here lets the replacement Client finish those requests
+        // and then destroys that new connection with ClientDestroyedError.
+        if (dispatcher[kConnected] > 0 || dispatcher[kBusy] || dispatcher[kPending] > 0) {
           return
         }
 
@@ -13744,7 +13991,7 @@ const {
   kGetDispatcher
 } = __nccwpck_require__(2128)
 const Pool = __nccwpck_require__(628)
-const { kUrl } = __nccwpck_require__(6443)
+const { kOriginless, kUrl } = __nccwpck_require__(6443)
 const util = __nccwpck_require__(3440)
 const kFactory = Symbol('factory')
 
@@ -13780,14 +14027,17 @@ function defaultFactory (origin, opts) {
 }
 
 class BalancedPool extends PoolBase {
-  constructor (upstreams = [], { factory = defaultFactory, ...opts } = {}) {
+  constructor (upstreams = [], { factory = defaultFactory, connect, tls, ...opts } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
 
-    super()
+    super(opts)
 
-    this[kOptions] = { ...util.deepClone(opts) }
+    this[kOriginless] = true
+    if (connect && typeof connect !== 'function') connect = { ...connect }
+    if (tls && typeof tls !== 'function') tls = { ...tls }
+    this[kOptions] = { ...util.deepClone(opts), connect, tls }
     this[kIndex] = -1
     this[kCurrentWeight] = 0
 
@@ -13969,6 +14219,7 @@ const {
   InformationalError,
   BodyTimeoutError,
   HTTPParserError,
+  WebAssemblyNotSupportedError,
   ResponseExceededMaxSizeError
 } = __nccwpck_require__(8707)
 const {
@@ -14003,10 +14254,15 @@ const {
   kOnError,
   kResume,
   kHTTPContext,
-  kClosed
+  kClosed,
+  kUseMilo
 } = __nccwpck_require__(6443)
 
 const constants = __nccwpck_require__(2824)
+// Node.js core bundles only llhttp; experimental Milo remains available in npm builds.
+const { H1Parser, getMiloEnabled } = typeof esbuildDetection === 'undefined'
+  ? __nccwpck_require__(1969)
+  : {}
 const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const removeAllListeners = util.removeAllListeners
@@ -14018,12 +14274,25 @@ const kTypeOfService = Symbol('kTypeOfService')
 let extractBody
 
 function lazyllhttp () {
+  // Check only when HTTP/1 needs the parser, so other APIs remain usable without WASM.
+  if (typeof WebAssembly === 'undefined') {
+    throw new WebAssemblyNotSupportedError()
+  }
+
   const llhttpWasmData = process.env.JEST_WORKER_ID ? __nccwpck_require__(3870) : undefined
 
   let mod
 
-  // We disable wasm SIMD on ppc64 as it seems to be broken on Power 9 architectures.
-  let useWasmSIMD = process.arch !== 'ppc64'
+  // We disable wasm SIMD on older versions of Node.js on ppc64 that are broken on Power >=9 architectures.
+  let useWasmSIMD = true
+  if (process.arch === 'riscv64') {
+    useWasmSIMD = false
+  } else if (process.arch === 'ppc64') {
+    const [major, minor] = process.versions.node.split('.').map(n => parseInt(n, 10))
+    if (major < 24 || (major === 24 && minor < 12)) {
+      useWasmSIMD = false
+    }
+  }
   // The Env Variable UNDICI_NO_WASM_SIMD allows explicitly overriding the default behavior
   if (process.env.UNDICI_NO_WASM_SIMD === '1') {
     useWasmSIMD = false
@@ -14034,8 +14303,7 @@ function lazyllhttp () {
   if (useWasmSIMD) {
     try {
       mod = new WebAssembly.Module(__nccwpck_require__(3434))
-    } catch {
-    }
+    } catch {}
   }
 
   if (!mod) {
@@ -14072,7 +14340,7 @@ function lazyllhttp () {
        * @param {number} p
        * @returns {number}
        */
-      wasm_on_message_begin: (p) => {
+      wasm_on_message_begin: p => {
         assert(currentParser.ptr === p)
         return currentParser.onMessageBegin()
       },
@@ -14124,11 +14392,10 @@ function lazyllhttp () {
        * @param {number} p
        * @returns {number}
        */
-      wasm_on_message_complete: (p) => {
+      wasm_on_message_complete: p => {
         assert(currentParser.ptr === p)
         return currentParser.onMessageComplete()
       }
-
     }
   })
 }
@@ -14161,10 +14428,10 @@ const TIMEOUT_KEEP_ALIVE = 8 | USE_NATIVE_TIMER
 
 class Parser {
   /**
-     * @param {import('./client.js')} client
-     * @param {import('net').Socket} socket
-     * @param {*} llhttp
-     */
+   * @param {import('./client.js')} client
+   * @param {import('net').Socket} socket
+   * @param {*} llhttp
+   */
   constructor (client, socket, { exports }) {
     this.llhttp = exports
     this.ptr = this.llhttp.llhttp_alloc(constants.TYPE.RESPONSE)
@@ -14191,7 +14458,8 @@ class Parser {
 
     this.keepAlive = ''
     this.contentLength = -1
-    this.connectionKeepAlive = false
+    this.hasTransferEncoding = false
+    this.connection = ''
     this.maxResponseSize = client[kMaxResponseSize]
   }
 
@@ -14199,10 +14467,7 @@ class Parser {
     // If the existing timer and the new timer are of different timer type
     // (fast or native) or have different delay, we need to clear the existing
     // timer and set a new one.
-    if (
-      delay !== this.timeoutValue ||
-      (type & USE_FAST_TIMER) ^ (this.timeoutType & USE_FAST_TIMER)
-    ) {
+    if (delay !== this.timeoutValue || (type & USE_FAST_TIMER) ^ (this.timeoutType & USE_FAST_TIMER)) {
       // If a timeout is already set, clear it with clearTimeout of the fast
       // timer implementation, as it can clear fast and native timers.
       if (this.timeout) {
@@ -14387,9 +14652,7 @@ class Parser {
     if (ptr) {
       const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
       message =
-        'Response does not match the HTTP/1.1 protocol (' +
-        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-        ')'
+        'Response does not match the HTTP/1.1 protocol (' + Buffer.from(llhttp.memory.buffer, ptr, len).toString() + ')'
     }
 
     return new HTTPParserError(message, constants.ERROR[ret], data)
@@ -14467,6 +14730,7 @@ class Parser {
    */
   onHeaderValue (buf) {
     let len = this.headers.length
+    const isContinuation = (len & 1) === 0
 
     if ((len & 1) === 1) {
       this.headers.push(buf)
@@ -14479,19 +14743,19 @@ class Parser {
     if (key.length === 10) {
       const headerName = util.bufferToLowerCasedHeaderName(key)
       if (headerName === 'keep-alive') {
-        this.keepAlive += buf.toString()
+        this.keepAlive += (isContinuation || this.keepAlive.length === 0 ? '' : ',') + buf.toString()
       } else if (headerName === 'connection') {
-        this.connectionKeepAlive =
-          this.headers[len - 1].length === 10 &&
-          util.bufferToLowerCasedHeaderName(this.headers[len - 1]) === 'keep-alive'
+        this.connection += (isContinuation || this.connection.length === 0 ? '' : ',') + buf.toString()
       }
     } else if (key.length === 14 && util.bufferToLowerCasedHeaderName(key) === 'content-length') {
       if (this.contentLength === -1) {
         this.contentLength = 0
       }
       for (let i = 0; i < buf.length; i++) {
-        this.contentLength = (this.contentLength * 10) + (buf[i] - 0x30)
+        this.contentLength = this.contentLength * 10 + (buf[i] - 0x30)
       }
+    } else if (key.length === 17 && util.bufferToLowerCasedHeaderName(key) === 'transfer-encoding') {
+      this.hasTransferEncoding = true
     }
 
     this.trackHeader(buf.length)
@@ -14513,7 +14777,7 @@ class Parser {
    * @param {Buffer} head
    */
   onUpgrade (head) {
-    const { upgrade, client, socket, headers, statusCode } = this
+    const { upgrade, client, socket, headers, statusCode, statusText } = this
 
     assert(upgrade)
     assert(client[kSocket] === socket)
@@ -14548,8 +14812,9 @@ class Parser {
     client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'))
 
     try {
-      request.onRequestUpgrade(statusCode, headers, socket)
+      request.onRequestUpgrade(statusCode, headers, socket, statusText)
     } catch (err) {
+      util.errorRequest(client, request, err)
       util.destroy(socket, err)
     }
 
@@ -14597,16 +14862,27 @@ class Parser {
     assert(this.timeoutType === TIMEOUT_HEADERS)
 
     this.statusCode = statusCode
-    this.shouldKeepAlive = (
+    this.shouldKeepAlive =
       shouldKeepAlive ||
       // Override llhttp value which does not allow keepAlive for HEAD.
-      (request.method === 'HEAD' && !socket[kReset] && this.connectionKeepAlive)
-    )
+      (request.method === 'HEAD' && !socket[kReset] &&
+        /(?:^|,)[\t ]*keep-alive[\t ]*(?:,|$)/i.test(this.connection) &&
+        !/(?:^|,)[\t ]*close[\t ]*(?:,|$)/i.test(this.connection))
+
+    // Responses to HEAD and 204/304 responses never carry content
+    if (request.method === 'HEAD' || statusCode === 204 || statusCode === 304) {
+      // A non-zero Content-Length or Transfer-Encoding on a 204/304 means the
+      // server may also have sent content inappropriately, which would then be
+      // parsed as the next response on this connection. Accept it, but do not
+      // reuse the connection. HEAD requests are fine tho.
+      if (request.method !== 'HEAD' && (this.contentLength > 0 || this.hasTransferEncoding)) {
+        this.shouldKeepAlive = false
+      }
+      this.contentLength = -1
+    }
 
     if (this.statusCode >= 200) {
-      const bodyTimeout = request.bodyTimeout != null
-        ? request.bodyTimeout
-        : client[kBodyTimeout]
+      const bodyTimeout = request.bodyTimeout != null ? request.bodyTimeout : client[kBodyTimeout]
       this.setTimeout(bodyTimeout, TIMEOUT_BODY)
     } else if (this.timeout) {
       if (this.timeout.refresh) {
@@ -14634,10 +14910,7 @@ class Parser {
       const keepAliveTimeout = this.keepAlive ? util.parseKeepAliveTimeout(this.keepAlive) : null
 
       if (keepAliveTimeout != null) {
-        const timeout = Math.min(
-          keepAliveTimeout - client[kKeepAliveTimeoutThreshold],
-          client[kKeepAliveMaxTimeout]
-        )
+        const timeout = Math.min(keepAliveTimeout - client[kKeepAliveTimeoutThreshold], client[kKeepAliveMaxTimeout])
         if (timeout <= 0) {
           socket[kReset] = true
         } else {
@@ -14734,8 +15007,9 @@ class Parser {
     this.statusText = ''
     this.bytesRead = 0
     this.contentLength = -1
+    this.hasTransferEncoding = false
     this.keepAlive = ''
-    this.connectionKeepAlive = false
+    this.connection = ''
 
     this.headers = []
     this.headersSize = 0
@@ -14744,7 +15018,7 @@ class Parser {
       return 0
     }
 
-    if (request.method !== 'HEAD' && contentLength !== -1 && bytesRead !== contentLength) {
+    if (contentLength !== -1 && bytesRead !== contentLength) {
       util.destroy(socket, new ResponseContentLengthMismatchError())
       return -1
     }
@@ -14832,7 +15106,9 @@ function connectH1 (client, socket) {
   socket[kIdleSocketValidation] = 0
   socket[kIdleSocketValidationTimeout] = null
   socket[kSocketUsed] = false
-  socket[kParser] = new Parser(client, socket, llhttpInstance)
+  socket[kParser] = typeof esbuildDetection === 'undefined' && (client[kUseMilo] ?? getMiloEnabled())
+    ? new H1Parser(client, socket)
+    : new Parser(client, socket, llhttpInstance)
 
   util.addListener(socket, 'error', onHttpSocketError)
   util.addListener(socket, 'readable', onHttpSocketReadable)
@@ -14893,8 +15169,11 @@ function connectH1 (client, socket) {
           return true
         }
 
-        if (client[kRunning] > 0 && util.bodyLength(request.body) !== 0 &&
-          (util.isStream(request.body) || util.isAsyncIterable(request.body) || util.isFormDataLike(request.body))) {
+        if (
+          client[kRunning] > 0 &&
+          util.bodyLength(request.body) !== 0 &&
+          (util.isStream(request.body) || util.isAsyncIterable(request.body) || util.isFormDataLike(request.body))
+        ) {
           // Request with stream or iterator body can error while other requests
           // are inflight and indirectly error those as well.
           // Ensure this doesn't happen by waiting for inflight
@@ -14913,8 +15192,6 @@ function connectH1 (client, socket) {
 }
 
 function onHttpSocketError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   const parser = this[kParser]
 
   // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -15004,7 +15281,7 @@ function onSocketClose () {
 
 function clearIdleSocketValidation (socket) {
   if (socket[kIdleSocketValidationTimeout]) {
-    clearTimeout(socket[kIdleSocketValidationTimeout])
+    clearImmediate(socket[kIdleSocketValidationTimeout])
     socket[kIdleSocketValidationTimeout] = null
   }
 
@@ -15013,15 +15290,23 @@ function clearIdleSocketValidation (socket) {
 
 function scheduleIdleSocketValidation (client, socket) {
   socket[kIdleSocketValidation] = 1
-  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+  // Yield to the check phase (after poll) so unsolicited bytes / FIN / RST
+  // already pending on this idle keep-alive socket are processed before the
+  // next request is written (GHSA-35p6-xmwp-9g52).
+  //
+  // setTimeout(0) pays Node's ~1ms timer floor on every sequential reuse
+  // (#5493). setImmediate avoids that, but an *unref'd* Immediate lets poll
+  // block for ~500ms when the event loop is otherwise idle (#5600 / #5606).
+  // A ref'd Immediate both keeps the pending request alive and makes poll
+  // return immediately — the hybrid those issues asked for.
+  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
     socket[kIdleSocketValidationTimeout] = null
     socket[kIdleSocketValidation] = 2
 
     if (client[kSocket] === socket && !socket.destroyed) {
       client[kResume]()
     }
-  }, 0)
-  socket[kIdleSocketValidationTimeout].unref?.()
+  })
 }
 
 /**
@@ -15074,9 +15359,7 @@ function resumeH1 (client) {
     } else if (client[kRunning] > 0 && socket[kParser].statusCode < 200) {
       if (socket[kParser].timeoutType !== TIMEOUT_HEADERS) {
         const request = client[kQueue][client[kRunningIdx]]
-        const headersTimeout = request.headersTimeout != null
-          ? request.headersTimeout
-          : client[kHeadersTimeout]
+        const headersTimeout = request.headersTimeout != null ? request.headersTimeout : client[kHeadersTimeout]
         socket[kParser].setTimeout(headersTimeout, TIMEOUT_HEADERS)
       }
     }
@@ -15133,14 +15416,13 @@ function writeH1 (client, request) {
   // servers and corrupt connection state. Do not
   // re-use the connection for further requests.
 
-  const expectsPayload = (
+  const expectsPayload =
     method === 'PUT' ||
     method === 'POST' ||
     method === 'PATCH' ||
     method === 'QUERY' ||
     method === 'PROPFIND' ||
     method === 'PROPPATCH'
-  )
 
   if (util.isFormDataLike(body)) {
     if (!extractBody) {
@@ -15189,7 +15471,12 @@ function writeH1 (client, request) {
 
   // https://github.com/nodejs/undici/issues/2046
   // A user agent may send a Content-Length header with 0 value, this should be allowed.
-  if (shouldSendContentLength(method) && contentLength > 0 && request.contentLength !== null && request.contentLength !== contentLength) {
+  if (
+    shouldSendContentLength(method) &&
+    contentLength > 0 &&
+    request.contentLength !== null &&
+    request.contentLength !== contentLength
+  ) {
     if (client[kStrictContentLength]) {
       util.errorRequest(client, request, new RequestContentLengthMismatchError())
       return false
@@ -15205,7 +15492,7 @@ function writeH1 (client, request) {
    * @param {Error} [err]
    * @returns {void}
    */
-  const abort = (err) => {
+  const abort = err => {
     if (request.aborted || request.completed) {
       return
     }
@@ -15390,14 +15677,9 @@ function writeStream (abort, body, client, request, socket, contentLength, heade
 
     assert(socket.destroyed || (socket[kWriting] && client[kRunning] <= 1))
 
-    socket
-      .off('drain', onDrain)
-      .off('error', onFinished)
+    socket.off('drain', onDrain).off('error', onFinished)
 
-    body
-      .removeListener('data', onData)
-      .removeListener('end', onFinished)
-      .removeListener('close', onClose)
+    body.removeListener('data', onData).removeListener('end', onFinished).removeListener('close', onClose)
 
     if (!err) {
       try {
@@ -15416,19 +15698,13 @@ function writeStream (abort, body, client, request, socket, contentLength, heade
     }
   }
 
-  body
-    .on('data', onData)
-    .on('end', onFinished)
-    .on('error', onFinished)
-    .on('close', onClose)
+  body.on('data', onData).on('end', onFinished).on('error', onFinished).on('close', onClose)
 
   if (body.resume) {
     body.resume()
   }
 
-  socket
-    .on('drain', onDrain)
-    .on('error', onFinished)
+  socket.on('drain', onDrain).on('error', onFinished)
 
   if (body.errorEmitted ?? body.errored) {
     setImmediate(onFinished, body.errored)
@@ -15549,19 +15825,18 @@ async function writeIterable (abort, body, client, request, socket, contentLengt
     }
   }
 
-  const waitForDrain = () => new Promise((resolve, reject) => {
-    assert(callback === null)
+  const waitForDrain = () =>
+    new Promise((resolve, reject) => {
+      assert(callback === null)
 
-    if (socket[kError]) {
-      reject(socket[kError])
-    } else {
-      callback = resolve
-    }
-  })
+      if (socket[kError]) {
+        reject(socket[kError])
+      } else {
+        callback = resolve
+      }
+    })
 
-  socket
-    .on('close', onDrain)
-    .on('drain', onDrain)
+  socket.on('close', onDrain).on('drain', onDrain)
 
   const writer = new AsyncWriter({ abort, socket, request, contentLength, client, expectsPayload, header })
   try {
@@ -15580,9 +15855,7 @@ async function writeIterable (abort, body, client, request, socket, contentLengt
   } catch (err) {
     writer.destroy(err)
   } finally {
-    socket
-      .off('close', onDrain)
-      .off('drain', onDrain)
+    socket.off('close', onDrain).off('drain', onDrain)
   }
 }
 
@@ -15607,8 +15880,25 @@ class AsyncWriter {
     this.expectsPayload = expectsPayload
     this.header = header
     this.abort = abort
+    this.lengthMismatch = false
 
     socket[kWriting] = true
+  }
+
+  /**
+   * The body doesn't match the declared content-length and strictContentLength
+   * is off. Warn once, and mark the socket so it isn't reused: on the wire this
+   * request's body no longer ends where the server expects, so anything sent
+   * after it on the same connection would be misread.
+   * @returns {void}
+   */
+  onLengthMismatch () {
+    this.socket[kReset] = true
+
+    if (!this.lengthMismatch) {
+      this.lengthMismatch = true
+      process.emitWarning(new RequestContentLengthMismatchError())
+    }
   }
 
   /**
@@ -15626,7 +15916,7 @@ class AsyncWriter {
       return false
     }
 
-    const len = chunk instanceof Uint8Array ? chunk.byteLength : Buffer.byteLength(chunk)
+    let len = chunk instanceof Uint8Array ? chunk.byteLength : Buffer.byteLength(chunk)
     if (!len) {
       return true
     }
@@ -15637,7 +15927,17 @@ class AsyncWriter {
         throw new RequestContentLengthMismatchError()
       }
 
-      process.emitWarning(new RequestContentLengthMismatchError())
+      this.onLengthMismatch()
+
+      // Never write past the declared content-length. The server treats any
+      // extra bytes as the start of the next request, so a body could inject
+      // a request of its own (request smuggling).
+      const remaining = contentLength - bytesWritten
+      if (remaining === 0) {
+        return true
+      }
+      chunk = (typeof chunk === 'string' ? Buffer.from(chunk) : chunk).subarray(0, remaining)
+      len = remaining
     }
 
     socket.cork()
@@ -15712,9 +16012,12 @@ class AsyncWriter {
     if (contentLength !== null && bytesWritten !== contentLength) {
       if (client[kStrictContentLength]) {
         throw new RequestContentLengthMismatchError()
-      } else {
-        process.emitWarning(new RequestContentLengthMismatchError())
       }
+
+      // The body is shorter than declared, so the server is still waiting for
+      // the rest. Don't let the next request's bytes on this connection be
+      // read as the missing part of this body.
+      this.onLengthMismatch()
     }
 
     if (socket[kParser].timeout && socket[kParser].timeoutType === TIMEOUT_HEADERS) {
@@ -15757,12 +16060,14 @@ const { pipeline } = __nccwpck_require__(7075)
 const util = __nccwpck_require__(3440)
 const {
   RequestContentLengthMismatchError,
+  ResponseContentLengthMismatchError,
   RequestAbortedError,
   SocketError,
   InformationalError,
   InvalidArgumentError,
   HeadersTimeoutError,
-  BodyTimeoutError
+  BodyTimeoutError,
+  ResponseExceededMaxSizeError
 } = __nccwpck_require__(8707)
 const {
   kUrl,
@@ -15791,12 +16096,12 @@ const {
   kRemoteSettings,
   kHTTP2Stream,
   kHTTP2SessionState,
-  kHTTP2Options
+  kHTTP2Options,
+  kMaxResponseSize
 } = __nccwpck_require__(6443)
 const { channels } = __nccwpck_require__(2414)
 
 const kOpenStreams = Symbol('open streams')
-const kRequestStreamId = Symbol('request stream id')
 const kRequestStream = Symbol('request stream')
 const kRequestStreamCleanup = Symbol('request stream cleanup')
 const kRequestStreamState = Symbol('request stream state')
@@ -15809,6 +16114,15 @@ const kRefusedStreamRetry = Symbol('refused stream retry')
 // an unbounded connect/refuse/reconnect loop that never settles and starves the
 // event loop.
 const MAX_GOAWAY_REPLAY_ATTEMPTS = 1
+
+// RFC 9113 section 6.2. node:http2 reports frame types as raw numbers.
+const HTTP2_FRAME_TYPE_HEADERS = 1
+
+// Lower bound on how long a liveness PING may take to be acked. Stream
+// timeouts can be tiny (tens of ms), while an ack on a live connection can take
+// longer than that on a loaded event loop; without a floor a slow but healthy
+// connection would be torn down.
+const MIN_PROBE_TIMEOUT = 1e3
 
 let extractBody
 
@@ -15876,7 +16190,9 @@ function getGoAwayPendingIdx (client, lastStreamID) {
       continue
     }
 
-    if (typeof request[kRequestStreamId] !== 'number' || request[kRequestStreamId] > maxAcceptedStreamID) {
+    // A pending stream may not have had an ID when it was bound to the request.
+    const streamId = request[kRequestStream]?.id
+    if (typeof streamId !== 'number' || streamId > maxAcceptedStreamID) {
       return i
     }
   }
@@ -15885,7 +16201,6 @@ function getGoAwayPendingIdx (client, lastStreamID) {
 }
 
 function detachRequestFromStream (request) {
-  request[kRequestStreamId] = null
   request[kRequestStream] = null
   request[kRequestStreamCleanup] = null
 }
@@ -15895,7 +16210,6 @@ function bindRequestToStream (request, stream, cleanup) {
   const previousStream = request[kRequestStream]
   detachRequestFromStream(request)
   previousCleanup?.(previousStream)
-  request[kRequestStreamId] = stream.id
   request[kRequestStream] = stream
   request[kRequestStreamCleanup] = cleanup
 }
@@ -15941,6 +16255,11 @@ function canReplayRequest (request) {
   const { body } = request
 
   return body == null || util.isBuffer(body) || util.isBlobLike(body)
+}
+
+function hasResponseStarted (request) {
+  const state = request[kRequestStream]?.[kRequestStreamState]
+  return state?.responseReceived === true
 }
 
 // Count a GOAWAY refusal against the request's replay budget. A peer that
@@ -15991,8 +16310,14 @@ function severRequestStream (stream) {
     closeStreamSession(stream)
   }
 
+  // #5936: Node can still deliver a session-level error to a native stream
+  // after undici has stopped tracking it (e.g. on idle session teardown). Keep
+  // a persistent noop error sink so the 'error' event is never emitted with no
+  // listener, which would crash the process. A single sink is enough even if
+  // one was already attached by the onError path, so clear it first.
   if (!stream.destroyed && !stream.closed) {
-    stream.once('error', noop)
+    stream.off('error', noop)
+    stream.on('error', noop)
   }
 }
 
@@ -16021,6 +16346,9 @@ function connectH2 (client, socket) {
     // Armed while the peer advertises MAX_CONCURRENT_STREAMS = 0 and we have
     // work that cannot start. See setNoStreamsTimeout.
     noStreamsTimeout: null,
+    // Armed while a PING checks whether the peer is still there after a
+    // stream timed out. See probeHttp2Session.
+    probeTimeout: null,
     // Sockets start out ref'd. Session ref/unref proxies to the socket, so a
     // single cached flag lets us skip redundant uv ref/unref calls, provided
     // every ref/unref of the session or its socket goes through
@@ -16105,6 +16433,11 @@ function connectH2 (client, socket) {
         return true
       }
 
+      // Do not open streams on a connection that may be dead.
+      if (session[kHTTP2SessionState].probeTimeout != null) {
+        return true
+      }
+
       if (client[kRunning] >= client[kMaxConcurrentStreams]) {
         return true
       }
@@ -16156,7 +16489,8 @@ function resumeH2 (client) {
   const session = client[kHTTP2Session]
 
   if (socket?.destroyed === false) {
-    if (client[kSize] === 0 || client[kMaxConcurrentStreams] === 0) {
+    // After an upgrade the queue is empty but its stream is still in use, so never unref while a stream is open.
+    if (session[kOpenStreams] === 0 && client[kSize] === 0) {
       unrefH2Session(session)
     } else {
       refH2Session(session)
@@ -16237,6 +16571,60 @@ function onNoStreamsTimeout (session) {
   resetHttp2Session(session, err)
 }
 
+// A stream timeout only resets that stream, unlike HTTP/1.1 which destroys the
+// socket. If the connection itself silently died (dropped by a NAT or load
+// balancer, a hung peer), every new stream would time out in turn and the
+// session would never be replaced. Ask the peer for a PING ack within the
+// timeout that just fired (but at least MIN_PROBE_TIMEOUT): if it answers, only
+// that request was slow; if not, drop the session so queued requests move to a
+// fresh connection.
+function probeHttp2Session (session, timeout) {
+  const state = session[kHTTP2SessionState]
+
+  if (state.probeTimeout != null || session.closed || session.destroyed) {
+    return
+  }
+
+  try {
+    session.ping(onHttp2ProbeAck.bind(session))
+  } catch {
+    // The session is going away on its own.
+    return
+  }
+
+  state.probeTimeout = setTimeout(onHttp2ProbeTimeout, Math.max(timeout, MIN_PROBE_TIMEOUT), session).unref()
+}
+
+function clearHttp2ProbeTimeout (session) {
+  const state = session[kHTTP2SessionState]
+
+  if (state?.probeTimeout != null) {
+    clearTimeout(state.probeTimeout)
+    state.probeTimeout = null
+  }
+}
+
+function onHttp2ProbeAck () {
+  if (this[kHTTP2SessionState].probeTimeout == null) {
+    return
+  }
+
+  clearHttp2ProbeTimeout(this)
+  this[kClient][kResume]()
+}
+
+function onHttp2ProbeTimeout (session) {
+  session[kHTTP2SessionState].probeTimeout = null
+
+  if (session.closed || session.destroyed) {
+    return
+  }
+
+  const err = new SocketError('HTTP/2: connection unresponsive', util.getSocketInfo(session[kSocket]))
+  session[kError] = err
+  resetHttp2Session(session, err)
+}
+
 function clearHttp2IdleTimeout (session) {
   const state = session[kHTTP2SessionState]
 
@@ -16291,8 +16679,14 @@ function applyConnectionWindowSize (connectionWindowSize) {
 }
 
 function onHttp2RemoteSettings (settings) {
-  // Fallbacks are a safe bet, remote setting will always override
-  this[kClient][kMaxConcurrentStreams] = settings.maxConcurrentStreams ?? this[kClient][kMaxConcurrentStreams]
+  const client = this[kClient]
+
+  // The configured maxConcurrentStreams (default 100) is the client's own
+  // ceiling. The server's SETTINGS_MAX_CONCURRENT_STREAMS can lower it, but
+  // must not raise it: a default Node.js server advertises 2^32-1.
+  const localMaxConcurrentStreams = client[kHTTP2Options].maxConcurrentStreams
+  const remoteMaxConcurrentStreams = settings.maxConcurrentStreams ?? client[kMaxConcurrentStreams] ?? localMaxConcurrentStreams
+  client[kMaxConcurrentStreams] = Math.min(remoteMaxConcurrentStreams, localMaxConcurrentStreams)
   /**
    * From RFC-8441
    * A sender MUST NOT send a SETTINGS_ENABLE_CONNECT_PROTOCOL parameter
@@ -16337,8 +16731,6 @@ function onHttp2SendPing (session) {
 }
 
 function onHttp2SessionError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kSocket][kError] = err
 
   if (this[kReceivedGoAway]) {
@@ -16390,18 +16782,17 @@ function onHttp2SessionGoAway (errorCode, lastStreamID) {
     const request = client[kQueue][i]
 
     if (request != null) {
+      // Read before detaching, which drops the stream state.
+      const responseStarted = hasResponseStarted(request)
+
       streamsToClose.push(detachRequestStreamForClose(request))
 
-      if (canReplayRequest(request) && registerGoAwayRefusal(request)) {
+      if (!responseStarted && canReplayRequest(request) && registerGoAwayRefusal(request)) {
         retriableRequests.push(request)
       } else {
         util.errorRequest(client, request, err)
       }
     }
-  }
-
-  for (let i = 0; i < streamsToClose.length; i++) {
-    closeStream(streamsToClose[i])
   }
 
   if (pendingIdx !== previousPendingIdx) {
@@ -16410,20 +16801,33 @@ function onHttp2SessionGoAway (errorCode, lastStreamID) {
     client[kQueue].push(...retriableRequests, ...remainingPendingRequests)
   }
 
+  // Publish the rebuilt queue and detach the session before closing anything.
+  // A synchronous sibling HEADERS frameError can requeue an accepted-but-unsent
+  // request and resume the client. It must see the final indices and must not
+  // dispatch its retry on the session that is being retired.
+  client[kPendingIdx] = pendingIdx
+
   if (client[kHTTP2Session] === this) {
     client[kSocket] = null
     client[kHTTPContext] = null
     client[kHTTP2Session] = null
   }
 
+  if (this[kOpenStreams] === 0) {
+    unrefH2Session(this)
+  }
+
   clearHttp2IdleTimeout(this)
   clearNoStreamsTimeout(this)
+  clearHttp2ProbeTimeout(this)
+
+  for (let i = 0; i < streamsToClose.length; i++) {
+    closeStream(streamsToClose[i])
+  }
 
   if (!this.closed && !this.destroyed) {
     this.close()
   }
-
-  client[kPendingIdx] = pendingIdx
 
   client.emit('disconnect', client[kUrl], [client], err)
 
@@ -16443,6 +16847,7 @@ function onHttp2SessionClose () {
 
   clearHttp2IdleTimeout(this)
   clearNoStreamsTimeout(this)
+  clearHttp2ProbeTimeout(this)
 
   if (state.ping.interval != null) {
     clearInterval(state.ping.interval)
@@ -16497,8 +16902,6 @@ function onHttp2SocketClose () {
 }
 
 function onHttp2SocketError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kError] = err
 
   if (this[kHTTP2Session]?.[kReceivedGoAway]) {
@@ -16520,18 +16923,20 @@ function noop () {}
 
 function closeStreamSession (stream) {
   const session = stream[kHTTP2Session]
+  const client = session[kClient]
 
   stream[kHTTP2Session] = null
   session[kOpenStreams] -= 1
-  if (session[kOpenStreams] === 0) {
+  // A session that received GOAWAY does not need to stay ref'd for queued requests.
+  if (session[kOpenStreams] === 0 && (client[kSize] === 0 || session[kReceivedGoAway])) {
     unrefH2Session(session)
     setHttp2IdleTimeout(session)
   }
 }
 
 function onUpgradeStreamClose () {
-  this.off('error', noop)
-
+  // #5936: Retain the noop error sink so a session-level error delivered to
+  // this stream after undici detaches it cannot crash via an unhandled 'error'.
   const state = this[kRequestStreamState]
   this[kRequestStreamState] = null
 
@@ -16582,25 +16987,27 @@ function buildRequestHeaders (reqHeaders) {
   for (let n = 0; n < reqHeaders.length; n += 2) {
     const key = reqHeaders[n + 0]
     const val = reqHeaders[n + 1]
-    const current = headers[key]
+    // Reading headers[key] directly resolves `__proto__` through the prototype
+    // chain instead of reporting the header as absent.
+    const current = Object.hasOwn(headers, key) ? headers[key] : undefined
 
     if (key === 'cookie') {
       if (current != null) {
-        headers[key] = Array.isArray(current) ? (current.push(val), current) : [current, val]
+        util.setHeader(headers, key, Array.isArray(current) ? (current.push(val), current) : [current, val])
       } else {
-        headers[key] = val
+        util.setHeader(headers, key, val)
       }
 
       continue
     }
 
     if (typeof val === 'string') {
-      headers[key] = current ? `${current}, ${val}` : val
+      util.setHeader(headers, key, current ? `${current}, ${val}` : val)
       continue
     }
 
     for (let i = 0; i < val.length; i++) {
-      headers[key] = headers[key] ? `${headers[key]}, ${val[i]}` : val[i]
+      util.setHeader(headers, key, Object.hasOwn(headers, key) ? `${headers[key]}, ${val[i]}` : val[i])
     }
   }
 
@@ -16633,8 +17040,11 @@ function releaseUpgradeStream (stream) {
 
   removeUpgradeStreamListeners(stream)
 
+  // #5936: removeUpgradeStreamListeners() dropped the noop sink; re-attach a
+  // persistent one so a late session-level error on this (possibly still native
+  // tracked) stream cannot crash via an unhandled 'error'.
   if (!stream.destroyed && !stream.closed) {
-    stream.once('error', noop)
+    stream.on('error', noop)
   }
 }
 
@@ -16681,9 +17091,14 @@ function onUpgradeResponse (headers, _flags) {
   const statusCode = headers[HTTP2_HEADER_STATUS]
   delete headers[HTTP2_HEADER_STATUS]
 
-  request.onRequestUpgrade(statusCode, headers, stream)
+  try {
+    request.onRequestUpgrade(statusCode, headers, stream)
+  } catch (err) {
+    state.abort(err)
+    return
+  }
 
-  if (request.aborted || request.completed) {
+  if (request.aborted) {
     return
   }
 
@@ -16774,13 +17189,16 @@ function writeH2 (client, request) {
   const state = {
     abort: null,
     body: request.body,
+    bytesRead: 0,
     client,
     contentLength: null,
     expectsPayload: false,
+    maxResponseSize: client[kMaxResponseSize],
     request,
     headersTimeout,
     bodyTimeout,
     requestFinalized: false,
+    responseContentLength: null,
     responseReceived: false,
     bodySent: false,
     pendingEnd: false,
@@ -17012,6 +17430,7 @@ function writeH2 (client, request) {
   // become unreachable once the stream closes, so plain `on` avoids the
   // per-listener `once` wrapper allocation.
   stream.on('response', onResponse)
+  stream.on('headers', onInterimResponse)
   stream.on('end', onEnd)
   stream.on('error', onError)
   stream.on('frameError', onFrameError)
@@ -17032,6 +17451,7 @@ function removeRequestStreamListeners (stream) {
   stream.off('error', noop)
   stream.off('continue', writeBodyH2)
   stream.off('response', onResponse)
+  stream.off('headers', onInterimResponse)
   stream.off('end', onEnd)
   stream.off('error', onError)
   stream.off('frameError', onFrameError)
@@ -17057,16 +17477,76 @@ function releaseRequestStream (stream) {
     detachRequestFromStream(request)
   }
 
-  // A closed or destroyed stream cannot emit further events; leaving the
-  // listeners in place saves the removal scans (they are collected with
-  // the stream). All handlers bail out when the stream state is gone.
+  // #5936: Node can deliver a session-level error to a released stream before
+  // its native handle is dropped (e.g. on idle session teardown). Attach a
+  // persistent noop error sink so a late 'error' always has a listener and
+  // cannot crash the process. A closed/destroyed stream cannot emit further
+  // events and is no longer tracked natively, so skip the listener teardown.
   if (!stream.destroyed && !stream.closed) {
     removeRequestStreamListeners(stream)
-    stream.once('error', noop)
+    stream.on('error', noop)
   }
 }
 
 function onData (chunk) {
+  const stream = this
+  const state = stream[kRequestStreamState]
+
+  if (state == null) {
+    return
+  }
+
+  const { request, maxResponseSize, responseContentLength } = state
+
+  if (request.aborted || request.completed) {
+    return
+  }
+
+  if (responseContentLength != null && state.bytesRead + chunk.length > responseContentLength) {
+    state.abort(new ResponseContentLengthMismatchError())
+    return
+  }
+
+  if (maxResponseSize > -1 && state.bytesRead + chunk.length > maxResponseSize) {
+    // Unlike HTTP/1.1, which destroys the socket because it cannot abandon one
+    // response without losing framing, resetting the offending stream leaves
+    // the session usable for its siblings.
+    state.abort(new ResponseExceededMaxSizeError())
+    return
+  }
+
+  state.bytesRead += chunk.length
+
+  if (request.onResponseData(chunk) === false) {
+    pauseResponseStream(stream, state)
+  }
+}
+
+// The body timeout measures how long the peer takes to send data. While the
+// consumer applies backpressure the peer can't send (it's out of flow-control
+// window), and Http2Stream's timer, which counts stream activity, would fire.
+// Stop it while paused and start a fresh one on resume, like HTTP/1.1, which
+// ignores the body timeout while its parser is paused.
+function pauseResponseStream (stream, state) {
+  stream.pause()
+  if (state.bodyTimeout) {
+    stream.setTimeout(0)
+  }
+}
+
+// Passed to the handler as its resume callback, bound to the stream.
+function resumeResponseStream () {
+  const stream = this
+  const state = stream[kRequestStreamState]
+
+  if (state != null && state.bodyTimeout && stream.isPaused()) {
+    stream.setTimeout(state.bodyTimeout)
+  }
+
+  stream.resume()
+}
+
+function onInterimResponse (headers) {
   const stream = this
   const state = stream[kRequestStreamState]
 
@@ -17080,9 +17560,14 @@ function onData (chunk) {
     return
   }
 
-  if (request.onResponseData(chunk) === false) {
-    stream.pause()
-  }
+  // node http2 emits 'headers' for interim (1xx) informational responses,
+  // while the final response arrives via 'response'. Forward these to the
+  // handler so that onInfo is invoked, matching the HTTP/1 behaviour and the
+  // documented onInfo contract.
+  const statusCode = headers[HTTP2_HEADER_STATUS]
+  delete headers[HTTP2_HEADER_STATUS]
+
+  request.onResponseStart(Number(statusCode), headers, noop, '')
 }
 
 function onResponse (headers) {
@@ -17104,10 +17589,19 @@ function onResponse (headers) {
     stream.end()
   }
 
-  const statusCode = headers[HTTP2_HEADER_STATUS]
+  const statusCode = Number(headers[HTTP2_HEADER_STATUS])
   delete headers[HTTP2_HEADER_STATUS]
   request.onResponseStarted()
   state.responseReceived = true
+
+  // A Content-Length in HEAD and 304 responses describes the selected
+  // representation rather than DATA on this stream. Successful CONNECT uses
+  // the upgrade path above; all other final responses use Content-Length as
+  // their DATA payload length.
+  if (request.method !== 'HEAD' && statusCode !== 304) {
+    const contentLength = headers[HTTP2_HEADER_CONTENT_LENGTH]
+    state.responseContentLength = contentLength == null ? null : Number(contentLength)
+  }
 
   if (state.headersTimeout || state.bodyTimeout) {
     stream.setTimeout(state.bodyTimeout)
@@ -17126,8 +17620,8 @@ function onResponse (headers) {
     return
   }
 
-  if (request.onResponseStart(Number(statusCode), headers, stream.resume.bind(stream), '') === false) {
-    stream.pause()
+  if (request.onResponseStart(statusCode, headers, resumeResponseStream.bind(stream), '') === false) {
+    pauseResponseStream(stream, state)
   }
 
   stream.on('data', onData)
@@ -17149,6 +17643,11 @@ function onEnd () {
   // trailers on the state by now, so completing here still delivers them.
   if (state.responseReceived) {
     if (!request.aborted && !request.completed) {
+      if (state.responseContentLength != null && state.bytesRead !== state.responseContentLength) {
+        state.abort(new ResponseContentLengthMismatchError())
+        return
+      }
+
       state.pendingEnd = true
 
       // Complete on 'end': a blocked event loop can keep the stream's 'close'
@@ -17180,10 +17679,43 @@ function retryRefusedStream (stream, state) {
   // SHOULD NOT automatically retry the same request more than once.
   request[kRefusedStreamRetry] = true
 
+  // The peer only reset this stream, so the HTTP/2 session remains usable for
+  // the retry.
+  requeueStreamRequest(client, state)
+
+  return true
+}
+
+// nghttp2 refuses to send the HEADERS of a stream opened before a GOAWAY was
+// received but flushed after it. The peer never saw the request, so it can be
+// replayed on a new connection whatever its method. A GOAWAY whose
+// lastStreamID covers the stream (e.g. 2^31-1, a graceful shutdown notice)
+// leaves the stream attached to the session, so this is the only signal.
+function retryUnsentStream (state) {
+  const { client, request, session } = state
+
+  if (
+    !session[kReceivedGoAway] ||
+    state.responseReceived ||
+    request.aborted ||
+    request.completed ||
+    !canReplayRequest(request) ||
+    !registerGoAwayRefusal(request)
+  ) {
+    return false
+  }
+
+  requeueStreamRequest(client, state)
+
+  return true
+}
+
+function requeueStreamRequest (client, state) {
+  const { request } = state
+
   // Detach the failed attempt before moving the request back to the pending
-  // queue. The peer only reset this stream, so the HTTP/2 session remains
-  // usable for the retry. Severing also drops the 'close' listener, so the
-  // abandoned stream cannot later complete the retried request.
+  // queue. Severing also drops the 'close' listener, so the abandoned stream
+  // cannot later complete the retried request.
   detachRequestStreamForClose(request)
   state.stream = null
   state.requestFinalized = true
@@ -17191,8 +17723,6 @@ function retryRefusedStream (stream, state) {
   completeRequest(client, request)
   client[kQueue].splice(client[kPendingIdx], 0, request)
   client[kResume]()
-
-  return true
 }
 
 function onError (err) {
@@ -17204,6 +17734,17 @@ function onError (err) {
   }
 
   stream.off('error', onError)
+  // #5936: The stream has already errored, but Node may destroy it again with a
+  // session-level error before the native handle is released. Keep a persistent
+  // noop error sink so that re-delivery cannot go unhandled.
+  stream.on('error', noop)
+
+  // Node's HTTP/2 implementation can turn an incomplete Content-Length body
+  // into a protocol stream error instead of emitting 'end'. Prefer the
+  // content-length mismatch error when the received byte count proves it.
+  if (state.responseContentLength != null && state.bytesRead !== state.responseContentLength) {
+    err = new ResponseContentLengthMismatchError()
+  }
 
   if (typeof stream.rstCode === 'number' && stream.rstCode !== NGHTTP2_NO_ERROR) {
     err.http2ErrorCode = stream.rstCode
@@ -17228,6 +17769,11 @@ function onFrameError (type, code) {
   }
 
   stream.off('frameError', onFrameError)
+
+  if (type === HTTP2_FRAME_TYPE_HEADERS && retryUnsentStream(state)) {
+    return
+  }
+
   state.abort(new InformationalError(`HTTP/2: "frameError" received - type ${type}, code ${code}`))
 }
 
@@ -17246,9 +17792,14 @@ function onTimeout () {
   // Remove self so timeout doesn't fire again after we handle it
   stream.off('timeout', onTimeout)
 
-  const err = state.responseReceived
-    ? new BodyTimeoutError(`HTTP/2: "stream timeout after ${state.bodyTimeout}"`)
-    : new HeadersTimeoutError(`HTTP/2: "headers timeout after ${state.headersTimeout}"`)
+  const { responseReceived, session, bodyTimeout, headersTimeout } = state
+  const err = responseReceived
+    ? new BodyTimeoutError(`HTTP/2: "stream timeout after ${bodyTimeout}"`)
+    : new HeadersTimeoutError(`HTTP/2: "headers timeout after ${headersTimeout}"`)
+
+  // Probe before aborting: completing the request resumes the queue, which
+  // must not open new streams until the peer has proven it is alive.
+  probeHttp2Session(session, responseReceived ? bodyTimeout : headersTimeout)
   state.abort(err)
 }
 
@@ -17554,7 +18105,8 @@ const {
   kMaxConcurrentStreams,
   kHostAuthority,
   kResume,
-  kHTTP2Options
+  kHTTP2Options,
+  kUseMilo
 } = __nccwpck_require__(6443)
 const connectH1 = __nccwpck_require__(637)
 const connectH2 = __nccwpck_require__(8788)
@@ -17636,8 +18188,10 @@ class Client extends DispatcherBase {
     initialWindowSize,
     connectionWindowSize,
     pingInterval,
+    useMilo,
     webSocket,
-    h2Options
+    h2Options,
+    eventSource
   } = {}) {
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -17737,7 +18291,7 @@ class Client extends DispatcherBase {
           throw new InvalidArgumentError('h2Options.settings.initialWindowSize must be a positive integer, greater than 0')
         }
 
-        if (h2Options.maxConcurrentStreams != null && (!Number.isInteger(h2Options.connectionWindowSize) || h2Options.maxConcurrentStreams < 1)) {
+        if (h2Options.maxConcurrentStreams != null && (!Number.isInteger(h2Options.maxConcurrentStreams) || h2Options.maxConcurrentStreams < 1)) {
           throw new InvalidArgumentError('h2Options.maxConcurrentStreams must be a positive integer, greater than 0')
         }
 
@@ -17776,7 +18330,7 @@ class Client extends DispatcherBase {
       }
     }
 
-    super({ webSocket })
+    super({ webSocket, eventSource })
 
     if (typeof connect !== 'function') {
       connect = buildConnector({
@@ -17834,6 +18388,7 @@ class Client extends DispatcherBase {
         initialWindowSize: h2Options?.initialWindowSize ?? initialWindowSize ?? 262144
       }
     }
+    this[kUseMilo] = useMilo
 
     // kQueue is built up of 3 sections separated by
     // the kRunningIdx and kPendingIdx indices.
@@ -18199,6 +18754,11 @@ function _resume (client, sync) {
       return
     }
 
+    if (request.aborted) {
+      client[kQueue].splice(client[kPendingIdx], 1)
+      continue
+    }
+
     if (client[kUrl].protocol === 'https:' && client[kServerName] !== request.servername) {
       if (client[kRunning] > 0) {
         return
@@ -18247,6 +18807,7 @@ module.exports = Client
 
 
 
+const buffer = __nccwpck_require__(4573)
 const Dispatcher = __nccwpck_require__(883)
 const {
   ClientDestroyedError,
@@ -18254,10 +18815,12 @@ const {
   InvalidArgumentError
 } = __nccwpck_require__(8707)
 const { kDestroy, kClose, kClosed, kDestroyed, kDispatch } = __nccwpck_require__(6443)
+const { defaultWebSocketMaxFragments, defaultWebSocketMaxPayloadSize } = __nccwpck_require__(735)
 
 const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kWebSocketOptions = Symbol('webSocketOptions')
+const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   /** @type {boolean} */
@@ -18278,15 +18841,25 @@ class DispatcherBase extends Dispatcher {
   constructor (opts) {
     super()
     this[kWebSocketOptions] = opts?.webSocket ?? {}
+    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   /**
-   * @returns {import('../../types/dispatcher').WebSocketOptions}
+   * @returns {import('../../types/client').Client.WebSocketOptions}
    */
   get webSocketOptions () {
     return {
-      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
-      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024 // 128 MB default
+      maxFragments: this[kWebSocketOptions].maxFragments ?? defaultWebSocketMaxFragments,
+      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? defaultWebSocketMaxPayloadSize
+    }
+  }
+
+  /**
+   * @returns {import('../../types/client').Client.EventSourceOptions}
+   */
+  get eventSourceOptions () {
+    return {
+      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -18439,6 +19012,7 @@ module.exports = DispatcherBase
 
 
 const EventEmitter = __nccwpck_require__(8474)
+const { kOriginless, kUrl } = __nccwpck_require__(6443)
 
 class Dispatcher extends EventEmitter {
   dispatch () {
@@ -18456,6 +19030,10 @@ class Dispatcher extends EventEmitter {
   compose (...args) {
     // So we handle [interceptor1, interceptor2] or interceptor1, interceptor2, ...
     const interceptors = Array.isArray(args[0]) ? args[0] : args
+    // null disables origin-dependent interceptors; undefined uses opts.origin.
+    const interceptorOrigin = this[kOriginless] === true
+      ? null
+      : this[kUrl]?.origin
     let dispatch = this.dispatch.bind(this)
 
     for (const interceptor of interceptors) {
@@ -18467,11 +19045,20 @@ class Dispatcher extends EventEmitter {
         throw new TypeError(`invalid interceptor, expected function received ${typeof interceptor}`)
       }
 
-      dispatch = interceptor(dispatch)
+      dispatch = interceptor(dispatch, interceptorOrigin)
 
       if (dispatch == null || typeof dispatch !== 'function' || dispatch.length !== 2) {
         throw new TypeError('invalid interceptor')
       }
+    }
+
+    const originalDispatch = dispatch
+    const self = this
+    dispatch = function (opts, handler) {
+      if (opts && typeof opts === 'object' && !opts.origin && self[kUrl]) {
+        opts = Object.assign({}, opts, { origin: self[kUrl].origin })
+      }
+      return originalDispatch(opts, handler)
     }
 
     return new Proxy(this, {
@@ -18493,6 +19080,7 @@ module.exports = Dispatcher
 const Dispatcher = __nccwpck_require__(883)
 const { InvalidArgumentError } = __nccwpck_require__(8707)
 const { toRawHeaders } = __nccwpck_require__(3440)
+const { kOriginless, kUrl } = __nccwpck_require__(6443)
 
 class LegacyHandlerWrapper {
   #handler
@@ -18506,12 +19094,16 @@ class LegacyHandlerWrapper {
   }
 
   onRequestUpgrade (controller, statusCode, headers, socket) {
-    const rawHeaders = controller?.rawHeaders ?? toRawHeaders(headers ?? {})
+    const rawHeaders = Array.isArray(controller?.rawHeaders)
+      ? controller.rawHeaders
+      : toRawHeaders(controller?.rawHeaders ?? headers ?? {})
     this.#handler.onUpgrade?.(statusCode, rawHeaders, socket)
   }
 
   onResponseStart (controller, statusCode, headers, statusMessage) {
-    const rawHeaders = controller?.rawHeaders ?? toRawHeaders(headers ?? {})
+    const rawHeaders = Array.isArray(controller?.rawHeaders)
+      ? controller.rawHeaders
+      : toRawHeaders(controller?.rawHeaders ?? headers ?? {})
 
     if (this.#handler.onHeaders?.(statusCode, rawHeaders, () => controller.resume(), statusMessage) === false) {
       controller.pause()
@@ -18525,7 +19117,9 @@ class LegacyHandlerWrapper {
   }
 
   onResponseEnd (controller, trailers) {
-    const rawTrailers = controller?.rawTrailers ?? toRawHeaders(trailers ?? {})
+    const rawTrailers = Array.isArray(controller?.rawTrailers)
+      ? controller.rawTrailers
+      : toRawHeaders(controller?.rawTrailers ?? trailers ?? {})
     this.#handler.onComplete?.(rawTrailers)
   }
 
@@ -18561,6 +19155,8 @@ class Dispatcher1Wrapper extends Dispatcher {
     }
 
     this.#dispatcher = dispatcher
+    this[kUrl] = dispatcher[kUrl]
+    this[kOriginless] = dispatcher[kOriginless]
   }
 
   static wrapHandler (handler) {
@@ -18583,6 +19179,17 @@ class Dispatcher1Wrapper extends Dispatcher {
     }
 
     return this.#dispatcher.dispatch(opts, Dispatcher1Wrapper.wrapHandler(handler))
+  }
+
+  // Older undici versions read WebSocket and EventSource receive limits from
+  // the (legacy) global dispatcher, which is this wrapper, so report the
+  // wrapped dispatcher's settings.
+  get webSocketOptions () {
+    return this.#dispatcher.webSocketOptions
+  }
+
+  get eventSourceOptions () {
+    return this.#dispatcher.eventSourceOptions
   }
 
   close (...args) {
@@ -18620,7 +19227,7 @@ class EnvHttpProxyAgent extends DispatcherBase {
   #opts = null
 
   constructor (opts = {}) {
-    super()
+    super(opts)
     this.#opts = opts
 
     const { httpProxy, httpsProxy, noProxy, ...agentOpts } = opts
@@ -18673,6 +19280,13 @@ class EnvHttpProxyAgent extends DispatcherBase {
     // brackets from IPv6 literals (e.g. "[::1]" -> "::1") so that the
     // result matches the unbracketed form stored by #parseNoProxy.
     hostname = hostname.replace(/:\d*$/, '').replace(/^\[(.+)\]$/, '$1').toLowerCase()
+    // Drop a trailing dot: it only marks the fully qualified form of a domain
+    // name ("example.com." and "example.com" are the same name, RFC 1034 root
+    // label). This runs on every dispatch, so it is a charCode check rather
+    // than a third regex. `length > 1` leaves the degenerate host "." alone.
+    if (hostname.length > 1 && hostname.charCodeAt(hostname.length - 1) === 46) {
+      hostname = hostname.slice(0, -1)
+    }
     port = Number.parseInt(port, 10) || DEFAULT_PORTS[protocol] || 0
     if (!this.#shouldProxy(hostname, port)) {
       return this[kNoProxyAgent]
@@ -18691,17 +19305,25 @@ class EnvHttpProxyAgent extends DispatcherBase {
     if (this.#noProxyEntries.length === 0) {
       return true // Always proxy if NO_PROXY is not set or empty.
     }
-    if (this.#noProxyValue === '*') {
-      return false // Never proxy if wildcard is set.
-    }
 
     for (let i = 0; i < this.#noProxyEntries.length; i++) {
       const entry = this.#noProxyEntries[i]
+      // A bare `*` entry matches all hosts regardless of its position or the
+      // surrounding whitespace (e.g. ` * ` or `none.invalid,*`). If a port is
+      // attached (`*:80`) it only bypasses that port.
+      if (entry.hostname === '*') {
+        if (entry.port && entry.port !== port) {
+          continue
+        }
+        return false // Never proxy if a wildcard entry is present.
+      }
       if (entry.port && entry.port !== port) {
         continue // Skip if ports don't match.
       }
-      // Don't proxy if the hostname is equal with the no_proxy host.
-      if (hostname === entry.hostname) {
+      // Don't proxy if the hostname is equal with the no_proxy host. A
+      // `*.example.com` wildcard matches subdomains only, not the apex
+      // `example.com`, so exact matches are skipped for wildcard entries.
+      if (!entry.wildcard && hostname === entry.hostname) {
         return false
       }
       // Don't proxy if the hostname is the subdomain of the no_proxy host.
@@ -18746,10 +19368,17 @@ class EnvHttpProxyAgent extends DispatcherBase {
         port = parsed ? Number.parseInt(parsed[2], 10) : 0
       }
 
+      // A leading `*` marks a subdomain wildcard (`*.example.com`), distinct
+      // from a plain or leading-dot suffix (`example.com` / `.example.com`)
+      // which also matches the apex. `*.example.com` must only match
+      // subdomains, never the apex `example.com` itself.
+      const wildcard = entry.charCodeAt(0) === 42 /* '*' */
+
       noProxyEntries.push({
-        // strip leading dot or asterisk with dot
-        hostname: hostname.replace(/^\*?\./, '').toLowerCase(),
-        port
+        // strip leading dot or asterisk with dot, and any trailing dot
+        hostname: hostname.replace(/^\*?\./, '').replace(/^(.+)\.$/, '$1').toLowerCase(),
+        port,
+        wildcard
       })
     }
 
@@ -18974,11 +19603,1084 @@ module.exports = H2CClient
 
 /***/ }),
 
+/***/ 1969:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+
+
+const assert = __nccwpck_require__(4589)
+const util = __nccwpck_require__(3440)
+const timers = __nccwpck_require__(6603)
+const {
+  HeadersTimeoutError,
+  HeadersOverflowError,
+  SocketError,
+  InformationalError,
+  BodyTimeoutError,
+  HTTPParserError,
+  ResponseContentLengthMismatchError,
+  ResponseExceededMaxSizeError
+} = __nccwpck_require__(8707)
+const {
+  kUrl,
+  kReset,
+  kClient,
+  kParser,
+  kBlocking,
+  kRunning,
+  kWriting,
+  kQueue,
+  kKeepAliveDefaultTimeout,
+  kRunningIdx,
+  kError,
+  kPipelining,
+  kSocket,
+  kKeepAliveTimeoutValue,
+  kKeepAliveMaxTimeout,
+  kKeepAliveTimeoutThreshold,
+  kBodyTimeout,
+  kMaxResponseSize,
+  kResume,
+  kHTTPContext,
+  kMaxHeadersSize
+} = __nccwpck_require__(6443)
+
+const FastBuffer = Buffer[Symbol.species]
+const removeAllListeners = util.removeAllListeners
+
+const kPausedByHandler = Symbol('kPausedByHandler')
+
+const BUFFER_PAGE_SIZE = 4096
+const INITIAL_BUFFER_SIZE = 128 * 1024
+const EMPTY_BUF = Buffer.alloc(0)
+const BODY_KIND_CONTENT_LENGTH = 0
+const EVENT_RANGE_SIZE = 9
+const EVENT_HEADERS_SIZE = 19
+
+let miloPackage
+
+// We disable wasm SIMD on ppc64 as it seems to be broken on Power 9 architectures.
+// We disable wasm SIMD on riscv64 as it seems to be broken on there as well.
+let useWasmSIMD = (process.arch !== 'riscv64' && process.arch !== 'ppc64')
+// The Env Variable UNDICI_NO_WASM_SIMD allows explicitly overriding the default behavior.
+if (process.env.UNDICI_NO_WASM_SIMD === '1') {
+  useWasmSIMD = false
+} else if (process.env.UNDICI_NO_WASM_SIMD === '0') {
+  useWasmSIMD = true
+}
+
+const USE_NATIVE_TIMER = 0
+const USE_FAST_TIMER = 1
+const TIMEOUT_HEADERS = 2 | USE_FAST_TIMER
+const TIMEOUT_BODY = 4 | USE_FAST_TIMER
+const TIMEOUT_KEEP_ALIVE = 8 | USE_NATIVE_TIMER
+
+let miloEnabled =
+  process.env.UNDICI_USE_MILO === '1' || process.env.UNDICI_USE_MILO === 'true'
+let miloInstance = null
+let currentBuffer = null
+let currentBufferSize = 0
+let currentBufferPtr = null
+let currentBufferRef = null
+
+function onParserTimeout (parserWeakRef) {
+  const parser = parserWeakRef.deref ? parserWeakRef.deref() : parserWeakRef
+  if (!parser) {
+    return
+  }
+
+  const { socket, timeoutType, client, paused } = parser
+
+  if (timeoutType === TIMEOUT_HEADERS) {
+    if (!socket[kWriting] || socket.writableNeedDrain || client[kRunning] > 1) {
+      assert(!paused, 'cannot be paused while waiting for headers')
+      util.destroy(socket, new HeadersTimeoutError())
+    }
+  } else if (timeoutType === TIMEOUT_BODY) {
+    if (!paused) {
+      util.destroy(socket, new BodyTimeoutError())
+    }
+  } else if (timeoutType === TIMEOUT_KEEP_ALIVE) {
+    assert(client[kRunning] === 0 && client[kKeepAliveTimeoutValue])
+    util.destroy(socket, new InformationalError('socket idle timeout'))
+  }
+}
+
+function getMilo () {
+  if (miloInstance) {
+    return miloInstance
+  }
+
+  // Milo modules compile WASM on load; defer loading until the parser is needed.
+  if (useWasmSIMD) {
+    try {
+      miloPackage = __nccwpck_require__(9545)
+    } catch {}
+  }
+
+  miloPackage = miloPackage || __nccwpck_require__(5997)
+  miloInstance = miloPackage.setup()
+  return miloInstance
+}
+
+class H1Parser {
+  constructor (client, socket) {
+    this.milo = getMilo()
+
+    this.client = client
+    this.socket = socket
+    this.parser = this.milo.create()
+    this.events = new FastBuffer(
+      this.milo.memory.buffer,
+      this.parser + this.milo.ParserFields.EVENTS,
+      4
+    ).readUInt32LE(0)
+
+    this.milo.setShouldAutodetect(this.parser, false)
+    this.milo.setIsRequest(this.parser, false)
+    this.milo.setShouldManageUnconsumed(this.parser, false)
+    this.milo.setShouldSuspendAfterHeaders(this.parser, true)
+    this.milo.setMaxHeaderLength(this.parser, client[kMaxHeadersSize])
+    this.milo.setActiveEvents(
+      this.parser,
+      this.milo.EVENT_ACTIVE_ON_ERROR |
+        this.milo.EVENT_ACTIVE_ON_MESSAGE_COMPLETE |
+        this.milo.EVENT_ACTIVE_ON_REASON |
+        this.milo.EVENT_ACTIVE_ON_HEADER_NAME |
+        this.milo.EVENT_ACTIVE_ON_HEADER_VALUE |
+        this.milo.EVENT_ACTIVE_ON_HEADERS |
+        this.milo.EVENT_ACTIVE_ON_DATA |
+        this.milo.EVENT_ACTIVE_ON_TRAILER_NAME |
+        this.milo.EVENT_ACTIVE_ON_TRAILER_VALUE
+    )
+
+    this.timeout = null
+    this.timeoutWeakRef = new WeakRef(this)
+    this.timeoutValue = null
+    this.timeoutType = null
+    this.statusCode = 0
+    this.statusText = ''
+    this.upgrade = false
+    this.responseStarted = false
+    this.pausedByParser = false
+    this.pauseStateIsStart = false
+    this.headers = []
+    this.trailers = []
+    this.headersSize = 0
+    this.trailersSize = 0
+    this.headersMaxSize = client[kMaxHeadersSize]
+    this.shouldKeepAlive = false
+    this.paused = false
+    this.errored = false
+    this.waitingForMoreData = 0
+    this.resume = this.resume.bind(this)
+    this.bytesRead = 0
+    this.keepAlive = ''
+    this.connection = ''
+    this.contentLength = -1
+    this.maxResponseSize = client[kMaxResponseSize]
+    this.directBodyRemaining = 0
+    this.directBodyCompletePending = false
+    this.headersSuspended = false
+    this.skipBody = false
+
+    this[kPausedByHandler] = false
+
+    if (
+      INITIAL_BUFFER_SIZE > currentBufferSize ||
+      currentBuffer.buffer !== this.milo.memory.buffer
+    ) {
+      this.ensureBuffers(INITIAL_BUFFER_SIZE)
+    } else {
+      this.updateBuffers()
+    }
+  }
+
+  setTimeout (delay, type) {
+    if (
+      delay !== this.timeoutValue ||
+      (type & USE_FAST_TIMER) ^ (this.timeoutType & USE_FAST_TIMER)
+    ) {
+      if (this.timeout) {
+        timers.clearTimeout(this.timeout)
+        this.timeout = null
+      }
+
+      if (delay) {
+        if (type & USE_FAST_TIMER) {
+          this.timeout = timers.setFastTimeout(
+            onParserTimeout,
+            delay,
+            this.timeoutWeakRef
+          )
+        } else {
+          this.timeout = setTimeout(
+            onParserTimeout,
+            delay,
+            this.timeoutWeakRef
+          )
+          this.timeout?.unref()
+        }
+      }
+
+      this.timeoutValue = delay
+    } else if (this.timeout?.refresh) {
+      this.timeout.refresh()
+    }
+
+    this.timeoutType = type
+  }
+
+  ensureBuffers (size) {
+    const { milo } = this
+
+    if (currentBufferPtr != null) {
+      milo.dealloc(currentBufferPtr, currentBufferSize)
+    }
+
+    // Reallocate buffers
+    currentBufferSize = Math.ceil(size / BUFFER_PAGE_SIZE) * BUFFER_PAGE_SIZE
+    currentBufferPtr = milo.alloc(currentBufferSize)
+    currentBuffer = new FastBuffer(
+      milo.memory.buffer,
+      currentBufferPtr,
+      currentBufferSize
+    )
+
+    this.updateBuffers()
+  }
+
+  updateBuffers () {
+    this.parserFields = new FastBuffer(this.milo.memory.buffer, this.parser)
+    this.parserEvents = new FastBuffer(
+      this.milo.memory.buffer,
+      this.events,
+      64 * 1024
+    )
+  }
+
+  resume () {
+    if (this.socket.destroyed || !this.paused) {
+      return
+    }
+
+    this.milo.resume(this.parser)
+
+    assert(this.timeoutType === TIMEOUT_BODY)
+    if (this.timeout?.refresh) {
+      this.timeout.refresh()
+    }
+
+    this.paused = false
+    if (this.directBodyCompletePending) {
+      try {
+        this.completeDirectBody()
+      } catch (err) {
+        util.destroy(this.socket, err)
+        return
+      }
+
+      if (this.paused) {
+        return
+      }
+    }
+
+    this.readMore()
+  }
+
+  readMore () {
+    if (this.paused || !this.parser) {
+      return
+    }
+
+    while (!this.paused && this.parser) {
+      if (
+        this.waitingForMoreData &&
+        this.socket.readableLength <= this.waitingForMoreData
+      ) {
+        break
+      }
+
+      this.waitingForMoreData = 0
+
+      const chunk = this.socket.read()
+      if (chunk === null) {
+        break
+      }
+
+      if (this.execute(chunk) === false) {
+        break
+      }
+    }
+  }
+
+  execute (data) {
+    const available = data.length
+    assert(!this.paused)
+
+    const { socket, milo } = this
+
+    try {
+      if (this.directBodyRemaining > 0) {
+        return this.consumeDirectBody(data)
+      }
+
+      if (currentBuffer.buffer !== milo.memory.buffer) {
+        currentBuffer = new FastBuffer(
+          milo.memory.buffer,
+          currentBufferPtr,
+          currentBufferSize
+        )
+        this.updateBuffers()
+      } else if (this.parserEvents.buffer !== milo.memory.buffer) {
+        this.updateBuffers()
+      }
+
+      let offset = 0
+      let parseLen = available
+      const headersEnd = this.statusCode === 0 ? data.indexOf('\r\n\r\n') : -1
+
+      if (headersEnd !== -1) {
+        parseLen = headersEnd + 4
+      }
+
+      for (;;) {
+        if (parseLen > currentBufferSize) {
+          this.ensureBuffers(parseLen)
+        }
+
+        const parseData = data.subarray(offset, offset + parseLen)
+        currentBuffer.set(parseData)
+        currentBufferRef = parseData
+
+        const consumed = milo.parse(this.parser, currentBufferPtr, parseLen)
+        this.drainEvents()
+
+        const consumedTotal = offset + consumed
+
+        if (
+          this.errored ||
+          (consumed === 0 &&
+            this.parserFields[milo.ParserFields.ERROR_CODE] !== milo.ERROR_NONE)
+        ) {
+          throw this.createError(data.subarray(consumedTotal))
+        } else if (this.upgrade) {
+          this.onUpgrade(data.subarray(consumedTotal))
+          return false
+        } else if (this.directBodyCompletePending) {
+          this.completeDirectBody()
+
+          if (this.paused) {
+            return false
+          }
+        } else if (this.pausedByParser) {
+          this.pausedByParser = false
+          this.headersSuspended = false
+          if (this[kPausedByHandler] && this.pauseStateIsStart) {
+            this.pauseStateIsStart = false
+            milo.resume(this.parser)
+            this[kPausedByHandler] = false
+            return false
+          }
+
+          this.pauseStateIsStart = false
+          this.paused = true
+          socket.unshift(data.subarray(consumedTotal))
+          return false
+        }
+
+        if (this.directBodyRemaining > 0) {
+          return this.consumeDirectBody(data.subarray(consumedTotal))
+        }
+
+        if (consumed < parseLen) {
+          const remaining = data.subarray(consumedTotal)
+          socket.unshift(remaining)
+          this.waitingForMoreData = consumed === 0 ? remaining.length : 0
+          return false
+        }
+
+        offset = consumedTotal
+
+        if (offset >= available) {
+          if (this.headersSuspended) {
+            this.headersSuspended = false
+            parseLen = 0
+            continue
+          }
+
+          return true
+        }
+
+        this.headersSuspended = false
+        parseLen = available - offset
+      }
+    } catch (err) {
+      util.destroy(socket, err)
+      return false
+    } finally {
+      currentBufferRef = null
+    }
+  }
+
+  consumeDirectBody (data) {
+    const { socket, client, maxResponseSize } = this
+    const available = data.length
+    const len = Math.min(available, this.directBodyRemaining)
+
+    if (this.timeout?.refresh) {
+      this.timeout.refresh()
+    }
+
+    if (len > 0) {
+      const request = client[kQueue][client[kRunningIdx]]
+      assert(request)
+      assert(this.timeoutType === TIMEOUT_BODY)
+      assert(this.statusCode >= 200)
+
+      if (maxResponseSize > -1 && this.bytesRead + len > maxResponseSize) {
+        throw new ResponseExceededMaxSizeError()
+      }
+
+      this.bytesRead += len
+      this.directBodyRemaining -= len
+
+      if (request.onResponseData(data.subarray(0, len)) === false) {
+        this.directBodyCompletePending = this.directBodyRemaining === 0
+        this.pauseParser()
+        this[kPausedByHandler] = true
+        this.pausedByParser = false
+        this.paused = true
+
+        if (len < available) {
+          socket.unshift(data.subarray(len))
+        }
+
+        return false
+      }
+    }
+
+    if (this.directBodyRemaining === 0) {
+      this.completeDirectBody()
+
+      const remaining = data.subarray(len)
+      if (
+        this.errored ||
+        this.parserFields[this.milo.ParserFields.ERROR_CODE] !==
+          this.milo.ERROR_NONE
+      ) {
+        throw this.createError(remaining)
+      } else if (this.pausedByParser) {
+        this.pausedByParser = false
+        this.pauseStateIsStart = false
+        this.paused = true
+        if (remaining.length > 0) {
+          socket.unshift(remaining)
+        }
+        return false
+      }
+
+      if (remaining.length > 0) {
+        socket.unshift(remaining)
+        return false
+      }
+    }
+
+    return true
+  }
+
+  completeDirectBody () {
+    const { milo } = this
+
+    if (currentBuffer.buffer !== milo.memory.buffer) {
+      currentBuffer = new FastBuffer(
+        milo.memory.buffer,
+        currentBufferPtr,
+        currentBufferSize
+      )
+      this.updateBuffers()
+    } else if (this.parserEvents.buffer !== milo.memory.buffer) {
+      this.updateBuffers()
+    }
+
+    this.directBodyCompletePending = false
+    currentBufferRef = EMPTY_BUF
+
+    milo.complete(this.parser)
+    this.drainEvents()
+  }
+
+  setShouldSkipBody (value) {
+    if (this.skipBody !== value) {
+      this.skipBody = value
+      this.milo.setShouldSkipBody(this.parser, value)
+    }
+  }
+
+  finish () {
+    if (!this.parser) {
+      return null
+    }
+
+    if (this.directBodyRemaining > 0) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    if (this.parserEvents.buffer !== this.milo.memory.buffer) {
+      this.updateBuffers()
+    }
+
+    this.milo.finish(this.parser)
+    this.drainEvents()
+
+    if (!this.errored) {
+      return null
+    }
+
+    return this.createError(EMPTY_BUF)
+  }
+
+  createError (data) {
+    const { contentLength, bytesRead } = this
+
+    if (contentLength !== -1 && bytesRead !== contentLength) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const errorCode = this.parserFields[this.milo.ParserFields.ERROR_CODE]
+    const errorName = this.milo.Errors[errorCode]
+    const errorDescription =
+      errorName === 'UNEXPECTED_EOF'
+        ? 'Invalid EOF state'
+        : this.milo.getErrorDescription(this.parser)
+    const reason =
+      errorName === 'UNEXPECTED_EOF'
+        ? errorDescription
+        : errorDescription
+          ? `[ERROR_${errorName}] ${errorDescription}`
+          : `ERROR_${errorName}`
+    return new HTTPParserError(
+      `Response does not match the HTTP/1.1 protocol (${reason})`,
+      errorName,
+      data
+    )
+  }
+
+  destroy () {
+    if (this.parser) {
+      this.milo.destroy(this.parser)
+      this.parser = null
+    }
+
+    this.timeout && timers.clearTimeout(this.timeout)
+    this.timeout = null
+    this.timeoutValue = null
+    this.timeoutType = null
+    this.paused = false
+    this.responseStarted = false
+    this.pausedByParser = false
+    this.pauseStateIsStart = false
+    this.connection = ''
+    this.skipBody = false
+  }
+
+  pauseParser (stateIsStart = false) {
+    this.milo.pause(this.parser)
+    this.pausedByParser = true
+    this.pauseStateIsStart = stateIsStart
+  }
+
+  drainEvents () {
+    const { socket, client, milo } = this
+    let cursor = 0
+
+    const firstEvent = this.parserEvents[0]
+    if (
+      firstEvent !== milo.EVENT_END &&
+      firstEvent !== milo.EVENT_ERROR &&
+      !this.responseStarted
+    ) {
+      this.responseStarted = true
+
+      if (socket.destroyed) {
+        return this.fail(this.milo.ERROR_CALLBACK_ERROR, 'Other side closed')
+      }
+
+      const request = client[kQueue][client[kRunningIdx]]
+      if (!request) {
+        return this.fail(this.milo.ERROR_CALLBACK_ERROR, 'Missing request')
+      }
+
+      request.onResponseStarted()
+    }
+
+    for (;;) {
+      const event = this.parserEvents[cursor]
+      let eventLen = EVENT_RANGE_SIZE
+      switch (event) {
+        case milo.EVENT_END:
+          return
+        case milo.EVENT_ERROR:
+          this.errored = true
+          return
+        case milo.EVENT_MESSAGE_COMPLETE: {
+          const {
+            client,
+            socket,
+            statusCode,
+            upgrade,
+            trailers,
+            contentLength,
+            bytesRead,
+            shouldKeepAlive
+          } = this
+
+          this.responseStarted = false
+
+          if (socket.destroyed && (!statusCode || shouldKeepAlive)) {
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Other side closed')
+          }
+
+          if (upgrade) {
+            this.pauseParser()
+            return
+          }
+
+          assert(statusCode >= 100)
+
+          const request = client[kQueue][client[kRunningIdx]]
+          assert(request)
+
+          this.statusCode = 0
+          this.statusText = ''
+          this.bytesRead = 0
+          this.contentLength = -1
+          this.directBodyRemaining = 0
+          this.directBodyCompletePending = false
+          this.headersSuspended = false
+          this.skipBody = false
+          this.keepAlive = ''
+          this.connection = ''
+          this.trailers = []
+          this.trailersSize = 0
+
+          if (statusCode < 200) {
+            break
+          }
+
+          if (
+            request.method !== 'HEAD' &&
+            contentLength !== -1 &&
+            bytesRead !== contentLength
+          ) {
+            util.destroy(socket, new ResponseContentLengthMismatchError())
+            this.pauseParser()
+            break
+          }
+
+          request.onResponseEnd(trailers)
+
+          client[kQueue][client[kRunningIdx]++] = null
+
+          if (socket[kWriting]) {
+            assert(client[kRunning] === 0)
+            util.destroy(socket, new InformationalError('reset'))
+            this.pauseParser(true)
+          } else if (!shouldKeepAlive) {
+            util.destroy(socket, new InformationalError('reset'))
+            this.pauseParser(true)
+          } else if (socket[kReset] && client[kRunning] === 0) {
+            util.destroy(socket, new InformationalError('reset'))
+            this.pauseParser(true)
+          } else if (client[kPipelining] == null || client[kPipelining] === 1) {
+            setImmediate(client[kResume])
+          } else {
+            client[kResume]()
+          }
+
+          break
+        }
+        case milo.EVENT_REASON: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          this.statusText = new FastBuffer(
+            currentBufferRef.buffer,
+            currentBufferRef.byteOffset + at,
+            len
+          ).toString()
+          break
+        }
+        case milo.EVENT_HEADER_NAME: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          const data =
+            len > 0
+              ? new FastBuffer(
+                currentBufferRef.buffer,
+                currentBufferRef.byteOffset + at,
+                len
+              )
+              : EMPTY_BUF
+
+          this.headers.push(data)
+          this.headersSize += len
+          if (this.headersSize >= this.headersMaxSize) {
+            util.destroy(this.socket, new HeadersOverflowError())
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Headers overflow')
+          }
+
+          break
+        }
+        case milo.EVENT_HEADER_VALUE: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          const data =
+            len > 0
+              ? new FastBuffer(
+                currentBufferRef.buffer,
+                currentBufferRef.byteOffset + at,
+                len
+              )
+              : EMPTY_BUF
+          const key = this.headers[this.headers.length - 1]
+
+          this.headers.push(data)
+
+          if (key.length === 10) {
+            const headerName = util.bufferToLowerCasedHeaderName(key)
+            if (headerName === 'keep-alive') {
+              this.keepAlive += (this.keepAlive.length === 0 ? '' : ',') + data.toString()
+            } else if (headerName === 'connection') {
+              this.connection += (this.connection.length === 0 ? '' : ',') + data.toString()
+            }
+          }
+
+          this.headersSize += len
+          if (this.headersSize >= this.headersMaxSize) {
+            util.destroy(this.socket, new HeadersOverflowError())
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Headers overflow')
+          }
+
+          break
+        }
+        case milo.EVENT_HEADERS: {
+          eventLen = EVENT_HEADERS_SIZE
+
+          const statusCode = this.parserEvents.readUInt16LE(cursor + 5)
+          const shouldKeepAlive = this.parserEvents[cursor + 7] !== 0
+          const shouldUpgrade = this.parserEvents[cursor + 8] !== 0
+          const hasTrailers = this.parserEvents[cursor + 9] !== 0
+          const bodyKind = this.parserEvents[cursor + 10]
+          const contentLength =
+            this.parserEvents.readUInt32LE(cursor + 11) +
+            this.parserEvents.readUInt32LE(cursor + 15) * 0x100000000
+
+          const { socket, client, headers, statusText } = this
+
+          if (socket.destroyed) {
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Other side closed')
+          }
+
+          const request = client[kQueue][client[kRunningIdx]]
+          if (!request) {
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Missing request')
+          }
+
+          assert(!this.upgrade)
+          assert(this.statusCode < 200)
+
+          if (statusCode === 100) {
+            util.destroy(
+              socket,
+              new SocketError('bad response', util.getSocketInfo(socket))
+            )
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Bad response')
+          }
+
+          if (shouldUpgrade && !request.upgrade) {
+            util.destroy(
+              socket,
+              new SocketError('bad upgrade', util.getSocketInfo(socket))
+            )
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Bad upgrade')
+          }
+
+          assert(this.timeoutType === TIMEOUT_HEADERS)
+
+          this.statusCode = statusCode
+          this.shouldKeepAlive =
+            shouldKeepAlive ||
+            (request.method === 'HEAD' &&
+              !socket[kReset] &&
+              /(?:^|,)[\t ]*keep-alive[\t ]*(?:,|$)/i.test(this.connection) &&
+              !/(?:^|,)[\t ]*close[\t ]*(?:,|$)/i.test(this.connection))
+          this.contentLength =
+            bodyKind === BODY_KIND_CONTENT_LENGTH ? contentLength : -1
+
+          if (this.statusCode >= 200) {
+            const bodyTimeout =
+              request.bodyTimeout != null
+                ? request.bodyTimeout
+                : client[kBodyTimeout]
+            this.setTimeout(bodyTimeout, TIMEOUT_BODY)
+          } else if (this.timeout?.refresh) {
+            this.timeout.refresh()
+          }
+
+          if (request.method === 'CONNECT') {
+            assert(client[kRunning] === 1)
+            milo.setIsConnect(this.parser, true)
+            this.upgrade = true
+            return
+          }
+
+          if (shouldUpgrade) {
+            assert(client[kRunning] === 1)
+            this.upgrade = true
+            this.pauseParser()
+            return
+          }
+
+          this.headers = []
+          this.headersSize = 0
+
+          if (this.shouldKeepAlive && client[kPipelining]) {
+            const keepAliveTimeout = this.keepAlive
+              ? util.parseKeepAliveTimeout(this.keepAlive)
+              : null
+
+            if (keepAliveTimeout != null) {
+              const timeout = Math.min(
+                keepAliveTimeout - client[kKeepAliveTimeoutThreshold],
+                client[kKeepAliveMaxTimeout]
+              )
+              if (timeout <= 0) {
+                socket[kReset] = true
+              } else {
+                client[kKeepAliveTimeoutValue] = timeout
+              }
+            } else {
+              client[kKeepAliveTimeoutValue] = client[kKeepAliveDefaultTimeout]
+            }
+          } else {
+            socket[kReset] = true
+          }
+
+          const pause =
+            request.onResponseStart(
+              statusCode,
+              headers,
+              this.resume,
+              statusText
+            ) === false
+
+          if (request.aborted) {
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Request aborted')
+          }
+
+          if (request.method === 'HEAD' || statusCode < 200) {
+            this.setShouldSkipBody(true)
+          }
+
+          this.headersSuspended = true
+          if (
+            !pause &&
+            request.method !== 'HEAD' &&
+            statusCode >= 200 &&
+            statusCode !== 204 &&
+            statusCode !== 205 &&
+            statusCode !== 304 &&
+            bodyKind === BODY_KIND_CONTENT_LENGTH &&
+            contentLength > 0 &&
+            !hasTrailers
+          ) {
+            this.directBodyRemaining = contentLength
+          }
+
+          if (socket[kBlocking]) {
+            socket[kBlocking] = false
+            client[kResume]()
+          }
+
+          if (pause) {
+            this.pauseParser()
+            this[kPausedByHandler] = true
+          } else if (
+            request.method === 'HEAD' ||
+            statusCode < 200 ||
+            statusCode === 204 ||
+            statusCode === 205 ||
+            statusCode === 304 ||
+            (bodyKind === BODY_KIND_CONTENT_LENGTH && contentLength === 0)
+          ) {
+            this.directBodyCompletePending = true
+          }
+
+          break
+        }
+        case milo.EVENT_DATA: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          const { client, socket, statusCode, maxResponseSize } = this
+
+          if (socket.destroyed) {
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Other side closed')
+          }
+
+          const request = client[kQueue][client[kRunningIdx]]
+          assert(request)
+          assert(this.timeoutType === TIMEOUT_BODY)
+
+          if (this.timeout?.refresh) {
+            this.timeout.refresh()
+          }
+
+          assert(statusCode >= 200)
+
+          if (maxResponseSize > -1 && this.bytesRead + len > maxResponseSize) {
+            util.destroy(socket, new ResponseExceededMaxSizeError())
+            return this.fail(
+              milo.ERROR_CALLBACK_ERROR,
+              'Response size exceeded'
+            )
+          }
+
+          this.bytesRead += len
+
+          const buffer = currentBufferRef
+          if (
+            request.onResponseData(
+              new FastBuffer(buffer.buffer, buffer.byteOffset + at, len)
+            ) === false
+          ) {
+            this.pauseParser()
+            this[kPausedByHandler] = true
+          }
+
+          break
+        }
+        case milo.EVENT_TRAILER_NAME: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          const data =
+            len > 0
+              ? new FastBuffer(
+                currentBufferRef.buffer,
+                currentBufferRef.byteOffset + at,
+                len
+              )
+              : EMPTY_BUF
+
+          this.trailers.push(data)
+
+          this.trailersSize += len
+          if (this.trailersSize >= this.headersMaxSize) {
+            util.destroy(this.socket, new HeadersOverflowError())
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Headers overflow')
+          }
+
+          break
+        }
+        case milo.EVENT_TRAILER_VALUE: {
+          const at = this.parserEvents.readUInt32LE(cursor + 1)
+          const len = this.parserEvents.readUInt32LE(cursor + 5)
+          const data =
+            len > 0
+              ? new FastBuffer(
+                currentBufferRef.buffer,
+                currentBufferRef.byteOffset + at,
+                len
+              )
+              : EMPTY_BUF
+
+          this.trailers.push(data)
+
+          this.trailersSize += len
+          if (this.trailersSize >= this.headersMaxSize) {
+            util.destroy(this.socket, new HeadersOverflowError())
+            return this.fail(milo.ERROR_CALLBACK_ERROR, 'Headers overflow')
+          }
+
+          break
+        }
+        default:
+          return
+      }
+
+      cursor += eventLen
+    }
+  }
+
+  fail (code, message) {
+    this.milo.fail(this.parser, code, message)
+    this.errored = true
+  }
+
+  onUpgrade (head) {
+    const { upgrade, client, socket, headers, statusCode } = this
+
+    assert(upgrade)
+    assert(client[kSocket] === socket)
+    assert(!socket.destroyed)
+    assert(!this.paused)
+
+    const request = client[kQueue][client[kRunningIdx]]
+    assert(request)
+    assert(request.upgrade || request.method === 'CONNECT')
+
+    this.statusCode = 0
+    this.statusText = ''
+    this.shouldKeepAlive = false
+    this.headers = []
+    this.headersSize = 0
+
+    socket.unshift(head)
+    socket[kParser].destroy()
+    socket[kParser] = null
+    socket[kClient] = null
+    socket[kError] = null
+
+    removeAllListeners(socket)
+
+    client[kSocket] = null
+    client[kHTTPContext] = null
+    client[kQueue][client[kRunningIdx]++] = null
+    client.emit(
+      'disconnect',
+      client[kUrl],
+      [client],
+      new InformationalError('upgrade')
+    )
+
+    try {
+      request.onRequestUpgrade(statusCode, headers, socket)
+    } catch (err) {
+      util.destroy(socket, err)
+    }
+
+    client[kResume]()
+  }
+}
+
+function setMiloEnabled (value) {
+  miloEnabled = value
+}
+
+function getMiloEnabled () {
+  return miloEnabled
+}
+
+module.exports = { H1Parser, getMiloEnabled, setMiloEnabled }
+
+
+/***/ }),
+
 /***/ 2128:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
 
+const { AsyncResource } = __nccwpck_require__(6698)
 const { PoolStats } = __nccwpck_require__(6854)
 const DispatcherBase = __nccwpck_require__(1841)
 const FixedQueue = __nccwpck_require__(4660)
@@ -18992,10 +20694,48 @@ const kOnDrain = Symbol('onDrain')
 const kOnConnect = Symbol('onConnect')
 const kOnDisconnect = Symbol('onDisconnect')
 const kOnConnectionError = Symbol('onConnectionError')
+const kOnClientBusy = Symbol('on client busy')
+const kOnClientDrain = Symbol('on client drain')
+const kDrainQueue = Symbol('drain queue')
 const kGetDispatcher = Symbol('get dispatcher')
 const kHasDispatcher = Symbol('has dispatcher')
 const kAddClient = Symbol('add client')
 const kRemoveClient = Symbol('remove client')
+const kRetireClient = Symbol('retire client')
+const kRetiring = Symbol('retiring clients')
+
+// Closes every live client, including clients that have been
+// taken out of rotation but are still finishing their own
+// requests.
+// Requests that wait in the Pool queue are dispatched later from whichever
+// callback drains the queue (another request's connect, drain, ...). Capture
+// the caller's async context so Client#dispatch, and the diagnostics channel
+// events it publishes, still run in it.
+class QueuedRequest extends AsyncResource {
+  constructor (opts, handler) {
+    super('UNDICI_POOL_QUEUED_REQUEST')
+    this.opts = opts
+    this.handler = handler
+  }
+
+  dispatch (dispatcher) {
+    return this.runInAsyncScope(dispatcher.dispatch, dispatcher, this.opts, this.handler)
+  }
+}
+
+function closeClients (pool) {
+  const closeAll = []
+  for (let i = 0; i < pool[kClients].length; i++) {
+    const client = pool[kClients][i]
+    if (!client.destroyed) {
+      closeAll.push(client.close())
+    }
+  }
+  for (const closed of pool[kRetiring].values()) {
+    closeAll.push(closed)
+  }
+  return Promise.all(closeAll)
+}
 
 class PoolBase extends DispatcherBase {
   [kQueue] = new FixedQueue();
@@ -19004,12 +20744,21 @@ class PoolBase extends DispatcherBase {
 
   [kClients] = [];
 
+  // Clients removed from kClients that have not finished closing,
+  // mapped to a promise that settles once they have.
+  [kRetiring] = new Map();
+
   [kNeedDrain] = false;
 
   [kOnDrain] (client, origin, targets) {
-    const queue = this[kQueue]
+    if (client.closed || client.destroyed) {
+      return
+    }
 
+    const queue = this[kQueue]
     let needDrain = false
+
+    this[kOnClientDrain](client)
 
     while (!needDrain) {
       const item = queue.shift()
@@ -19017,10 +20766,22 @@ class PoolBase extends DispatcherBase {
         break
       }
       this[kQueued]--
-      needDrain = !client.dispatch(item.opts, item.handler)
+      needDrain = !item.dispatch(client)
     }
 
     client[kNeedDrain] = needDrain
+    if (needDrain) {
+      this[kOnClientBusy](client)
+
+      // This client is full but requests are still queued, e.g. an h2
+      // client that has just released everything queued while ALPN was
+      // negotiated and hit maxConcurrentStreams. Hand the rest to other
+      // clients, creating new ones up to the connection limit, instead of
+      // leaving them for this client to drain one batch at a time.
+      if (!queue.isEmpty()) {
+        return this[kDrainQueue](origin, targets)
+      }
+    }
 
     if (!needDrain && this[kNeedDrain]) {
       this[kNeedDrain] = false
@@ -19028,15 +20789,45 @@ class PoolBase extends DispatcherBase {
     }
 
     if (this[kClosedResolve] && queue.isEmpty()) {
-      const closeAll = []
-      for (let i = 0; i < this[kClients].length; i++) {
-        const client = this[kClients][i]
-        if (!client.destroyed) {
-          closeAll.push(client.close())
+      return closeClients(this).then(this[kClosedResolve])
+    }
+  }
+
+  [kOnClientBusy] () {}
+
+  [kOnClientDrain] () {}
+
+  [kDrainQueue] (origin, targets) {
+    const queue = this[kQueue]
+    let hasDispatcher = true
+
+    while (!queue.isEmpty()) {
+      const dispatcher = this[kGetDispatcher]()
+      if (!dispatcher) {
+        hasDispatcher = false
+        break
+      }
+
+      const item = queue.shift()
+      this[kQueued]--
+
+      if (!item.dispatch(dispatcher)) {
+        dispatcher[kNeedDrain] = true
+        this[kOnClientBusy](dispatcher)
+        hasDispatcher = this[kHasDispatcher]()
+        if (!hasDispatcher) {
+          break
         }
       }
-      return Promise.all(closeAll)
-        .then(this[kClosedResolve])
+    }
+
+    if (hasDispatcher && this[kNeedDrain]) {
+      this[kNeedDrain] = false
+      this.emit('drain', origin, [this, ...targets])
+    }
+
+    if (this[kClosedResolve] && queue.isEmpty()) {
+      return closeClients(this).then(this[kClosedResolve])
     }
   }
 
@@ -19102,14 +20893,7 @@ class PoolBase extends DispatcherBase {
 
   [kClose] () {
     if (this[kQueue].isEmpty()) {
-      const closeAll = []
-      for (let i = 0; i < this[kClients].length; i++) {
-        const client = this[kClients][i]
-        if (!client.destroyed) {
-          closeAll.push(client.close())
-        }
-      }
-      return Promise.all(closeAll)
+      return closeClients(this)
     } else {
       return new Promise((resolve) => {
         this[kClosedResolve] = resolve
@@ -19130,6 +20914,9 @@ class PoolBase extends DispatcherBase {
     for (let i = 0; i < this[kClients].length; i++) {
       destroyAll[i] = this[kClients][i].destroy(err)
     }
+    for (const client of this[kRetiring].keys()) {
+      destroyAll.push(client.destroy(err))
+    }
     return Promise.all(destroyAll)
   }
 
@@ -19138,10 +20925,11 @@ class PoolBase extends DispatcherBase {
 
     if (!dispatcher) {
       this[kNeedDrain] = true
-      this[kQueue].push({ opts, handler })
+      this[kQueue].push(new QueuedRequest(opts, handler))
       this[kQueued]++
     } else if (!dispatcher.dispatch(opts, handler)) {
       dispatcher[kNeedDrain] = true
+      this[kOnClientBusy](dispatcher)
       this[kNeedDrain] = !this[kHasDispatcher]()
     }
 
@@ -19175,7 +20963,7 @@ class PoolBase extends DispatcherBase {
 
     if (this[kNeedDrain]) {
       queueMicrotask(() => {
-        if (this[kNeedDrain]) {
+        if (this[kNeedDrain] && !client[kNeedDrain]) {
           this[kOnDrain](client, client[kUrl], [client, this])
         }
       })
@@ -19184,13 +20972,37 @@ class PoolBase extends DispatcherBase {
     return this
   }
 
-  [kRemoveClient] (client) {
+  // Takes a client out of rotation. A closed client no longer takes requests
+  // from the pool queue (see kOnDrain), but it finishes the requests it
+  // already has. Until it has, pool.close() waits for it and pool.destroy()
+  // destroys it.
+  [kRetireClient] (client) {
     const idx = this[kClients].indexOf(client)
     if (idx !== -1) {
       this[kClients].splice(idx, 1)
     }
 
-    client.close(() => {})
+    if (client.destroyed || this[kRetiring].has(client)) {
+      return
+    }
+
+    // Use the callback form: custom dispatchers from `factory` are not
+    // required to return a promise, and may call back synchronously.
+    let done = false
+    let resolveClosed
+    const closed = new Promise((resolve) => { resolveClosed = resolve })
+    this[kRetiring].set(client, closed)
+    client.close(() => {
+      if (!done) {
+        done = true
+        this[kRetiring].delete(client)
+        resolveClosed()
+      }
+    })
+  }
+
+  [kRemoveClient] (client) {
+    this[kRetireClient](client)
 
     this[kNeedDrain] = !this[kClients].some(dispatcher => (
       !dispatcher[kNeedDrain] &&
@@ -19206,6 +21018,10 @@ module.exports = {
   kNeedDrain,
   kAddClient,
   kRemoveClient,
+  kRetireClient,
+  kDrainQueue,
+  kOnClientBusy,
+  kOnClientDrain,
   kGetDispatcher,
   kHasDispatcher
 }
@@ -19223,24 +21039,52 @@ const {
   kClients,
   kNeedDrain,
   kAddClient,
+  kDrainQueue,
+  kOnClientBusy,
+  kOnClientDrain,
   kGetDispatcher,
   kHasDispatcher,
-  kRemoveClient
+  kRemoveClient,
+  kRetireClient
 } = __nccwpck_require__(2128)
 const Client = __nccwpck_require__(3701)
 const {
   InvalidArgumentError
 } = __nccwpck_require__(8707)
 const util = __nccwpck_require__(3440)
-const { kUrl } = __nccwpck_require__(6443)
+const { kConnecting, kHTTPContext, kUrl, kQueued } = __nccwpck_require__(6443)
 const buildConnector = __nccwpck_require__(9136)
 
 const kOptions = Symbol('options')
 const kConnections = Symbol('connections')
 const kFactory = Symbol('factory')
+const kProtocol = Symbol('protocol')
+const kProtocolProbe = Symbol('protocol probe')
 
 function defaultFactory (origin, opts) {
   return new Client(origin, opts)
+}
+
+function shouldCreateProtocolProbe (pool, dispatcher) {
+  return dispatcher instanceof Client &&
+    pool[kProtocol] !== 'h1' &&
+    (pool[kOptions].useH2c === true || (pool[kUrl].protocol === 'https:' && pool[kOptions].allowH2 !== false))
+}
+
+function createClient (pool) {
+  const dispatcher = pool[kFactory](pool[kUrl], pool[kOptions])
+
+  // HTTPS does not reveal whether the peer selected h1 or h2 until ALPN
+  // completes. While h2 is still possible, let one Client probe the protocol
+  // and keep later requests in the Pool queue instead of opening one TLS
+  // connection per request. A confirmed h1 connection disables this gate and
+  // restores the usual Pool fan-out.
+  if (shouldCreateProtocolProbe(pool, dispatcher)) {
+    pool[kProtocolProbe] = dispatcher
+  }
+
+  pool[kAddClient](dispatcher)
+  return dispatcher
 }
 
 class Pool extends PoolBase {
@@ -19290,6 +21134,8 @@ class Pool extends PoolBase {
     this[kUrl] = util.parseOrigin(origin)
     this[kOptions] = { ...util.deepClone(options), connect, allowH2, useH2c, clientTtl, socketPath }
     this[kFactory] = factory
+    this[kProtocol] = null
+    this[kProtocolProbe] = null
 
     this.on('connect', (origin, targets) => {
       if (clientTtl != null && clientTtl > 0) {
@@ -19297,21 +21143,72 @@ class Pool extends PoolBase {
           Object.assign(target, { ttl: Date.now() })
         }
       }
+
+      const client = targets[targets.length - 1]
+      if (client instanceof Client) {
+        this[kProtocol] = client[kHTTPContext]?.version
+      }
+
+      if (client === this[kProtocolProbe]) {
+        // An h2 Client's drain event releases the requests accumulated during
+        // negotiation onto that Client. If ALPN selected h1, release the probe
+        // immediately and restore normal Pool fan-out instead.
+        if (this[kProtocol] !== 'h2') {
+          this[kProtocolProbe] = null
+          this[kDrainQueue](origin, targets.slice(1))
+        }
+      }
     })
 
-    this.on('connectionError', (origin, targets, error) => {
+    this.on('disconnect', (origin, targets) => {
+      if (targets.includes(this[kProtocolProbe])) {
+        this[kProtocolProbe] = null
+        this[kDrainQueue](origin, targets.slice(1))
+      }
+    })
+
+    this.on('connectionError', (origin, targets) => {
+      let resumeQueued = false
+
       // If a connection error occurs, we remove the client from the pool,
       // and emit a connectionError event. They will not be re-used.
       // Fixes https://github.com/nodejs/undici/issues/3895
       for (const target of targets) {
-        // Do not use kRemoveClient here, as it will close the client,
-        // but the client cannot be closed in this state.
-        const idx = this[kClients].indexOf(target)
-        if (idx !== -1) {
-          this[kClients].splice(idx, 1)
+        if (target === this[kProtocolProbe]) {
+          this[kProtocolProbe] = null
+          resumeQueued = true
+        }
+
+        // Retire (close) the client rather than only dropping it from
+        // kClients: otherwise its drain listener keeps pulling requests from
+        // the pool queue onto a client that pool.destroy() can't reach.
+        if (this[kClients].includes(target)) {
+          this[kRetireClient](target)
         }
       }
+
+      // The retired client no longer drains the pool queue, so hand any
+      // queued requests to another (possibly new) client.
+      if (resumeQueued || this[kQueued] > 0) {
+        this[kDrainQueue](origin, targets.slice(1))
+      }
     })
+  }
+
+  [kOnClientBusy] (client) {
+    if (
+      this[kProtocolProbe] === null &&
+      client[kConnecting] &&
+      shouldCreateProtocolProbe(this, client)
+    ) {
+      this[kProtocolProbe] = client
+    }
+  }
+
+  [kOnClientDrain] (client) {
+    if (client === this[kProtocolProbe]) {
+      this[kProtocolProbe] = null
+    }
   }
 
   [kGetDispatcher] () {
@@ -19328,10 +21225,12 @@ class Pool extends PoolBase {
       }
     }
 
+    if (this[kProtocolProbe] !== null) {
+      return
+    }
+
     if (!this[kConnections] || this[kClients].length < this[kConnections]) {
-      const dispatcher = this[kFactory](this[kUrl], this[kOptions])
-      this[kAddClient](dispatcher)
-      return dispatcher
+      return createClient(this)
     }
   }
 
@@ -19348,9 +21247,12 @@ class Pool extends PoolBase {
       }
     }
 
+    if (this[kProtocolProbe] !== null) {
+      return false
+    }
+
     if (!this[kConnections] || this[kClients].length < this[kConnections]) {
-      const dispatcher = this[kFactory](this[kUrl], this[kOptions])
-      this[kAddClient](dispatcher)
+      createClient(this)
       return true
     }
 
@@ -19377,6 +21279,7 @@ const buildConnector = __nccwpck_require__(9136)
 const Client = __nccwpck_require__(3701)
 const { channels } = __nccwpck_require__(2414)
 const Socks5ProxyAgent = __nccwpck_require__(7223)
+const { hasSafeIterator } = __nccwpck_require__(3440)
 
 const kAgent = Symbol('proxy agent')
 const kClient = Symbol('proxy client')
@@ -19450,11 +21353,10 @@ class Http1ProxyWrapper extends DispatcherBase {
 
     opts.path = origin + path
 
-    if (!('host' in headers) && !('Host' in headers)) {
-      const { host } = new URL(origin)
-      headers.host = host
-    }
     opts.headers = { ...this[kProxyHeaders], ...headers }
+    if (!hasHostHeader(headers)) {
+      opts.headers.host = new URL(origin).host
+    }
 
     // Pin the SNI/cert hostname to the proxy. Without this the underlying
     // Client would derive it from the (rewritten) Host header, which points
@@ -19488,7 +21390,7 @@ class ProxyAgent extends DispatcherBase {
 
     const { proxyTunnel, connectTimeout } = opts
 
-    super()
+    super(opts)
 
     const url = this.#getUrl(opts)
     const { href, origin, port, protocol, username, password, hostname: proxyHostname } = url
@@ -19529,6 +21431,7 @@ class ProxyAgent extends DispatcherBase {
           factory: agentFactory,
           username: opts.username || username,
           password: opts.password || password,
+          connectTimeout,
           proxyTls: opts.proxyTls,
           requestTls: opts.requestTls
         })
@@ -19642,12 +21545,14 @@ class ProxyAgent extends DispatcherBase {
   }
 
   dispatch (opts, handler) {
-    const headers = buildHeaders(opts.headers)
+    let headers = buildHeaders(opts.headers)
     throwIfProxyAuthIsSent(headers)
 
-    if (headers && !('host' in headers) && !('Host' in headers)) {
-      const { host } = new URL(opts.origin)
-      headers.host = host
+    if (headers && !hasHostHeader(headers)) {
+      if (headers === opts.headers) {
+        headers = { ...headers }
+      }
+      headers.host = new URL(opts.origin).host
     }
 
     return this[kAgent].dispatch(
@@ -19691,8 +21596,8 @@ class ProxyAgent extends DispatcherBase {
 }
 
 /**
- * @param {string[] | Record<string, string>} headers
- * @returns {Record<string, string>}
+ * @param {string[] | Record<string, string> | Iterable<[string, string | string[] | undefined]>} headers
+ * @returns {Record<string, string | string[] | undefined>}
  */
 function buildHeaders (headers) {
   // When using undici.fetch, the headers list is stored
@@ -19707,6 +21612,34 @@ function buildHeaders (headers) {
       }
 
       headersPair[headers[i]] = headers[i + 1]
+    }
+
+    return headersPair
+  }
+
+  // Materialize iterable header containers (e.g. Map, Headers) into a record so
+  // that throwIfProxyAuthIsSent() can inspect their entries. Object.keys and
+  // for...in see nothing on a Map/Headers instance, so without this the
+  // Proxy-Authorization guard is bypassed and proxy credentials can reach the
+  // origin server (GHSA-6cv7-626c-qhqw).
+  if (headers && typeof headers === 'object' && hasSafeIterator(headers)) {
+    const headersPair = {}
+
+    for (const [key, value] of headers) {
+      if (!Object.hasOwn(headersPair, key)) {
+        headersPair[key] = value
+        continue
+      }
+
+      const previous = headersPair[key]
+      const values = []
+      if (previous !== undefined) {
+        values.push(...(Array.isArray(previous) ? previous : [previous]))
+      }
+      if (value !== undefined) {
+        values.push(...(Array.isArray(value) ? value : [value]))
+      }
+      headersPair[key] = values.length > 1 ? values : values[0]
     }
 
     return headersPair
@@ -19739,6 +21672,15 @@ function isProxyAuthorizationHeader (key) {
   return key.length === proxyAuthorization.length && key.toLowerCase() === proxyAuthorization
 }
 
+function hasHostHeader (headers) {
+  for (const key in headers) {
+    if (key.length === 4 && key.toLowerCase() === 'host') {
+      return true
+    }
+  }
+  return false
+}
+
 function throwProxyAuthError () {
   throw new InvalidArgumentError('Proxy-Authorization should be sent in ProxyAgent constructor')
 }
@@ -19755,6 +21697,7 @@ module.exports = ProxyAgent
 
 const Dispatcher = __nccwpck_require__(883)
 const RetryHandler = __nccwpck_require__(7816)
+const { kOriginless, kUrl } = __nccwpck_require__(6443)
 
 class RetryAgent extends Dispatcher {
   #agent = null
@@ -19763,6 +21706,8 @@ class RetryAgent extends Dispatcher {
     super(options)
     this.#agent = agent
     this.#options = options
+    this[kUrl] = agent[kUrl]
+    this[kOriginless] = agent[kOriginless]
   }
 
   dispatch (opts, handler) {
@@ -19774,6 +21719,16 @@ class RetryAgent extends Dispatcher {
       handler
     })
     return this.#agent.dispatch(opts, retry)
+  }
+
+  // WebSocket and EventSource read their receive limits from the dispatcher
+  // they are given, so report the wrapped agent's settings rather than none.
+  get webSocketOptions () {
+    return this.#agent.webSocketOptions
+  }
+
+  get eventSourceOptions () {
+    return this.#agent.eventSourceOptions
   }
 
   close () {
@@ -19802,14 +21757,16 @@ const {
   kAddClient,
   kGetDispatcher,
   kHasDispatcher,
-  kRemoveClient
+  kRemoveClient,
+  kRetireClient,
+  kDrainQueue
 } = __nccwpck_require__(2128)
 const Client = __nccwpck_require__(3701)
 const {
   InvalidArgumentError
 } = __nccwpck_require__(8707)
 const util = __nccwpck_require__(3440)
-const { kUrl } = __nccwpck_require__(6443)
+const { kUrl, kQueued } = __nccwpck_require__(6443)
 const buildConnector = __nccwpck_require__(9136)
 
 const kOptions = Symbol('options')
@@ -19860,7 +21817,7 @@ class RoundRobinPool extends PoolBase {
       })
     }
 
-    super()
+    super(options)
 
     this[kConnections] = connections || null
     this[kUrl] = util.parseOrigin(origin)
@@ -19877,11 +21834,19 @@ class RoundRobinPool extends PoolBase {
     })
 
     this.on('connectionError', (origin, targets, error) => {
+      // Retire (close) the client rather than only dropping it from
+      // kClients: otherwise its drain listener keeps pulling requests from
+      // the pool queue onto a client that pool.destroy() can't reach.
       for (const target of targets) {
-        const idx = this[kClients].indexOf(target)
-        if (idx !== -1) {
-          this[kClients].splice(idx, 1)
+        if (this[kClients].includes(target)) {
+          this[kRetireClient](target)
         }
+      }
+
+      // The retired client no longer drains the pool queue, so hand any
+      // queued requests to another (possibly new) client.
+      if (this[kQueued] > 0) {
+        this[kDrainQueue](origin, targets.slice(1))
       }
     })
   }
@@ -19965,14 +21930,17 @@ const { URL } = __nccwpck_require__(3136)
 
 let tls // include tls conditionally since it is not always available
 const DispatcherBase = __nccwpck_require__(1841)
-const { InvalidArgumentError } = __nccwpck_require__(8707)
+const { ConnectTimeoutError, InvalidArgumentError } = __nccwpck_require__(8707)
 const { Socks5Client, STATES } = __nccwpck_require__(8082)
 const { kBusy, kConnected, kDispatch, kClose, kDestroy } = __nccwpck_require__(6443)
 const Pool = __nccwpck_require__(628)
 const buildConnector = __nccwpck_require__(9136)
+const { setupConnectTimeout } = __nccwpck_require__(3440)
 const { debuglog } = __nccwpck_require__(7975)
 
 const debug = debuglog('undici:socks5-proxy')
+
+const DEFAULT_SOCKS5_CONNECT_TIMEOUT = 5000
 
 const kProxyUrl = Symbol('proxy url')
 const kProxyHeaders = Symbol('proxy headers')
@@ -19980,7 +21948,15 @@ const kProxyAuth = Symbol('proxy auth')
 const kProxyProtocol = Symbol('proxy protocol')
 const kPools = Symbol('pools')
 const kConnector = Symbol('connector')
+const kConnectTimeout = Symbol('connect timeout')
 const kRequestTls = Symbol('request tls settings')
+const kRequestTlsTimeout = Symbol('request tls timeout')
+
+function createConnectTimeoutError (hostname, port, timeout) {
+  return new ConnectTimeoutError(
+    `Connect Timeout Error (attempted address: ${hostname}:${port}, timeout: ${timeout}ms)`
+  )
+}
 
 // Static flag to ensure warning is only emitted once per process
 let experimentalWarningEmitted = false
@@ -19990,7 +21966,7 @@ let experimentalWarningEmitted = false
  */
 class Socks5ProxyAgent extends DispatcherBase {
   constructor (proxyUrl, options = {}) {
-    super()
+    super(options)
 
     // Emit experimental warning only once
     if (!experimentalWarningEmitted) {
@@ -20015,7 +21991,20 @@ class Socks5ProxyAgent extends DispatcherBase {
     this[kProxyUrl] = url
     this[kProxyHeaders] = options.headers || {}
     this[kProxyProtocol] = options.proxyTls ? 'https:' : 'http:'
-    this[kRequestTls] = options.requestTls
+
+    const connectTimeout = options.connectTimeout ?? DEFAULT_SOCKS5_CONNECT_TIMEOUT
+    if (!Number.isFinite(connectTimeout) || connectTimeout < 0) {
+      throw new InvalidArgumentError('invalid connectTimeout')
+    }
+    this[kConnectTimeout] = connectTimeout
+
+    const { timeout, ...requestTls } = options.requestTls || {}
+    const requestTlsTimeout = timeout ?? connectTimeout
+    if (!Number.isFinite(requestTlsTimeout) || requestTlsTimeout < 0) {
+      throw new InvalidArgumentError('invalid requestTls.timeout')
+    }
+    this[kRequestTls] = requestTls
+    this[kRequestTlsTimeout] = requestTlsTimeout
 
     // Extract auth from URL or options
     this[kProxyAuth] = {
@@ -20024,8 +22013,13 @@ class Socks5ProxyAgent extends DispatcherBase {
     }
 
     // Create connector for proxy connection
+    const proxyTlsTimeout = options.proxyTls?.timeout ?? connectTimeout
+    if (!Number.isFinite(proxyTlsTimeout) || proxyTlsTimeout < 0) {
+      throw new InvalidArgumentError('invalid proxyTls.timeout')
+    }
     this[kConnector] = options.connect || buildConnector({
       ...options.proxyTls,
+      timeout: proxyTlsTimeout,
       servername: options.proxyTls?.servername || url.hostname
     })
 
@@ -20074,20 +22068,29 @@ class Socks5ProxyAgent extends DispatcherBase {
 
     // Wait for authentication (if required)
     const authenticationReady = Promise.withResolvers()
+    const authenticationTimeout = this[kConnectTimeout] === 0
+      ? null
+      : setTimeout(() => {
+        cleanupAuthenticationListeners()
+        socks5Client.destroy()
+        authenticationReady.reject(
+          createConnectTimeoutError(proxyHost, proxyPort, this[kConnectTimeout])
+        )
+      }, this[kConnectTimeout])
 
-    const authenticationTimeout = setTimeout(() => {
-      authenticationReady.reject(new Error('SOCKS5 authentication timeout'))
-    }, 5000)
+    const cleanupAuthenticationListeners = () => {
+      clearTimeout(authenticationTimeout)
+      socks5Client.removeListener('authenticated', onAuthenticated)
+      socks5Client.removeListener('error', onAuthenticationError)
+    }
 
     const onAuthenticated = () => {
-      clearTimeout(authenticationTimeout)
-      socks5Client.removeListener('error', onAuthenticationError)
+      cleanupAuthenticationListeners()
       authenticationReady.resolve()
     }
 
     const onAuthenticationError = (err) => {
-      clearTimeout(authenticationTimeout)
-      socks5Client.removeListener('authenticated', onAuthenticated)
+      cleanupAuthenticationListeners()
       authenticationReady.reject(err)
     }
 
@@ -20107,21 +22110,30 @@ class Socks5ProxyAgent extends DispatcherBase {
 
     // Wait for connection
     const connectionReady = Promise.withResolvers()
+    const connectionTimeout = this[kConnectTimeout] === 0
+      ? null
+      : setTimeout(() => {
+        cleanupConnectionListeners()
+        socks5Client.destroy()
+        connectionReady.reject(
+          createConnectTimeoutError(targetHost, targetPort, this[kConnectTimeout])
+        )
+      }, this[kConnectTimeout])
 
-    const connectionTimeout = setTimeout(() => {
-      connectionReady.reject(new Error('SOCKS5 connection timeout'))
-    }, 5000)
+    const cleanupConnectionListeners = () => {
+      clearTimeout(connectionTimeout)
+      socks5Client.removeListener('connected', onConnected)
+      socks5Client.removeListener('error', onConnectionError)
+    }
 
     const onConnected = (info) => {
       debug('SOCKS5 tunnel established to', targetHost, targetPort, 'via', info)
-      clearTimeout(connectionTimeout)
-      socks5Client.removeListener('error', onConnectionError)
+      cleanupConnectionListeners()
       connectionReady.resolve()
     }
 
     const onConnectionError = (err) => {
-      clearTimeout(connectionTimeout)
-      socks5Client.removeListener('connected', onConnected)
+      cleanupConnectionListeners()
       connectionReady.reject(err)
     }
 
@@ -20174,8 +22186,31 @@ class Socks5ProxyAgent extends DispatcherBase {
                 })
 
                 const tlsReady = Promise.withResolvers()
-                finalSocket.once('secureConnect', tlsReady.resolve)
-                finalSocket.once('error', tlsReady.reject)
+
+                const cleanupTlsListeners = () => {
+                  queueMicrotask(clearTlsTimeout)
+                  finalSocket.removeListener('secureConnect', onSecureConnect)
+                  finalSocket.removeListener('error', onTlsError)
+                }
+
+                const onSecureConnect = () => {
+                  cleanupTlsListeners()
+                  tlsReady.resolve()
+                }
+
+                const onTlsError = (err) => {
+                  cleanupTlsListeners()
+                  tlsReady.reject(err)
+                }
+
+                const clearTlsTimeout = setupConnectTimeout(new WeakRef(finalSocket), {
+                  timeout: this[kRequestTlsTimeout],
+                  hostname: targetHost,
+                  port: targetPort
+                })
+
+                finalSocket.once('secureConnect', onSecureConnect)
+                finalSocket.once('error', onTlsError)
                 await tlsReady.promise
               }
 
@@ -20378,6 +22413,7 @@ module.exports = {
 
 
 const util = __nccwpck_require__(3440)
+const { kRedirectCacheControl } = __nccwpck_require__(6443)
 const {
   parseCacheControlHeader,
   hasInvalidCacheControlDirective,
@@ -20386,9 +22422,77 @@ const {
   isInvalidOrWildcardVaryHeader,
   isEtagUsable
 } = __nccwpck_require__(7659)
+
+/**
+ * A suppressed redirect hop recorded by the redirect handler. Carried on
+ * {@link kRedirectCacheControl} and inspected by the cache handler before the
+ * final response is stored under the original request key.
+ *
+ * @typedef {object} RedirectHop
+ * @property {number} statusCode The hop's response status code (e.g. 302).
+ * @property {import('../../types/header.d.ts').IncomingHttpHeaders} headers The hop's response headers.
+ * @property {number} receivedAt The time the hop's response headers were received.
+ */
 const { parseHttpDate } = __nccwpck_require__(5453)
 
 function noop () {}
+
+class CacheController {
+  #blocked = false
+  #downstreamPaused = false
+
+  constructor (target) {
+    this.target = target
+  }
+
+  block () {
+    this.#blocked = true
+  }
+
+  release () {
+    this.#blocked = false
+    if (!this.#downstreamPaused) {
+      this.target.resume()
+    }
+  }
+
+  pause () {
+    this.#downstreamPaused = true
+    this.target.pause()
+  }
+
+  resume () {
+    this.#downstreamPaused = false
+    if (!this.#blocked) {
+      this.target.resume()
+    }
+  }
+
+  abort (reason) {
+    this.target.abort(reason)
+  }
+
+  get paused () { return this.#downstreamPaused }
+  get aborted () { return this.target.aborted }
+  get reason () { return this.target.reason }
+  get rawHeaders () { return this.target.rawHeaders }
+  set rawHeaders (value) { this.target.rawHeaders = value }
+  get rawTrailers () { return this.target.rawTrailers }
+  set rawTrailers (value) { this.target.rawTrailers = value }
+}
+
+/**
+ * @param {string | URL} a
+ * @param {string | URL} b
+ * @returns {boolean}
+ */
+function sameOrigin (a, b) {
+  try {
+    return new URL(String(a)).origin === new URL(String(b)).origin
+  } catch {
+    return String(a) === String(b)
+  }
+}
 
 // Status codes that we can use some heuristics on to cache
 const HEURISTICALLY_CACHEABLE_STATUS_CODES = [
@@ -20422,6 +22526,16 @@ function arrayIncludes (array, value) {
   }
 
   return false
+}
+
+function appendVaryValues (target, varyValue) {
+  if (Array.isArray(varyValue)) {
+    for (let i = 0; i < varyValue.length; i++) {
+      target.push(varyValue[i])
+    }
+  } else if (varyValue != null) {
+    target.push(varyValue)
+  }
 }
 
 function appendConnectionHeaderTokens (headersToRemove, connectionHeader) {
@@ -20495,6 +22609,26 @@ function invalidateUnsafeRequest (store, cacheKey, resHeaders) {
   deleteLocationTargets(store, cacheKey, resHeaders.location)
   deleteLocationTargets(store, cacheKey, resHeaders['content-location'])
 }
+
+/**
+ * Whether the original request carried a credential that is not reflected in
+ * the cache key. The memory/sqlite stores key an entry on origin, method, path
+ * and `vary` only, so a credentialed request that is redirected to a resource
+ * that varies per principal must not be stored under the original (alias) key:
+ * a later caller would be served the first principal's body. The set mirrors the
+ * request credentials the redirect handler strips across origins (`authorization`,
+ * `cookie`, `proxy-authorization`).
+ *
+ * @param {import('../../types/header.d.ts').IncomingHttpHeaders | undefined} headers
+ * @returns {boolean}
+ */
+function requestCarriesCredentials (headers) {
+  return headers != null && (
+    Object.hasOwn(headers, 'authorization') ||
+    Object.hasOwn(headers, 'cookie') ||
+    Object.hasOwn(headers, 'proxy-authorization')
+  )
+}
 /**
  * @typedef {import('../../types/dispatcher.d.ts').default.DispatchHandler} DispatchHandler
  *
@@ -20527,9 +22661,22 @@ class CacheHandler {
   #handler
 
   /**
+   * @type {CacheController | undefined}
+   */
+  #downstreamController
+
+  /**
    * @type {import('node:stream').Writable | undefined}
    */
   #writeStream
+
+  /**
+   * The URLs visited while following redirects, shared by reference from the
+   * redirect handler through the request context. Carries the suppressed hops'
+   * status/headers under {@link kRedirectCacheControl}.
+   * @type {URL[] | undefined}
+   */
+  #history
 
   /**
    * @param {import('../../types/cache-interceptor.d.ts').default.CacheHandlerOptions} opts
@@ -20547,11 +22694,27 @@ class CacheHandler {
   onRequestStart (controller, context) {
     this.#writeStream?.destroy()
     this.#writeStream = undefined
-    this.#handler.onRequestStart?.(controller, context)
+    this.#downstreamController = new CacheController(controller)
+    // The redirect handler threads the list of visited URLs through the
+    // handler-chain context. Keep a reference to it (it is mutated as redirects
+    // are followed) so onResponseStart can tell which request actually produced
+    // the response. Unlike the request options object, this reference is not
+    // broken by an interceptor that copies the options between the cache and
+    // the redirect.
+    this.#history = context?.history
+    this.#handler.onRequestStart?.(this.#downstreamController, context)
   }
 
-  onRequestUpgrade (controller, statusCode, headers, socket) {
-    this.#handler.onRequestUpgrade?.(controller, statusCode, headers, socket)
+  onBodySent (chunk) {
+    this.#handler.onBodySent?.(chunk)
+  }
+
+  onRequestSent () {
+    this.#handler.onRequestSent?.()
+  }
+
+  onRequestUpgrade (_controller, statusCode, headers, socket) {
+    this.#handler.onRequestUpgrade?.(this.#downstreamController, statusCode, headers, socket)
   }
 
   /**
@@ -20568,7 +22731,7 @@ class CacheHandler {
   ) {
     const downstreamOnHeaders = () =>
       this.#handler.onResponseStart?.(
-        controller,
+        this.#downstreamController,
         statusCode,
         resHeaders,
         statusMessage
@@ -20586,7 +22749,70 @@ class CacheHandler {
       return downstreamOnHeaders()
     }
 
+    // A credential-bearing request that was redirected must not have the final
+    // hop's response stored under the original request's key. The cache key
+    // does not include the credential, and the redirect target may vary per
+    // principal (e.g. `/me` -> `/profile/{user}`), so replaying the body under
+    // the alias key would leak one principal's data to another — or to an
+    // unauthenticated caller — from a shared cache. The final hop's permissive
+    // cache-control (e.g. `public`) does not authorize this: the credential was
+    // presented to the original hop, not the resource that actually produced
+    // the body. Fail closed. A history with more than one entry means at least
+    // one redirect was actually followed (a single non-redirected hop records
+    // exactly one entry), so a plain revalidation is not mistaken for a redirect.
+    if (
+      this.#history && this.#history.length > 1 &&
+      requestCarriesCredentials(this.#cacheKey.headers)
+    ) {
+      return downstreamOnHeaders()
+    }
+
+    // A cross-origin redirect can change the origin that actually produced the
+    // final response. Keying that response on the original (trusted) origin
+    // would let a redirect target control an entry for a URL the application
+    // trusts. Every hop in the redirect chain must stay on the cache key's
+    // origin. An intermediate cross-origin hop can bounce back to the trusted
+    // origin (or to any cacheable asset there) even when the final response
+    // comes from the trusted origin, so checking only the final URL is not
+    // enough.
+    if (this.#history && this.#history.length > 0) {
+      for (const hopUrl of this.#history) {
+        if (!sameOrigin(hopUrl.origin, this.#cacheKey.origin)) {
+          return downstreamOnHeaders()
+        }
+      }
+    }
+
+    // A redirect hop that is not forwarded can still carry a storage policy
+    // (for example `no-store`, `private` for a shared cache, `no-cache`,
+    // `must-revalidate`, zero freshness, or `Vary: *`) that the final response
+    // body does not inherit. Honor it, otherwise a redirect that must not be
+    // stored (or that selects a private/authenticated target) could be
+    // laundered into a cacheable final response under the original key.
+    const now = Date.now()
+    const redirectHopInfo = this.#history?.[kRedirectCacheControl]
+    const redirectPolicy = redirectHopInfo?.length > 0
+      ? getRedirectPolicy(
+        this.#cacheType,
+        this.#cacheKey.method,
+        redirectHopInfo,
+        this.#cacheKey.headers,
+        this.#cacheByDefault,
+        now
+      )
+      : undefined
+    if (redirectHopInfo?.length > 0 && redirectPolicy === undefined) {
+      return downstreamOnHeaders()
+    }
+
     const cacheControlHeader = resHeaders['cache-control']
+    const cacheControlDirectives = cacheControlHeader ? parseCacheControlHeader(cacheControlHeader) : {}
+
+    if (revalidationResponseDisallowsCachedReuse(this.#cacheType, resHeaders, cacheControlDirectives)) {
+      deleteCachedValue(this.#store, this.#cacheKey)
+      return downstreamOnHeaders()
+    }
+
     const heuristicallyCacheable = resHeaders['last-modified'] && arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode)
     if (
       !cacheControlHeader &&
@@ -20603,8 +22829,7 @@ class CacheHandler {
       return downstreamOnHeaders()
     }
 
-    const cacheControlDirectives = cacheControlHeader ? parseCacheControlHeader(cacheControlHeader) : {}
-    if (!canCacheResponse(this.#cacheType, statusCode, resHeaders, cacheControlDirectives, this.#cacheKey.headers)) {
+    if (!canCacheResponse(this.#cacheType, this.#cacheKey.method, statusCode, resHeaders, cacheControlDirectives, this.#cacheKey.headers)) {
       if (statusCode === 304 && (cacheControlHeader || revalidationResponseDisallowsCachedReuse(this.#cacheType, resHeaders, cacheControlDirectives))) {
         deleteCachedValue(this.#store, this.#cacheKey)
       }
@@ -20612,7 +22837,6 @@ class CacheHandler {
       return downstreamOnHeaders()
     }
 
-    const now = Date.now()
     const resAge = Object.hasOwn(resHeaders, 'age') ? getAge(resHeaders.age) : undefined
     if (resAge !== undefined && resAge >= MAX_RESPONSE_AGE) {
       // Response considered stale
@@ -20649,24 +22873,65 @@ class CacheHandler {
     }
 
     const baseTime = now - currentAge
-    const absoluteStaleAt = staleAt + baseTime
+    let absoluteStaleAt = staleAt + baseTime
+    if (redirectPolicy !== undefined) {
+      absoluteStaleAt = Math.min(absoluteStaleAt, redirectPolicy.staleAt)
+    }
     if (now >= absoluteStaleAt && !revalidationOnly) {
       // Response is already stale
       deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey)
       return downstreamOnHeaders()
     }
 
+    // Union the `Vary` of every suppressed redirect hop with the final
+    // response's `Vary`. A 3xx hop that negotiates its target on `Authorization`
+    // / `Cookie` (or any other header) must make the stored entry vary on those
+    // headers too, or an authenticated user's private response would be served
+    // to unrelated callers.
     let varyDirectives
-    if (this.#cacheKey.headers && resHeaders.vary) {
-      varyDirectives = parseVaryHeader(resHeaders.vary, this.#cacheKey.headers)
-      if (!varyDirectives) {
-        // Parse error
-        return downstreamOnHeaders()
+    const combinedVary = []
+    if (redirectHopInfo) {
+      for (const hop of redirectHopInfo) {
+        appendVaryValues(combinedVary, hop?.headers?.vary)
+      }
+    }
+    appendVaryValues(combinedVary, resHeaders.vary)
+    if (combinedVary.length > 0) {
+      for (const varyHeader of combinedVary) {
+        if (hasVaryStar(varyHeader)) {
+          // `Vary: *` means the response can never be reused (RFC 9111 §4.1)
+          return downstreamOnHeaders()
+        }
+      }
+      if (this.#cacheKey.headers) {
+        varyDirectives = parseVaryHeader(combinedVary, this.#cacheKey.headers)
+        if (!varyDirectives) {
+          // Parse error
+          return downstreamOnHeaders()
+        }
+      }
+    }
+
+    // When the entry was folded from a redirect chain, the final response's
+    // stale-serving directives (RFC 5861) must not outlive the hops' freshness.
+    // A hop that grants no `stale-while-revalidate` / `stale-if-error` caps
+    // stale serving at its freshness, so the final response cannot launder a
+    // stale-serving window past the hop-bounded `staleAt`. Drop those directives
+    // (and keep the `proxy-revalidate` the hop policy may require) so the entry
+    // revalidates at `staleAt` instead of being served stale for the final
+    // response's window.
+    let effectiveCacheControlDirectives = cacheControlDirectives
+    if (redirectPolicy !== undefined) {
+      effectiveCacheControlDirectives = { ...cacheControlDirectives }
+      delete effectiveCacheControlDirectives['stale-while-revalidate']
+      delete effectiveCacheControlDirectives['stale-if-error']
+      if (redirectPolicy.requiresRevalidation === true) {
+        effectiveCacheControlDirectives['proxy-revalidate'] = true
       }
     }
 
     const cachedAt = baseTime
-    const deleteAt = determineDeleteAt(baseTime, now, cacheControlDirectives, absoluteStaleAt)
+    const deleteAt = determineDeleteAt(baseTime, now, effectiveCacheControlDirectives, absoluteStaleAt)
     const strippedHeaders = stripNecessaryHeaders(resHeaders, cacheControlDirectives)
 
     /**
@@ -20677,7 +22942,7 @@ class CacheHandler {
       statusMessage,
       headers: strippedHeaders,
       vary: varyDirectives,
-      cacheControlDirectives,
+      cacheControlDirectives: effectiveCacheControlDirectives,
       cachedAt,
       staleAt: absoluteStaleAt,
       deleteAt
@@ -20686,10 +22951,37 @@ class CacheHandler {
     // Not modified, re-use the cached value
     // https://www.rfc-editor.org/rfc/rfc9111.html#name-handling-304-not-modified
     if (statusCode === 304) {
+      let done = false
+      const finish304 = () => {
+        if (done) {
+          return
+        }
+        done = true
+        this.#downstreamController.release()
+      }
+
+      // The cached body below is replayed to the downstream handler from later
+      // stream ticks (or an iterator loop), outside the dispatcher's own error
+      // handling, so a throwing downstream handler must be converged to a
+      // per-request error instead of escaping as an uncaught exception.
+      const failReplay = (err) => {
+        if (done) {
+          return
+        }
+        done = true
+        // Abort the revalidation request: this releases the paused origin
+        // response (freeing the connection) and routes the error through
+        // CacheHandler.onResponseError, which destroys the cache write stream
+        // and forwards the error downstream exactly once.
+        controller.abort(err)
+      }
+
       const handle304 = (cachedValue) => {
         if (!cachedValue) {
           // Do not create a new cache entry, as a 304 won't have a body - so cannot be cached.
-          return downstreamOnHeaders()
+          downstreamOnHeaders()
+          finish304()
+          return
         }
 
         // Re-use the cached value: statuscode, statusmessage, headers and body
@@ -20704,6 +22996,7 @@ class CacheHandler {
         this.#writeStream = this.#store.createWriteStream(this.#cacheKey, value)
 
         if (!this.#writeStream || !cachedValue?.body) {
+          finish304()
           return
         }
 
@@ -20711,13 +23004,21 @@ class CacheHandler {
           const bodyIterator = cachedValue.body.values()
 
           const streamCachedBody = () => {
-            for (const chunk of bodyIterator) {
-              const full = this.#writeStream.write(chunk) === false
-              this.#handler.onResponseData?.(controller, chunk)
-              // when stream is full stop writing until we get a 'drain' event
-              if (full) {
-                break
+            if (done) {
+              return
+            }
+            try {
+              for (const chunk of bodyIterator) {
+                const full = this.#writeStream?.write(chunk) === false
+                this.#handler.onResponseData?.(this.#downstreamController, chunk)
+                // when stream is full stop writing until we get a 'drain' event
+                if (full) {
+                  return
+                }
               }
+              finish304()
+            } catch (err) {
+              failReplay(err)
             }
           }
 
@@ -20725,6 +23026,8 @@ class CacheHandler {
             .on('error', function () {
               handler.#writeStream = undefined
               handler.#store.delete(handler.#cacheKey)
+              // Keep replaying downstream without the store
+              streamCachedBody()
             })
             .on('drain', () => {
               streamCachedBody()
@@ -20732,6 +23035,8 @@ class CacheHandler {
             .on('close', function () {
               if (handler.#writeStream === this) {
                 handler.#writeStream = undefined
+                // Keep replaying downstream without the store
+                streamCachedBody()
               }
             })
 
@@ -20740,15 +23045,22 @@ class CacheHandler {
           // Readable stream body (e.g. from async/remote cache stores)
           cachedValue.body
             .on('data', (chunk) => {
-              this.#writeStream.write(chunk)
-              this.#handler.onResponseData?.(controller, chunk)
+              try {
+                this.#writeStream?.write(chunk)
+                this.#handler.onResponseData?.(this.#downstreamController, chunk)
+              } catch (err) {
+                cachedValue.body.destroy()
+                failReplay(err)
+              }
             })
             .on('end', () => {
-              this.#writeStream.end()
+              this.#writeStream?.end()
+              finish304()
             })
             .on('error', () => {
               this.#writeStream = undefined
               this.#store.delete(this.#cacheKey)
+              finish304()
             })
 
           this.#writeStream
@@ -20761,6 +23073,8 @@ class CacheHandler {
                 handler.#writeStream = undefined
               }
             })
+        } else {
+          finish304()
         }
       }
 
@@ -20768,8 +23082,14 @@ class CacheHandler {
        * @type {import('../../types/cache-interceptor.d.ts').default.CacheValue}
        */
       const result = this.#store.get(this.#cacheKey)
+      // A 304 ends before the cached body is replayed. Keep the origin
+      // response paused until replay is complete.
+      this.#downstreamController.block()
+      controller.pause()
       if (result && typeof result.then === 'function') {
-        result.then(handle304)
+        result.then(handle304, () => handle304(undefined)).catch((err) => {
+          controller.abort(err)
+        })
       } else {
         handle304(result)
       }
@@ -20812,18 +23132,18 @@ class CacheHandler {
       controller.pause()
     }
 
-    this.#handler.onResponseData?.(controller, chunk)
+    this.#handler.onResponseData?.(this.#downstreamController, chunk)
   }
 
   onResponseEnd (controller, trailers) {
     this.#writeStream?.end()
-    this.#handler.onResponseEnd?.(controller, trailers)
+    this.#handler.onResponseEnd?.(this.#downstreamController, trailers)
   }
 
   onResponseError (controller, err) {
     this.#writeStream?.destroy(err)
     this.#writeStream = undefined
-    this.#handler.onResponseError?.(controller, err)
+    this.#handler.onResponseError?.(this.#downstreamController, err)
   }
 }
 
@@ -20853,7 +23173,10 @@ function deleteCachedValueIfNotModified (statusCode, store, cacheKey) {
  */
 function revalidationResponseDisallowsCachedReuse (cacheType, resHeaders, cacheControlDirectives) {
   return cacheControlDirectives['no-store'] === true ||
-    (cacheType === 'shared' && cacheControlDirectives.private === true) ||
+    (cacheType === 'shared' && (
+      cacheControlDirectives.private === true ||
+      Object.hasOwn(resHeaders, 'set-cookie')
+    )) ||
     (resHeaders.vary ? isInvalidOrWildcardVaryHeader(resHeaders.vary) : false)
 }
 
@@ -20861,12 +23184,16 @@ function revalidationResponseDisallowsCachedReuse (cacheType, resHeaders, cacheC
  * @see https://www.rfc-editor.org/rfc/rfc9111.html#name-storing-responses-to-authen
  *
  * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
+ * @param {string} method
  * @param {number} statusCode
  * @param {import('../../types/header.d.ts').IncomingHttpHeaders} resHeaders
  * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives} cacheControlDirectives
  * @param {import('../../types/header.d.ts').IncomingHttpHeaders} [reqHeaders]
  */
-function canCacheResponse (cacheType, statusCode, resHeaders, cacheControlDirectives, reqHeaders) {
+function canCacheResponse (cacheType, method, statusCode, resHeaders, cacheControlDirectives, reqHeaders) {
+  if (!arrayIncludes(util.safeHTTPMethods, method)) {
+    return false
+  }
   // Status code must be final and understood.
   if (statusCode < 200 || arrayIncludes(NOT_UNDERSTOOD_STATUS_CODES, statusCode)) {
     return false
@@ -20887,7 +23214,10 @@ function canCacheResponse (cacheType, statusCode, resHeaders, cacheControlDirect
     return false
   }
 
-  if (cacheType === 'shared' && cacheControlDirectives.private === true) {
+  if (cacheType === 'shared' && (
+    cacheControlDirectives.private === true ||
+    Object.hasOwn(resHeaders, 'set-cookie')
+  )) {
     return false
   }
 
@@ -20926,6 +23256,139 @@ function canCacheResponse (cacheType, statusCode, resHeaders, cacheControlDirect
   }
 
   return true
+}
+
+/**
+ * Determine the absolute freshness deadline imposed by all suppressed redirect
+ * hops. Returning `undefined` means at least one hop cannot safely be folded
+ * into the final response under the original request key.
+ *
+ * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
+ * @param {string} method
+ * @param {RedirectHop[]} redirectHops
+ * @param {import('../../types/header.d.ts').IncomingHttpHeaders} reqHeaders
+ * @param {number | undefined} cacheByDefault
+ * @param {number} now
+ * @returns {{ staleAt: number, requiresRevalidation: boolean } | undefined}
+ */
+function getRedirectPolicy (cacheType, method, redirectHops, reqHeaders, cacheByDefault, now) {
+  let staleAt = Infinity
+  let requiresRevalidation = false
+
+  for (const hop of redirectHops) {
+    const hopPolicy = getRedirectHopPolicy(cacheType, method, hop, reqHeaders, cacheByDefault)
+    if (hopPolicy === undefined || hopPolicy.staleAt <= now) {
+      return undefined
+    }
+
+    staleAt = Math.min(staleAt, hopPolicy.staleAt)
+    requiresRevalidation ||= hopPolicy.requiresRevalidation
+  }
+
+  return { staleAt, requiresRevalidation }
+}
+
+/**
+ * Calculate one redirect hop's absolute freshness deadline using the same age,
+ * date, expiration, invalid-directive, and heuristic rules as a final response.
+ *
+ * @param {import('../../types/cache-interceptor.d.ts').default.CacheOptions['type']} cacheType
+ * @param {string} method
+ * @param {RedirectHop} hop
+ * @param {import('../../types/header.d.ts').IncomingHttpHeaders} reqHeaders
+ * @param {number | undefined} cacheByDefault
+ * @returns {{ staleAt: number, requiresRevalidation: boolean } | undefined}
+ */
+function getRedirectHopPolicy (cacheType, method, hop, reqHeaders, cacheByDefault) {
+  if (!Number.isInteger(hop?.statusCode) || !Number.isFinite(hop?.receivedAt)) {
+    return undefined
+  }
+
+  const hopHeaders = hop.headers ?? {}
+  const cacheControlHeader = hopHeaders['cache-control']
+  const hopCacheControl = cacheControlHeader
+    ? parseCacheControlHeader(cacheControlHeader)
+    : {}
+
+  // https://www.rfc-editor.org/rfc/rfc9111.html#section-4.1-5
+  if (hopHeaders.vary && hasVaryStar(hopHeaders.vary)) {
+    return undefined
+  }
+
+  if (hopCacheControl['no-store'] === true) {
+    return undefined
+  }
+
+  // A qualified `private` directive still marks the named fields as private.
+  // Folding a redirect that says `private="location"` would preserve the
+  // private target choice in the final body even though a shared cache is not
+  // allowed to store that Location field.
+  if (cacheType === 'shared' && Object.hasOwn(hopCacheControl, 'private')) {
+    return undefined
+  }
+
+  // These directives require the hop to be revalidated before reuse. Since the
+  // cache stores only the final response, it cannot independently validate the
+  // suppressed redirect response.
+  if (
+    Object.hasOwn(hopCacheControl, 'no-cache') ||
+    hopCacheControl['must-revalidate'] === true ||
+    (cacheType === 'shared' && hopCacheControl['proxy-revalidate'] === true)
+  ) {
+    return undefined
+  }
+
+  const heuristicallyCacheable =
+    hopHeaders['last-modified'] &&
+    arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, hop.statusCode)
+  if (
+    !cacheControlHeader &&
+    !hopHeaders.expires &&
+    !heuristicallyCacheable &&
+    !cacheByDefault
+  ) {
+    return undefined
+  }
+
+  if (!canCacheResponse(cacheType, method, hop.statusCode, hopHeaders, hopCacheControl, reqHeaders)) {
+    return undefined
+  }
+
+  const age = Object.hasOwn(hopHeaders, 'age') ? getAge(hopHeaders.age) : undefined
+  if (age !== undefined && age >= MAX_RESPONSE_AGE) {
+    return undefined
+  }
+
+  const responseDate = Object.hasOwn(hopHeaders, 'date') ? getDate(hopHeaders.date) : undefined
+  if (responseDate === null) {
+    return undefined
+  }
+
+  const apparentAge = responseDate ? Math.max(0, hop.receivedAt - responseDate.getTime()) : 0
+  const currentAge = Math.max(apparentAge, age ?? 0)
+  const hasValidator =
+    (typeof hopHeaders.etag === 'string' && isEtagUsable(hopHeaders.etag)) ||
+    typeof hopHeaders['last-modified'] === 'string'
+  const freshnessLifetime =
+    determineStaleAt(
+      cacheType,
+      hop.receivedAt,
+      age,
+      hopHeaders,
+      responseDate,
+      hopCacheControl,
+      hasValidator
+    ) ?? cacheByDefault
+
+  if (freshnessLifetime === undefined) {
+    return undefined
+  }
+
+  return {
+    staleAt: hop.receivedAt - currentAge + freshnessLifetime,
+    // RFC 9111 §5.2.2.10: s-maxage implies proxy-revalidate for shared caches.
+    requiresRevalidation: cacheType === 'shared' && Object.hasOwn(hopCacheControl, 's-maxage')
+  }
 }
 
 /**
@@ -21351,9 +23814,13 @@ module.exports = class DecoratorHandler {
   onResponseStart (...args) {
     assert(!this.#onCompleteCalled)
     assert(!this.#onErrorCalled)
-    assert(!this.#onResponseStartCalled)
 
-    this.#onResponseStartCalled = true
+    // Interim 1xx responses (e.g. 103 Early Hints) come before the final one.
+    const statusCode = args[1]
+    if (statusCode >= 200) {
+      assert(!this.#onResponseStartCalled)
+      this.#onResponseStartCalled = true
+    }
 
     return this.#handler.onResponseStart?.(...args)
   }
@@ -21381,7 +23848,13 @@ module.exports = class DecoratorHandler {
   /**
    * @deprecated
    */
-  onBodySent () {}
+  onBodySent (...args) {
+    return this.#handler.onBodySent?.(...args)
+  }
+
+  onRequestSent (...args) {
+    return this.#handler.onRequestSent?.(...args)
+  }
 }
 
 
@@ -21408,6 +23881,7 @@ const DEFAULT_MAX_BUFFER_SIZE = 5 * 1024 * 1024
  * @property {number} bufferedBytes
  * @property {object | null} pendingTrailers
  * @property {boolean} done
+ * @property {boolean} [pendingStart] onRequestStart deferred until the primary request's context is known
  */
 
 /**
@@ -21421,6 +23895,20 @@ class DeduplicationHandler {
    * @type {DispatchHandler}
    */
   #primaryHandler
+
+  /**
+   * Whether the primary request has started (onRequestStart received). Until
+   * then the request context is unknown and cannot be given to waiting handlers.
+   * @type {boolean}
+   */
+  #requestStarted = false
+
+  /**
+   * The primary request context, replayed to waiting handlers so they observe
+   * the same redirect history as the primary.
+   * @type {any}
+   */
+  #context = null
 
   /**
    * @type {WaitingHandler[]}
@@ -21504,20 +23992,30 @@ class DeduplicationHandler {
     const waitingController = waitingHandler.controller
 
     try {
-      handler.onRequestStart?.(waitingController, null)
+      if (this.#requestStarted) {
+        // The primary request has started, so its context (including the
+        // redirect history) is known and can be delivered immediately.
+        handler.onRequestStart?.(waitingController, this.#context)
 
-      if (waitingController.aborted) {
-        waitingHandler.done = true
-        return true
-      }
+        if (waitingController.aborted) {
+          waitingHandler.done = true
+          return true
+        }
 
-      if (this.#responseStarted) {
-        handler.onResponseStart?.(
-          waitingController,
-          this.#statusCode,
-          this.#headers,
-          this.#statusMessage
-        )
+        if (this.#responseStarted) {
+          handler.onResponseStart?.(
+            waitingController,
+            this.#statusCode,
+            this.#headers,
+            this.#statusMessage
+          )
+        }
+      } else {
+        // The primary request has not started yet. Defer onRequestStart until
+        // its context is known, so the waiting handler observes the same
+        // redirect history as the primary (a cache handler relies on it to
+        // reject cross-origin redirect responses).
+        waitingHandler.pendingStart = true
       }
     } catch {
       // Ignore errors from waiting handlers
@@ -21538,6 +24036,24 @@ class DeduplicationHandler {
    */
   onRequestStart (controller, context) {
     this.#controller = controller
+    if (!this.#requestStarted) {
+      this.#requestStarted = true
+      this.#context = context
+      // Deliver the now-known context to handlers that joined before the
+      // primary request started.
+      for (const waitingHandler of this.#waitingHandlers) {
+        if (waitingHandler.pendingStart && !waitingHandler.done && !waitingHandler.controller.aborted) {
+          waitingHandler.pendingStart = false
+          try {
+            waitingHandler.handler.onRequestStart?.(waitingHandler.controller, context)
+          } catch {
+            // Ignore errors from waiting handlers
+            waitingHandler.done = true
+          }
+        }
+      }
+      this.#pruneDoneWaitingHandlers()
+    }
     this.#primaryHandler.onRequestStart?.(controller, context)
   }
 
@@ -21644,37 +24160,40 @@ class DeduplicationHandler {
     }
 
     this.#completed = true
-    this.#primaryHandler.onResponseEnd?.(controller, trailers)
+    // Remove the completed request before callbacks can redispatch into this
+    // interceptor. Cleanup must not depend on downstream handlers succeeding.
+    this.#cleanup()
 
-    for (const waitingHandler of this.#waitingHandlers) {
-      if (waitingHandler.done || waitingHandler.controller.aborted) {
-        waitingHandler.done = true
-        continue
+    try {
+      this.#primaryHandler.onResponseEnd?.(controller, trailers)
+    } catch (err) {
+      // Completion callbacks may throw to initiate a retry. The transport's
+      // error callback would be ignored now that this handler is completed.
+      this.#primaryHandler.onResponseError?.(controller, err)
+    } finally {
+      for (const waitingHandler of this.#waitingHandlers) {
+        if (waitingHandler.done || waitingHandler.controller.aborted) {
+          waitingHandler.done = true
+          continue
+        }
+
+        this.#flushWaitingHandler(waitingHandler)
+
+        if (waitingHandler.done || waitingHandler.controller.aborted) {
+          waitingHandler.done = true
+          continue
+        }
+
+        if (waitingHandler.controller.paused) {
+          waitingHandler.pendingTrailers = trailers
+          continue
+        }
+
+        this.#endWaitingHandler(waitingHandler, trailers)
       }
 
-      this.#flushWaitingHandler(waitingHandler)
-
-      if (waitingHandler.done || waitingHandler.controller.aborted) {
-        waitingHandler.done = true
-        continue
-      }
-
-      if (waitingHandler.controller.paused && waitingHandler.bufferedChunks.length > 0) {
-        waitingHandler.pendingTrailers = trailers
-        continue
-      }
-
-      try {
-        waitingHandler.handler.onResponseEnd?.(waitingHandler.controller, trailers)
-      } catch {
-        // Ignore errors from waiting handlers
-      }
-
-      waitingHandler.done = true
+      this.#pruneDoneWaitingHandlers()
     }
-
-    this.#pruneDoneWaitingHandlers()
-    this.#onComplete?.()
   }
 
   /**
@@ -21688,15 +24207,23 @@ class DeduplicationHandler {
 
     this.#aborted = true
     this.#completed = true
+    this.#cleanup()
 
-    this.#primaryHandler.onResponseError?.(controller, err)
+    try {
+      this.#primaryHandler.onResponseError?.(controller, err)
+    } finally {
+      for (const waitingHandler of this.#waitingHandlers) {
+        this.#errorWaitingHandler(waitingHandler, err)
+      }
 
-    for (const waitingHandler of this.#waitingHandlers) {
-      this.#errorWaitingHandler(waitingHandler, err)
+      this.#waitingHandlers = []
     }
+  }
 
-    this.#waitingHandlers = []
-    this.#onComplete?.()
+  #cleanup () {
+    const onComplete = this.#onComplete
+    this.#onComplete = null
+    onComplete?.()
   }
 
   /**
@@ -21711,7 +24238,8 @@ class DeduplicationHandler {
       bufferedChunks: [],
       bufferedBytes: 0,
       pendingTrailers: null,
-      done: false
+      done: false,
+      pendingStart: false
     }
 
     const state = {
@@ -21736,14 +24264,7 @@ class DeduplicationHandler {
           !state.paused &&
           !state.aborted
         ) {
-          try {
-            waitingHandler.handler.onResponseEnd?.(waitingHandler.controller, waitingHandler.pendingTrailers)
-          } catch {
-            // Ignore errors from waiting handlers
-          }
-
-          waitingHandler.pendingTrailers = null
-          waitingHandler.done = true
+          this.#endWaitingHandler(waitingHandler, waitingHandler.pendingTrailers)
         }
 
         this.#pruneDoneWaitingHandlers()
@@ -21757,12 +24278,22 @@ class DeduplicationHandler {
       get aborted () { return state.aborted },
       get reason () { return state.reason },
       abort: (reason) => {
+        if (state.aborted) {
+          return
+        }
+
         state.aborted = true
         state.reason = reason ?? null
         waitingHandler.done = true
         waitingHandler.pendingTrailers = null
         waitingHandler.bufferedChunks = []
         waitingHandler.bufferedBytes = 0
+
+        try {
+          handler.onResponseError?.(waitingHandler.controller, state.reason ?? new RequestAbortedError())
+        } catch {
+          // Ignore errors from waiting handlers
+        }
       }
     }
 
@@ -21787,7 +24318,7 @@ class DeduplicationHandler {
 
     if (waitingHandler.bufferedBytes > this.#maxBufferSize) {
       const err = new RequestAbortedError(`Deduplicated waiting handler exceeded maxBufferSize (${this.#maxBufferSize} bytes) while paused`)
-      this.#errorWaitingHandler(waitingHandler, err)
+      waitingHandler.controller.abort(err)
     }
   }
 
@@ -21824,6 +24355,27 @@ class DeduplicationHandler {
 
   /**
    * @param {WaitingHandler} waitingHandler
+   * @param {object} trailers
+   */
+  #endWaitingHandler (waitingHandler, trailers) {
+    waitingHandler.done = true
+    waitingHandler.pendingTrailers = null
+
+    try {
+      waitingHandler.handler.onResponseEnd?.(waitingHandler.controller, trailers)
+    } catch (err) {
+      // This is a response failure, not a consumer abort. Aborting the waiting
+      // controller here would prevent downstream handlers from retrying.
+      try {
+        waitingHandler.handler.onResponseError?.(waitingHandler.controller, err)
+      } catch {
+        // An error callback must not prevent other waiting handlers completing.
+      }
+    }
+  }
+
+  /**
+   * @param {WaitingHandler} waitingHandler
    * @param {Error} err
    */
   #errorWaitingHandler (waitingHandler, err) {
@@ -21836,8 +24388,9 @@ class DeduplicationHandler {
     waitingHandler.bufferedChunks = []
     waitingHandler.bufferedBytes = 0
 
+    // A response failure is not a consumer abort: retry handlers must be able
+    // to retry it just as they would a failure of the primary request.
     try {
-      waitingHandler.controller.abort(err)
       waitingHandler.handler.onResponseError?.(waitingHandler.controller, err)
     } catch {
       // Ignore errors from waiting handlers
@@ -21861,7 +24414,8 @@ module.exports = DeduplicationHandler
 
 const util = __nccwpck_require__(3440)
 const assert = __nccwpck_require__(4589)
-const { InvalidArgumentError } = __nccwpck_require__(8707)
+const { InvalidArgumentError, MaxRedirectsError } = __nccwpck_require__(8707)
+const { kRequestOrigin, kRedirectCacheControl } = __nccwpck_require__(6443)
 
 const redirectableStatusCodes = [300, 301, 302, 303, 307, 308]
 
@@ -21896,10 +24450,28 @@ class RedirectHandler {
     this.maxRedirections = maxRedirections
     this.handler = handler
     this.history = []
+    // Per-hop metadata for each intermediate (suppressed) redirect hop: the
+    // hop's status code and response headers. An outer cache uses it to honor a
+    // hop's storage policy (e.g. `no-store`, `no-cache`, `Vary: *`) that would
+    // otherwise be lost because the hop's response is not forwarded. It travels
+    // as a non-enumerable property of the history array so it reaches the cache
+    // without becoming part of the public request/response context.
+    Object.defineProperty(this.history, kRedirectCacheControl, {
+      value: [],
+      enumerable: false
+    })
   }
 
   onRequestStart (controller, context) {
     this.handler.onRequestStart?.(controller, { ...context, history: this.history })
+  }
+
+  onBodySent (chunk) {
+    this.handler.onBodySent?.(chunk)
+  }
+
+  onRequestSent () {
+    this.handler.onRequestSent?.()
   }
 
   onRequestUpgrade (controller, statusCode, headers, socket) {
@@ -21907,8 +24479,9 @@ class RedirectHandler {
   }
 
   onResponseStart (controller, statusCode, headers, statusMessage) {
-    if (this.opts.throwOnMaxRedirect && this.history.length >= this.maxRedirections) {
-      throw new Error('max redirects')
+    if (statusCode < 200) {
+      this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage)
+      return
     }
 
     let removeContentHeaders = statusCode === 303
@@ -21936,12 +24509,26 @@ class RedirectHandler {
       this.opts.body = null
     }
 
-    this.location = this.history.length >= this.maxRedirections || util.isDisturbed(this.opts.body) || redirectableStatusCodes.indexOf(statusCode) === -1
+    this.location = util.isDisturbed(this.opts.body) || redirectableStatusCodes.indexOf(statusCode) === -1
       ? null
-      : headers.location
+      : headers.location || null
 
-    if (this.opts.origin) {
-      this.history.push(new URL(this.opts.path, this.opts.origin))
+    // Only a redirect that would otherwise be followed counts against the
+    // limit. The final response after exactly maxRedirections redirects, or a
+    // 3xx without a Location header, is delivered as usual.
+    if (this.location && this.history.length >= this.maxRedirections) {
+      if (this.opts.throwOnMaxRedirect) {
+        throw new MaxRedirectsError()
+      }
+      this.location = null
+    }
+
+    const requestOrigin = this.opts[kRequestOrigin] === undefined
+      ? this.opts.origin
+      : this.opts[kRequestOrigin]
+
+    if (requestOrigin) {
+      this.history.push(new URL(this.opts.path, requestOrigin))
     }
 
     if (!this.location) {
@@ -21949,7 +24536,19 @@ class RedirectHandler {
       return
     }
 
-    const { origin, pathname, search } = util.parseURL(new URL(this.location, this.opts.origin && new URL(this.opts.path, this.opts.origin)))
+    // This hop's response is suppressed (only its Location is used). Record its
+    // status and headers so an outer cache can honor a restrictive policy that
+    // would otherwise be lost when the final response is stored.
+    this.history[kRedirectCacheControl].push({
+      statusCode,
+      headers: { ...headers },
+      receivedAt: Date.now()
+    })
+
+    const baseUrl = requestOrigin
+      ? new URL(this.opts.path, requestOrigin)
+      : undefined
+    const { origin, pathname, search } = util.parseURL(new URL(this.location, baseUrl))
     const path = search ? `${pathname}${search}` : pathname
 
     // Check for redirect loops by seeing if we've already visited this URL in our history
@@ -21965,9 +24564,10 @@ class RedirectHandler {
     // Remove headers referring to the original URL.
     // By default it is Host only. A 303 or a 301/302 POST-to-GET redirect also removes all Content-* headers.
     // https://tools.ietf.org/html/rfc7231#section-6.4
-    this.opts.headers = cleanRequestHeaders(this.opts.headers, removeContentHeaders, this.opts.origin !== origin, this.stripHeadersOnRedirect, this.stripHeadersOnCrossOriginRedirect)
+    this.opts.headers = cleanRequestHeaders(this.opts.headers, removeContentHeaders, requestOrigin !== origin, this.stripHeadersOnRedirect, this.stripHeadersOnCrossOriginRedirect)
     this.opts.path = path
     this.opts.origin = origin
+    this.opts[kRequestOrigin] = origin
     this.opts.query = null
   }
 
@@ -22058,9 +24658,25 @@ function normalizeStripHeaders (headers, optionName) {
 function cleanRequestHeaders (headers, removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin) {
   const ret = []
   if (Array.isArray(headers)) {
-    for (let i = 0; i < headers.length; i += 2) {
-      if (!shouldRemoveHeader(headers[i], removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin)) {
-        ret.push(headers[i], headers[i + 1])
+    // Headers may be either a flat alternating [name, value, name, value, ...]
+    // list or an iterable of [name, value] pairs. A plain JavaScript array of
+    // tuples (e.g. `Object.entries(headers)`) satisfies the iterable-of-pairs
+    // public type, so we must distinguish the two representations before
+    // iterating. Treating every Array as a flat list misreads each tuple as a
+    // header name/value pair and defeats the cross-origin credential stripping.
+    if (headers.length > 0 && Array.isArray(headers[0])) {
+      // Array of [name, value] pairs.
+      for (const [key, value] of headers) {
+        if (!shouldRemoveHeader(key, removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin)) {
+          ret.push(key, value)
+        }
+      }
+    } else {
+      // Flat alternating [name, value, name, value, ...] list.
+      for (let i = 0; i < headers.length; i += 2) {
+        if (!shouldRemoveHeader(headers[i], removeContent, unknownOrigin, stripHeaders, stripHeadersOnCrossOrigin)) {
+          ret.push(headers[i], headers[i + 1])
+        }
       }
     }
   } else if (headers && typeof headers === 'object') {
@@ -22089,8 +24705,9 @@ module.exports = RedirectHandler
 const assert = __nccwpck_require__(4589)
 
 const { kRetryHandlerDefaultRetry } = __nccwpck_require__(6443)
-const { RequestRetryError } = __nccwpck_require__(8707)
+const { RequestRetryError, RequestAbortedError } = __nccwpck_require__(8707)
 const {
+  hasSafeIterator,
   isDisturbed,
   parseRangeHeader,
   wrapRequestBody
@@ -22128,19 +24745,59 @@ function validatePartialResponseContentLength (headers, range, statusCode, retry
 // new one: backpressure pauses the new connection's controller, but the
 // consumer's resume() targets the old one, so the resumed body stalls forever.
 // The proxy always forwards to the controller of the currently active connection.
+// An abort is additionally reported to the handler so it can cancel a pending
+// retry backoff instead of letting the request hang until the backoff elapses.
+// The notification is a private callback the handler hands over on construction,
+// so nothing outside the handler can trigger it.
 class RetryController {
-  constructor () {
-    this.target = null
+  #onAbort
+  #paused = false
+  #target = null
+
+  constructor (onAbort) {
+    this.#onAbort = onAbort
   }
 
-  pause () { this.target?.pause() }
-  resume () { this.target?.resume() }
-  abort (reason) { this.target?.abort(reason) }
-  get paused () { return this.target?.paused ?? false }
-  get aborted () { return this.target?.aborted ?? false }
-  get reason () { return this.target?.reason ?? null }
-  get rawHeaders () { return this.target?.rawHeaders ?? null }
-  get rawTrailers () { return this.target?.rawTrailers ?? null }
+  set target (target) {
+    this.#target = target
+    if (this.#paused) {
+      target?.pause()
+    }
+  }
+
+  get target () { return this.#target }
+
+  pause () {
+    this.#paused = true
+    this.#target?.pause()
+  }
+
+  resume () {
+    this.#paused = false
+    this.#target?.resume()
+  }
+
+  abort (reason) {
+    this.#target?.abort(reason)
+    this.#onAbort(reason)
+  }
+
+  get paused () { return this.#paused || (this.#target?.paused ?? false) }
+  get aborted () { return this.#target?.aborted ?? false }
+  get reason () { return this.#target?.reason ?? null }
+  get rawHeaders () { return this.#target?.rawHeaders ?? null }
+  set rawHeaders (value) {
+    if (this.#target) {
+      this.#target.rawHeaders = value
+    }
+  }
+
+  get rawTrailers () { return this.#target?.rawTrailers ?? null }
+  set rawTrailers (value) {
+    if (this.#target) {
+      this.#target.rawTrailers = value
+    }
+  }
 }
 
 class RetryHandler {
@@ -22199,15 +24856,38 @@ class RetryHandler {
     this.etag = null
     this.statusCode = null
     this.headers = null
-    this.controllerProxy = new RetryController()
+    this.controllerProxy = new RetryController(reason => this.#onAbort(reason))
+    // A retry decision is in flight (the policy may be holding a backoff
+    // timer). While pending, a consumer abort cancels the wait.
+    this.retryPending = false
+    // Backoff timer returned by the retry policy, so #onAbort can cancel it.
+    // Null for custom policies that do not return their timer.
+    this.retryTimer = null
+    // A response can complete while its controller is paused if the peer closes
+    // the connection. Hold its body until the retry policy decides whether to
+    // discard it for a retry or forward it as the final response.
+    this.pendingResponseData = null
+    this.pendingResponseTrailers = null
+    this.pendingResponseEnded = false
+    // Set once an abort during the backoff delivered the terminal error
+    // downstream; late policy callbacks and connection errors are then moot.
+    this.aborted = false
   }
 
   onResponseStartWithRetry (controller, statusCode, headers, statusMessage, err) {
     if (this.retryOpts.throwOnError) {
       // Preserve old behavior for status codes that are not eligible for retry
       if (this.retryOpts.statusCodes.includes(statusCode) === false) {
-        this.headersSent = true
-        this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)
+        if (this.headersSent) {
+          // The downstream handler already received the response from an
+          // earlier attempt. Forwarding this response would replace the
+          // downstream body and leave the original body pending forever.
+          this.handler.onResponseError?.(this.controllerProxy, err)
+        } else {
+          this.headersSent = true
+          this.checkpointResponseEnd(headers)
+          this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)
+        }
       } else {
         this.error = err
       }
@@ -22217,20 +24897,55 @@ class RetryHandler {
 
     if (isDisturbed(this.opts.body)) {
       this.headersSent = true
+      this.checkpointResponseEnd(headers)
       this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)
       return
     }
 
     function shouldRetry (passedErr) {
+      if (this.aborted) {
+        // Aborted while the policy was deciding; the decision is moot.
+        return
+      }
+      this.retryPending = false
+      this.retryTimer = null
+
+      const pendingData = this.pendingResponseData
+      const pendingTrailers = this.pendingResponseTrailers
+      const pendingEnd = this.pendingResponseEnded
+      this.pendingResponseData = null
+      this.pendingResponseTrailers = null
+      this.pendingResponseEnded = false
+
       if (passedErr) {
-        this.headersSent = true
-        this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)
+        if (this.headersSent) {
+          // The downstream handler already received the response from an
+          // earlier attempt. Forwarding this response would replace the
+          // downstream body and leave the original body pending forever.
+          this.handler.onResponseError?.(this.controllerProxy, passedErr)
+        } else {
+          this.headersSent = true
+          this.checkpointResponseEnd(headers)
+          this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)
+          controller.resume()
+
+          if (pendingEnd) {
+            for (const chunk of pendingData) {
+              this.onResponseData(controller, chunk)
+            }
+            this.onResponseEnd(controller, pendingTrailers)
+          }
+          return
+        }
         controller.resume()
         return
       }
 
       this.error = err
       controller.resume()
+      if (pendingEnd) {
+        this.onResponseEnd(controller, pendingTrailers)
+      }
     }
 
     // The pause()/resume() pair (here and in shouldRetry) acts on THIS
@@ -22241,14 +24956,34 @@ class RetryHandler {
     // between, leaving this one paused forever -- the very stall the proxy exists
     // to prevent.
     controller.pause()
-    this.retryOpts.retry(
+    // The default policy returns its backoff timer so an abort can cancel it;
+    // a custom policy may return anything (or nothing), which is ignored.
+    this.retryPending = true
+    this.pendingResponseData = []
+    this.pendingResponseTrailers = null
+    this.pendingResponseEnded = false
+    this.retryTimer = this.retryOpts.retry(
       err,
       {
         state: { counter: this.retryCount },
         opts: { retryOptions: this.retryOpts, ...this.opts }
       },
       shouldRetry.bind(this)
-    )
+    ) ?? null
+  }
+
+  checkpointResponseEnd (headers) {
+    if (this.end == null && this.opts.method !== 'HEAD') {
+      const contentLength = headers['content-length']
+      this.end = contentLength != null ? Number(contentLength) - 1 : null
+
+      assert(
+        this.end == null || Number.isFinite(this.end),
+        'invalid content-length'
+      )
+
+      this.resume = this.end != null
+    }
   }
 
   onRequestStart (controller, context) {
@@ -22261,6 +24996,14 @@ class RetryHandler {
     if (!this.headersSent) {
       this.handler.onRequestStart?.(this.controllerProxy, context)
     }
+  }
+
+  onBodySent (chunk) {
+    this.handler.onBodySent?.(chunk)
+  }
+
+  onRequestSent () {
+    this.handler.onRequestSent?.()
   }
 
   onRequestUpgrade (_controller, statusCode, headers, socket) {
@@ -22277,7 +25020,8 @@ class RetryHandler {
       timeoutFactor,
       statusCodes,
       errorCodes,
-      methods
+      methods,
+      retryAfter
     } = retryOptions
     const { counter } = state
 
@@ -22309,7 +25053,7 @@ class RetryHandler {
       return
     }
 
-    let retryAfterHeader = headers?.['retry-after']
+    let retryAfterHeader = retryAfter === false ? undefined : headers?.['retry-after']
     if (retryAfterHeader) {
       retryAfterHeader = Number(retryAfterHeader)
       retryAfterHeader = Number.isNaN(retryAfterHeader)
@@ -22324,7 +25068,9 @@ class RetryHandler {
           ? Math.min(retryAfterHeader, maxTimeout)
           : Math.min(minTimeout * timeoutFactor ** (counter - 1), maxTimeout)
 
-    setTimeout(() => cb(null), retryTimeout)
+    // Return the backoff timer so the handler can cancel it when the
+    // consumer aborts while the retry decision is pending.
+    return setTimeout(() => cb(null), retryTimeout)
   }
 
   onResponseStart (controller, statusCode, headers, statusMessage) {
@@ -22337,18 +25083,6 @@ class RetryHandler {
     this.retryCount += 1
     this.statusCode = statusCode
     this.headers = headers
-
-    if (statusCode >= 300) {
-      const err = new RequestRetryError('Request failed', statusCode, {
-        headers,
-        data: {
-          count: this.retryCount
-        }
-      })
-
-      this.onResponseStartWithRetry(controller, statusCode, headers, statusMessage, err)
-      return
-    }
 
     // Checkpoint for resume from where we left it
     if (this.headersSent) {
@@ -22386,9 +25120,25 @@ class RetryHandler {
 
       const { start, size, end = size ? size - 1 : null } = contentRange
 
-      assert(this.start === start, 'content-range mismatch')
-      assert(this.end == null || this.end === end, 'content-range mismatch')
+      if (this.start !== start || (this.end != null && this.end !== end)) {
+        throw new RequestRetryError('Content-Range mismatch', statusCode, {
+          headers,
+          data: { count: this.retryCount }
+        })
+      }
 
+      return
+    }
+
+    if (statusCode >= 300) {
+      const err = new RequestRetryError('Request failed', statusCode, {
+        headers,
+        data: {
+          count: this.retryCount
+        }
+      })
+
+      this.onResponseStartWithRetry(controller, statusCode, headers, statusMessage, err)
       return
     }
 
@@ -22463,6 +25213,11 @@ class RetryHandler {
   }
 
   onResponseData (_controller, chunk) {
+    if (this.pendingResponseData !== null) {
+      this.pendingResponseData.push(chunk)
+      return
+    }
+
     if (this.error) {
       return
     }
@@ -22473,6 +25228,12 @@ class RetryHandler {
   }
 
   onResponseEnd (_controller, trailers) {
+    if (this.pendingResponseData !== null) {
+      this.pendingResponseTrailers = trailers
+      this.pendingResponseEnded = true
+      return
+    }
+
     if (this.error && this.retryOpts.throwOnError) {
       throw this.error
     }
@@ -22497,19 +25258,9 @@ class RetryHandler {
 
   retry () {
     if (this.start !== 0) {
-      const headers = { range: `bytes=${this.start}-${this.end ?? ''}` }
-
-      // Weak etag check - weak etags will make comparison algorithms never match
-      if (this.etag != null) {
-        headers['if-match'] = this.etag
-      }
-
       this.opts = {
         ...this.opts,
-        headers: {
-          ...this.opts.headers,
-          ...headers
-        }
+        headers: buildResumeHeaders(this.opts.headers, `bytes=${this.start}-${this.end ?? ''}`, this.etag)
       }
     }
 
@@ -22522,14 +25273,27 @@ class RetryHandler {
   }
 
   onResponseError (controller, err) {
+    if (this.aborted) {
+      // #onAbort already delivered the terminal error downstream; the late
+      // error of the torn-down connection must not be forwarded twice.
+      return
+    }
+
     // controller is THIS failed connection (not the proxy): we inspect whether
     // the consumer aborted it to decide retry-vs-propagate.
-    if (controller?.aborted || isDisturbed(this.opts.body)) {
+    if (controller?.aborted || isDisturbed(this.opts.body) || (this.headersSent && !this.resume)) {
       this.handler.onResponseError?.(this.controllerProxy, err)
       return
     }
 
     function shouldRetry (returnedErr) {
+      if (this.aborted) {
+        // Aborted while the policy was deciding; the decision is moot.
+        return
+      }
+      this.retryPending = false
+      this.retryTimer = null
+
       if (!returnedErr) {
         this.retry()
         return
@@ -22549,15 +25313,77 @@ class RetryHandler {
       this.retryCount += 1
     }
 
-    this.retryOpts.retry(
+    this.retryPending = true
+    this.retryTimer = this.retryOpts.retry(
       err,
       {
         state: { counter: this.retryCount },
         opts: { retryOptions: this.retryOpts, ...this.opts }
       },
       shouldRetry.bind(this)
-    )
+    ) ?? null
   }
+
+  #onAbort (reason) {
+    // A consumer abort lands on the controller proxy. If the retry policy is
+    // still deciding (typically holding a backoff timer), cancel the wait and
+    // surface the abort immediately instead of letting the request hang until
+    // the backoff elapses.
+    if (!this.retryPending) {
+      return
+    }
+
+    this.aborted = true
+    this.retryPending = false
+    clearTimeout(this.retryTimer)
+    this.retryTimer = null
+    this.pendingResponseData = null
+    this.pendingResponseTrailers = null
+    this.pendingResponseEnded = false
+    this.handler.onResponseError?.(this.controllerProxy, reason ?? new RequestAbortedError())
+  }
+}
+
+function isReplacedHeader (key, etag) {
+  const name = key.toLowerCase()
+  return name === 'range' || (etag != null && name === 'if-match')
+}
+
+function buildResumeHeaders (headers, range, etag) {
+  if (Array.isArray(headers) || (headers && typeof headers === 'object' && hasSafeIterator(headers))) {
+    const ret = []
+    if (Array.isArray(headers)) {
+      for (let i = 0; i < headers.length; i += 2) {
+        if (!isReplacedHeader(headers[i], etag)) {
+          ret.push(headers[i], headers[i + 1])
+        }
+      }
+    } else {
+      for (const [key, value] of headers) {
+        if (!isReplacedHeader(key, etag)) {
+          ret.push(key, value)
+        }
+      }
+    }
+    ret.push('range', range)
+    // Weak etag check - weak etags will make comparison algorithms never match
+    if (etag != null) {
+      ret.push('if-match', etag)
+    }
+    return ret
+  }
+
+  const ret = {}
+  for (const key in headers) {
+    if (Object.hasOwn(headers, key) && !isReplacedHeader(key, etag)) {
+      ret[key] = headers[key]
+    }
+  }
+  ret.range = range
+  if (etag != null) {
+    ret['if-match'] = etag
+  }
+  return ret
 }
 
 module.exports = RetryHandler
@@ -22576,7 +25402,17 @@ const util = __nccwpck_require__(3440)
 const CacheHandler = __nccwpck_require__(9976)
 const MemoryCacheStore = __nccwpck_require__(4889)
 const CacheRevalidationHandler = __nccwpck_require__(7133)
-const { assertCacheStore, assertCacheMethods, makeCacheKey, normalizeHeaders, parseCacheControlHeader, isInvalidOrWildcardVaryHeader } = __nccwpck_require__(7659)
+const {
+  assertCacheStore,
+  assertCacheMethods,
+  getInterceptorOrigin,
+  makeCacheKey,
+  normalizeHeaders,
+  parseCacheControlHeader,
+  isInvalidOrWildcardVaryHeader,
+  parseVaryHeader,
+  isEtagUsable
+} = __nccwpck_require__(7659)
 const { AbortError } = __nccwpck_require__(8707)
 const { parseHttpDate } = __nccwpck_require__(5453)
 
@@ -22687,7 +25523,10 @@ function staleResponseRequiresRevalidation (result, cacheType) {
  * @returns {boolean}
  */
 function revalidationResponseDisallowsCachedReuse (cacheType, headers) {
-  if (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary)) {
+  if (
+    (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary)) ||
+    (cacheType === 'shared' && Object.hasOwn(headers, 'set-cookie'))
+  ) {
     return true
   }
 
@@ -22703,6 +25542,25 @@ function revalidationResponseDisallowsCachedReuse (cacheType, headers) {
 
 function revalidationResponseUpdatesCacheControl (headers) {
   return headers['cache-control'] !== undefined
+}
+
+/**
+ * @param {import('../../types/cache-interceptor.d.ts').default.GetResult} result
+ * @param {Record<string, string | string[] | null> | undefined} varyDirectives
+ * @returns {boolean}
+ */
+function revalidationResponseAddsVary (result, varyDirectives) {
+  if (!varyDirectives) {
+    return false
+  }
+
+  for (const key in varyDirectives) {
+    if (result.vary == null || !Object.hasOwn(result.vary, key)) {
+      return true
+    }
+  }
+
+  return false
 }
 
 function deleteCachedValue (store, cacheKey) {
@@ -22741,6 +25599,47 @@ function makeRevalidationHeaders (opts, result) {
   return headers
 }
 
+function revalidationTargetMatchesCacheKey (cacheKey, context) {
+  const history = context?.history
+  if (!Array.isArray(history) || history.length === 0) {
+    return true
+  }
+
+  try {
+    const cachedUrl = new URL(cacheKey.path, cacheKey.origin)
+    const responseUrl = history[history.length - 1]
+    return responseUrl.origin === cachedUrl.origin &&
+      responseUrl.pathname === cachedUrl.pathname &&
+      responseUrl.search === cachedUrl.search
+  } catch {
+    return false
+  }
+}
+
+function revalidationEtagMatchesCachedValue (result, headers) {
+  if (!Object.hasOwn(headers, 'etag')) {
+    return true
+  }
+
+  const responseEtag = headers.etag
+  const cachedEtag = result.etag
+  if (
+    typeof responseEtag !== 'string' ||
+    typeof cachedEtag !== 'string' ||
+    !isEtagUsable(responseEtag) ||
+    !isEtagUsable(cachedEtag)
+  ) {
+    return false
+  }
+
+  if (!responseEtag.startsWith('W/')) {
+    return responseEtag === cachedEtag
+  }
+
+  const cachedOpaqueTag = cachedEtag.startsWith('W/') ? cachedEtag.slice(2) : cachedEtag
+  return responseEtag.slice(2) === cachedOpaqueTag
+}
+
 /**
  * @param {import('../../types/cache-interceptor.d.ts').default.GetResult} result
  * @param {import('../../types/cache-interceptor.d.ts').default.CacheControlDirectives | undefined} cacheControlDirectives
@@ -22749,7 +25648,10 @@ function makeRevalidationHeaders (opts, result) {
  */
 function isStale (result, cacheControlDirectives, cacheType) {
   const now = Date.now()
-  if (now > result.staleAt) {
+  // A zero freshness lifetime (e.g. max-age=0 with a validator) is never fresh,
+  // even when reused within the same millisecond or after a clock step back.
+  // https://www.rfc-editor.org/rfc/rfc9111.html#section-4.2
+  if (now > result.staleAt || result.staleAt <= result.cachedAt) {
     // Response is stale
     if (!staleResponseRequiresRevalidation(result, cacheType) && cacheControlDirectives?.['max-stale']) {
       // There's a threshold where we can serve stale responses, let's see if
@@ -22869,6 +25771,9 @@ function sendCachedValue (handler, opts, result, age, context, isStale) {
   assert(!stream.destroyed, 'stream should not be destroyed')
   assert(!stream.readableDidRead, 'stream should not be readableDidRead')
 
+  let aborted = false
+  let abortReason = null
+
   const controller = {
     rawHeaders: [],
     rawTrailers: [],
@@ -22882,33 +25787,52 @@ function sendCachedValue (handler, opts, result, age, context, isStale) {
       return stream.isPaused()
     },
     get aborted () {
-      return stream.destroyed
+      return aborted
     },
     get reason () {
-      return stream.errored
+      return abortReason
     },
     abort (reason) {
-      stream.destroy(reason ?? new AbortError())
+      if (aborted) {
+        return
+      }
+      aborted = true
+      abortReason = reason ?? new AbortError()
+      stream.destroy(abortReason)
     }
   }
 
   stream
     .on('error', function (err) {
+      // Never rethrow: this runs from a stream event on a later tick, where a
+      // throw would crash the process. Like core's Request.onResponseError,
+      // the error is dropped if the handler has no onResponseError.
       if (!this.readableEnded) {
-        if (typeof handler.onResponseError === 'function') {
-          handler.onResponseError(controller, err)
-        } else {
-          throw err
-        }
+        handler.onResponseError?.(controller, err)
       }
     })
     .on('close', function () {
       if (!this.errored) {
-        handler.onResponseEnd?.(controller, {})
+        try {
+          handler.onResponseEnd?.(controller, {})
+        } catch (err) {
+          // The stream is already closed, so the error can't be routed
+          // through it; report it to the handler directly instead.
+          handler.onResponseError?.(controller, err)
+        }
       }
     })
 
-  handler.onRequestStart?.(controller, context)
+  // Downstream handler calls below run outside the dispatcher's own error
+  // handling (on later ticks for the body, or inside a promise callback for
+  // async stores), so a throw must be converged to a per-request error
+  // instead of escaping as an uncaught exception.
+  try {
+    handler.onRequestStart?.(controller, context)
+  } catch (err) {
+    stream.destroy(err)
+    return
+  }
 
   if (stream.destroyed) {
     return
@@ -22926,13 +25850,22 @@ function sendCachedValue (handler, opts, result, age, context, isStale) {
 
   controller.rawHeaders = util.toRawHeaders(headers)
 
-  handler.onResponseStart?.(controller, result.statusCode, headers, result.statusMessage)
+  try {
+    handler.onResponseStart?.(controller, result.statusCode, headers, result.statusMessage)
+  } catch (err) {
+    stream.destroy(err)
+    return
+  }
 
   if (opts.method === 'HEAD') {
     stream.destroy()
   } else {
     stream.on('data', function (chunk) {
-      handler.onResponseData?.(controller, chunk)
+      try {
+        handler.onResponseData?.(controller, chunk)
+      } catch (err) {
+        stream.destroy(err)
+      }
     })
   }
 }
@@ -22956,6 +25889,17 @@ function handleResult (
   result
 ) {
   if (!result) {
+    return handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl)
+  }
+
+  // Shared stores may outlive the Undici version that wrote them. Do not
+  // re-serve a Set-Cookie header from an existing shared-cache entry.
+  if (globalOpts.type === 'shared' && Object.hasOwn(result.headers, 'set-cookie')) {
+    if (util.isStream(result.body)) {
+      result.body.on('error', nop).destroy()
+    }
+
+    deleteCachedValue(globalOpts.store, cacheKey)
     return handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl)
   }
 
@@ -23019,6 +25963,14 @@ function handleResult (
     }
 
     const headers = makeRevalidationHeaders(opts, result)
+    const refetch = () => {
+      if (util.isStream(result.body)) {
+        result.body.on('error', nop).destroy()
+      }
+
+      deleteCachedValue(globalOpts.store, cacheKey)
+      return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
+    }
 
     // We need to revalidate the response
     return dispatch(
@@ -23030,17 +25982,18 @@ function handleResult (
         (success, context, statusCode, headers) => {
           if (success) {
             if (statusCode === 304) {
-              if (revalidationResponseDisallowsCachedReuse(globalOpts.type, headers)) {
-                if (util.isStream(result.body)) {
-                  result.body.on('error', nop).destroy()
-                }
-
-                deleteCachedValue(globalOpts.store, cacheKey)
-                return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
+              if (
+                !revalidationTargetMatchesCacheKey(cacheKey, context) ||
+                !revalidationEtagMatchesCachedValue(result, headers) ||
+                revalidationResponseDisallowsCachedReuse(globalOpts.type, headers)
+              ) {
+                return refetch()
               }
 
               if (revalidationResponseUpdatesCacheControl(headers)) {
                 deleteCachedValue(globalOpts.store, cacheKey)
+              } else if (revalidationResponseAddsVary(result, headers.vary ? parseVaryHeader(headers.vary, opts.headers) : undefined)) {
+                return refetch()
               }
             }
 
@@ -23108,29 +26061,28 @@ module.exports = (opts = {}) => {
     }
   }
 
-  return dispatch => {
+  return (dispatch, interceptorOrigin) => {
     return (opts, handler) => {
-      if (arrayIncludes(safeMethodsToNotCache, opts.method)) {
-        // Not a method we want to cache, skip
+      const requestOrigin = getInterceptorOrigin(opts, interceptorOrigin)
+      if (!requestOrigin || arrayIncludes(safeMethodsToNotCache, opts.method)) {
+        // We cannot safely cache without an authoritative origin, or this is
+        // not a method we want to cache.
         return dispatch(opts, handler)
       }
 
       // Check if origin is in whitelist
       if (origins !== undefined) {
-        if (!opts.origin) {
-          return dispatch(opts, handler)
-        }
-        const requestOrigin = opts.origin.toString().toLowerCase()
+        const normalizedRequestOrigin = requestOrigin.toString().toLowerCase()
         let isAllowed = false
 
         for (let i = 0; i < origins.length; i++) {
           const allowed = origins[i]
           if (typeof allowed === 'string') {
-            if (allowed.toLowerCase() === requestOrigin) {
+            if (allowed.toLowerCase() === normalizedRequestOrigin) {
               isAllowed = true
               break
             }
-          } else if (allowed.test(requestOrigin)) {
+          } else if (allowed.test(normalizedRequestOrigin)) {
             isAllowed = true
             break
           }
@@ -23159,7 +26111,12 @@ module.exports = (opts = {}) => {
       /**
        * @type {import('../../types/cache-interceptor.d.ts').default.CacheKey}
        */
-      const cacheKey = makeCacheKey(opts)
+      const cacheKey = makeCacheKey(opts, requestOrigin)
+
+      if (!arrayIncludes(util.safeHTTPMethods, opts.method)) {
+        return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
+      }
+
       const result = store.get(cacheKey)
 
       if (result && typeof result.then === 'function') {
@@ -23172,6 +26129,28 @@ module.exports = (opts = {}) => {
             reqCacheControl,
             result
           ))
+          .catch((err) => {
+            // Any throw escaping handleResult on the async-store path (e.g. a
+            // rejection from store.get() itself, or a throw in a code path not
+            // converged by sendCachedValue) would otherwise surface as an
+            // unhandled promise rejection and crash the process. Route it to
+            // the handler instead, matching the synchronous store path where
+            // the error propagates to the request() call site.
+            if (typeof handler.onResponseError === 'function') {
+              handler.onResponseError({
+                rawHeaders: [],
+                rawTrailers: [],
+                pause () {},
+                resume () {},
+                get paused () { return false },
+                get aborted () { return false },
+                get reason () { return null },
+                abort () {}
+              }, err)
+            } else {
+              throw err
+            }
+          })
       } else {
         return handleResult(
           dispatch,
@@ -23195,26 +26174,110 @@ module.exports = (opts = {}) => {
 
 
 
-const { createInflate, createGunzip, createBrotliDecompress, createZstdDecompress } = __nccwpck_require__(8522)
-const { pipeline } = __nccwpck_require__(7075)
+const { createInflate, createGunzip, createBrotliDecompress, createZstdDecompress, constants } = __nccwpck_require__(8522)
+const { pipeline, Transform: TransformStream } = __nccwpck_require__(7075)
+const { InvalidArgumentError, ResponseExceededMaxSizeError } = __nccwpck_require__(8707)
 const DecoratorHandler = __nccwpck_require__(8155)
 
 /** @typedef {import('node:stream').Transform} Transform */
 /** @typedef {import('node:stream').Transform} Controller */
 /** @typedef {Transform&import('node:zlib').Zlib} DecompressorStream */
 
+class DecompressController {
+  #onPause
+  #onResume
+  #onAbort
+  #paused = false
+
+  constructor (onPause, onResume, onAbort) {
+    this.#onPause = onPause
+    this.#onResume = onResume
+    this.#onAbort = onAbort
+    this.target = null
+  }
+
+  pause () {
+    if (this.#paused) {
+      return
+    }
+
+    this.#paused = true
+    this.#onPause()
+  }
+
+  resume () {
+    if (!this.#paused) {
+      return
+    }
+
+    this.#paused = false
+    this.#onResume()
+  }
+
+  abort (reason) {
+    this.target?.abort(reason)
+    this.#onAbort(reason)
+  }
+
+  get paused () { return this.#paused }
+  get aborted () { return this.target?.aborted ?? false }
+  get reason () { return this.target?.reason ?? null }
+  get rawHeaders () { return this.target?.rawHeaders ?? null }
+  set rawHeaders (value) {
+    if (this.target) {
+      this.target.rawHeaders = value
+    }
+  }
+
+  get rawTrailers () { return this.target?.rawTrailers ?? null }
+  set rawTrailers (value) {
+    if (this.target) {
+      this.target.rawTrailers = value
+    }
+  }
+}
+
+// `compress` and `x-compress` are deliberately absent. RFC 9110 section
+// 8.4.1.1 defines them as the UNIX compress (LZW) format, which zlib cannot
+// read, so inflating them turns a readable response into a Z_DATA_ERROR.
+// fetch() leaves them alone, and so does this interceptor.
 /** @type {Record<string, () => DecompressorStream>} */
 const supportedEncodings = {
+  __proto__: null,
   gzip: createGunzip,
   'x-gzip': createGunzip,
   br: createBrotliDecompress,
   deflate: createInflate,
-  compress: createInflate,
-  'x-compress': createInflate,
-  zstd: createZstdDecompress
+  // https://www.rfc-editor.org/rfc/rfc9659.html#section-3
+  zstd: createZstdDecompress.bind(null, { params: { [constants.ZSTD_d_windowLogMax]: 23 } })
 }
 
 const defaultSkipStatusCodes = /** @type {const} */ ([204, 304])
+const defaultMaxSize = 0
+
+/**
+ * Limits the output of one stage in a decompression chain.
+ * @param {number} maxSize - Maximum output size in bytes
+ * @returns {Transform}
+ */
+function createMaxSizeLimiter (maxSize) {
+  let size = 0
+
+  return new TransformStream({
+    transform (chunk, _encoding, callback) {
+      const decompressedSize = size + chunk.length
+      if (decompressedSize > maxSize) {
+        callback(new ResponseExceededMaxSizeError(
+          `Decompressed response size (${decompressedSize}) exceeded maxSize (${maxSize})`
+        ))
+        return
+      }
+
+      size = decompressedSize
+      callback(null, chunk)
+    }
+  })
+}
 
 let warningEmitted = /** @type {boolean} */ (false)
 
@@ -23222,6 +26285,7 @@ let warningEmitted = /** @type {boolean} */ (false)
  * @typedef {Object} DecompressHandlerOptions
  * @property {number[]|Readonly<number[]>} [skipStatusCodes=[204, 304]] - List of status codes to skip decompression for
  * @property {boolean} [skipErrorResponses] - Whether to skip decompression for error responses (status codes >= 400)
+ * @property {number} [maxSize=0] - Maximum decompressed response size in bytes. 0 disables the limit
  */
 
 class DecompressHandler extends DecoratorHandler {
@@ -23233,11 +26297,148 @@ class DecompressHandler extends DecoratorHandler {
   #skipStatusCodes
   /** @type {boolean} */
   #skipErrorResponses
+  /** @type {number} */
+  #maxSize
+  /** @type {number} */
+  #decompressedSize = 0
+  /** @type {boolean} */
+  #terminated = false
+  /** @type {boolean} */
+  #inputEnded = false
+  /** @type {boolean} */
+  #inputBackpressured = false
+  /** @type {boolean} */
+  #upstreamPaused = false
+  /** @type {boolean} */
+  #draining = false
+  /** @type {boolean} */
+  #drainRequested = false
+  /** @type {boolean} */
+  #completionPending = false
+  /** @type {DecompressorStream | undefined} */
+  #finalDecompressor
+  /** @type {DecompressController} */
+  #controller
 
-  constructor (handler, { skipStatusCodes = defaultSkipStatusCodes, skipErrorResponses = true } = {}) {
+  constructor (handler, { skipStatusCodes = defaultSkipStatusCodes, skipErrorResponses = true, maxSize = defaultMaxSize } = {}) {
+    if (!Number.isSafeInteger(maxSize) || maxSize < 0) {
+      throw new InvalidArgumentError('maxSize must be a non-negative integer')
+    }
+
     super(handler)
     this.#skipStatusCodes = skipStatusCodes
     this.#skipErrorResponses = skipErrorResponses
+    this.#maxSize = maxSize
+    this.#controller = new DecompressController(
+      () => this.#onDownstreamPause(),
+      () => this.#onDownstreamResume(),
+      reason => {
+        if (this.#inputEnded && !this.#terminated) {
+          this.onResponseError(this.#controller, reason)
+        }
+      }
+    )
+  }
+
+  #onDownstreamPause () {
+    this.#pauseUpstream()
+  }
+
+  #onDownstreamResume () {
+    const drainWasDeferred = this.#draining
+    this.#drainOutput()
+    if (!drainWasDeferred) {
+      this.#resumeUpstreamIfNeeded()
+      this.#finishIfReady()
+    }
+  }
+
+  #pauseUpstream () {
+    if (!this.#upstreamPaused && !this.#terminated) {
+      this.#upstreamPaused = true
+      this.#controller.target?.pause()
+    }
+  }
+
+  #resumeUpstreamIfNeeded () {
+    if (this.#upstreamPaused && !this.#controller.paused && !this.#inputBackpressured) {
+      this.#upstreamPaused = false
+      if (!this.#inputEnded) {
+        this.#controller.target?.resume()
+      }
+    }
+  }
+
+  #drainOutput () {
+    if (this.#terminated || this.#controller.paused || !this.#finalDecompressor) {
+      return
+    }
+
+    if (this.#draining) {
+      this.#drainRequested = true
+      return
+    }
+
+    this.#draining = true
+    try {
+      do {
+        this.#drainRequested = false
+        let chunk
+        while (!this.#terminated && !this.#controller.paused && (chunk = this.#finalDecompressor.read()) !== null) {
+          if (this.#maxSize > 0) {
+            const decompressedSize = this.#decompressedSize + chunk.length
+            if (decompressedSize > this.#maxSize) {
+              this.#fail(new ResponseExceededMaxSizeError(
+                `Decompressed response size (${decompressedSize}) exceeded maxSize (${this.#maxSize})`
+              ))
+              return
+            }
+
+            this.#decompressedSize = decompressedSize
+          }
+
+          try {
+            const result = super.onResponseData(this.#controller, chunk)
+            if (result === false && !this.#controller.paused) {
+              this.#controller.pause()
+            }
+          } catch (err) {
+            this.#fail(err)
+            return
+          }
+        }
+      } while (this.#drainRequested && !this.#terminated && !this.#controller.paused)
+    } finally {
+      this.#draining = false
+    }
+
+    this.#resumeUpstreamIfNeeded()
+    this.#finishIfReady()
+  }
+
+  #finishIfReady () {
+    if (this.#terminated || !this.#completionPending || this.#controller.paused || this.#draining) {
+      return
+    }
+
+    this.#cleanupDecompressors()
+    try {
+      super.onResponseEnd(this.#controller, this.#trailers)
+    } catch (err) {
+      this.#fail(err)
+      return
+    }
+    this.#terminated = true
+  }
+
+  #onDecompressionEnd () {
+    if (this.#terminated) {
+      return
+    }
+
+    this.#completionPending = true
+    this.#drainOutput()
+    this.#finishIfReady()
   }
 
   /**
@@ -23257,7 +26458,7 @@ class DecompressHandler extends DecoratorHandler {
    * Creates a chain of decompressors for multiple content encodings
    *
    * @param {string} encodings - Comma-separated list of content encodings
-   * @returns {Array<DecompressorStream>} - Array of decompressor streams
+   * @returns {Array<Transform>} - Array of decompressor and limiting streams
    * @throws {Error} - If the number of content-encodings exceeds the maximum allowed
    */
   #createDecompressionChain (encodings) {
@@ -23285,60 +26486,97 @@ class DecompressHandler extends DecoratorHandler {
       decompressors.push(supportedEncodings[encoding]())
     }
 
-    return decompressors
+    if (decompressors.length < 2) {
+      return decompressors
+    }
+
+    /** @type {Transform[]} */
+    const streams = []
+    for (let i = 0; i < decompressors.length; i++) {
+      streams.push(decompressors[i])
+      if (i < decompressors.length - 1 && this.#maxSize > 0) {
+        streams.push(createMaxSizeLimiter(this.#maxSize))
+      }
+    }
+
+    return streams
   }
 
   /**
-   * Sets up event handlers for a decompressor stream using readable events
-   * @param {DecompressorStream} decompressor - The decompressor stream
-   * @param {Controller} controller - The controller to coordinate with
+   * Stops decompression and reports an error.
+   * @param {Error} error - The decompression error
    * @returns {void}
    */
-  #setupDecompressorEvents (decompressor, controller) {
-    decompressor.on('readable', () => {
-      let chunk
-      while ((chunk = decompressor.read()) !== null) {
-        const result = super.onResponseData(controller, chunk)
-        if (result === false) {
-          break
-        }
-      }
-    })
+  #fail (error) {
+    if (this.#terminated) {
+      return
+    }
 
-    decompressor.on('error', (error) => {
-      super.onResponseError(controller, error)
-    })
+    if (this.#inputEnded) {
+      // The request is already marked complete once the compressed input ends,
+      // so controller.abort() can no longer propagate decoder flush errors.
+      this.onResponseError(this.#controller, error)
+    } else {
+      this.#controller.abort(error)
+    }
+  }
+
+  /**
+   * Sets up event handlers for the final decompressor stream.
+   * @param {DecompressorStream} decompressor - The decompressor stream
+   * @returns {void}
+   */
+  #setupDecompressorEvents (decompressor) {
+    this.#finalDecompressor = decompressor
+    decompressor.on('readable', () => this.#drainOutput())
+    decompressor.on('error', (error) => this.#fail(error))
   }
 
   /**
    * Sets up event handling for a single decompressor
-   * @param {Controller} controller - The controller to handle events
    * @returns {void}
    */
-  #setupSingleDecompressor (controller) {
+  #setupSingleDecompressor () {
     const decompressor = this.#decompressors[0]
-    this.#setupDecompressorEvents(decompressor, controller)
+    this.#setupDecompressorEvents(decompressor)
 
-    decompressor.on('end', () => {
-      super.onResponseEnd(controller, this.#trailers)
-    })
+    decompressor.on('end', () => this.#onDecompressionEnd())
   }
 
   /**
    * Sets up event handling for multiple chained decompressors using pipeline
-   * @param {Controller} controller - The controller to handle events
    * @returns {void}
    */
-  #setupMultipleDecompressors (controller) {
+  #setupMultipleDecompressors () {
     const lastDecompressor = this.#decompressors[this.#decompressors.length - 1]
-    this.#setupDecompressorEvents(lastDecompressor, controller)
+    this.#setupDecompressorEvents(lastDecompressor)
 
     pipeline(this.#decompressors, (err) => {
-      if (err) {
-        super.onResponseError(controller, err)
+      if (this.#terminated) {
         return
       }
-      super.onResponseEnd(controller, this.#trailers)
+
+      if (err) {
+        this.#fail(err)
+        return
+      }
+
+      this.#onDecompressionEnd()
+    })
+  }
+
+  #setupInputBackpressure () {
+    const decompressor = this.#decompressors[0]
+    decompressor.on('drain', () => {
+      if (this.#terminated) {
+        return
+      }
+
+      this.#inputBackpressured = false
+      if (!this.#controller.paused) {
+        this.#drainOutput()
+        this.#resumeUpstreamIfNeeded()
+      }
     })
   }
 
@@ -23348,6 +26586,16 @@ class DecompressHandler extends DecoratorHandler {
    */
   #cleanupDecompressors () {
     this.#decompressors.length = 0
+    this.#finalDecompressor = undefined
+  }
+
+  onRequestStart (controller, context) {
+    this.#controller.target = controller
+    return super.onRequestStart(this.#controller, context)
+  }
+
+  onRequestUpgrade (controller, statusCode, headers, socket) {
+    return super.onRequestUpgrade(this.#controller, statusCode, headers, socket)
   }
 
   /**
@@ -23358,18 +26606,24 @@ class DecompressHandler extends DecoratorHandler {
    * @returns {void}
    */
   onResponseStart (controller, statusCode, headers, statusMessage) {
-    const contentEncoding = headers['content-encoding']
+    // Repeated field lines reach us as an array. RFC 9110 section 5.3 lets a
+    // recipient join them with commas, which yields the single-line form the
+    // decompression chain already handles.
+    const rawContentEncoding = headers['content-encoding']
+    const contentEncoding = Array.isArray(rawContentEncoding)
+      ? rawContentEncoding.join(',')
+      : rawContentEncoding
 
     // If content encoding is not supported or status code is in skip list
     if (this.#shouldSkipDecompression(contentEncoding, statusCode)) {
-      return super.onResponseStart(controller, statusCode, headers, statusMessage)
+      return super.onResponseStart(this.#controller, statusCode, headers, statusMessage)
     }
 
     const decompressors = this.#createDecompressionChain(contentEncoding.toLowerCase())
 
     if (decompressors.length === 0) {
       this.#cleanupDecompressors()
-      return super.onResponseStart(controller, statusCode, headers, statusMessage)
+      return super.onResponseStart(this.#controller, statusCode, headers, statusMessage)
     }
 
     this.#decompressors = decompressors
@@ -23377,8 +26631,8 @@ class DecompressHandler extends DecoratorHandler {
     // Remove compression headers since we're decompressing
     const { 'content-encoding': _, 'content-length': __, ...newHeaders } = headers
 
-    if (controller?.rawHeaders) {
-      const rawHeaders = controller.rawHeaders
+    if (this.#controller.rawHeaders) {
+      const rawHeaders = this.#controller.rawHeaders
 
       if (Array.isArray(rawHeaders)) {
         const filteredHeaders = []
@@ -23393,7 +26647,7 @@ class DecompressHandler extends DecoratorHandler {
 
           filteredHeaders.push(rawHeaders[i], rawHeaders[i + 1])
         }
-        controller.rawHeaders = filteredHeaders
+        rawHeaders.splice(0, rawHeaders.length, ...filteredHeaders)
       } else if (typeof rawHeaders === 'object') {
         for (const name of Object.keys(rawHeaders)) {
           const lowerName = name.toLowerCase()
@@ -23404,13 +26658,14 @@ class DecompressHandler extends DecoratorHandler {
       }
     }
 
+    this.#setupInputBackpressure()
     if (this.#decompressors.length === 1) {
-      this.#setupSingleDecompressor(controller)
+      this.#setupSingleDecompressor()
     } else {
-      this.#setupMultipleDecompressors(controller)
+      this.#setupMultipleDecompressors()
     }
 
-    return super.onResponseStart(controller, statusCode, newHeaders, statusMessage)
+    return super.onResponseStart(this.#controller, statusCode, newHeaders, statusMessage)
   }
 
   /**
@@ -23420,10 +26675,13 @@ class DecompressHandler extends DecoratorHandler {
    */
   onResponseData (controller, chunk) {
     if (this.#decompressors.length > 0) {
-      this.#decompressors[0].write(chunk)
+      if (!this.#decompressors[0].write(chunk)) {
+        this.#inputBackpressured = true
+        this.#pauseUpstream()
+      }
       return
     }
-    super.onResponseData(controller, chunk)
+    return super.onResponseData(this.#controller, chunk)
   }
 
   /**
@@ -23433,12 +26691,12 @@ class DecompressHandler extends DecoratorHandler {
    */
   onResponseEnd (controller, trailers) {
     if (this.#decompressors.length > 0) {
+      this.#inputEnded = true
       this.#trailers = trailers
       this.#decompressors[0].end()
-      this.#cleanupDecompressors()
       return
     }
-    super.onResponseEnd(controller, trailers)
+    return super.onResponseEnd(this.#controller, trailers)
   }
 
   /**
@@ -23447,13 +26705,16 @@ class DecompressHandler extends DecoratorHandler {
    * @returns {void}
    */
   onResponseError (controller, err) {
-    if (this.#decompressors.length > 0) {
-      for (const decompressor of this.#decompressors) {
-        decompressor.destroy(err)
-      }
-      this.#cleanupDecompressors()
+    if (this.#terminated) {
+      return
     }
-    super.onResponseError(controller, err)
+
+    this.#terminated = true
+    for (const decompressor of this.#decompressors) {
+      decompressor.destroy()
+    }
+    this.#cleanupDecompressors()
+    super.onResponseError(this.#controller, err)
   }
 }
 
@@ -23497,7 +26758,7 @@ module.exports = createDecompressInterceptor
 const diagnosticsChannel = __nccwpck_require__(3053)
 const util = __nccwpck_require__(3440)
 const DeduplicationHandler = __nccwpck_require__(3599)
-const { normalizeHeaders, makeCacheKey, makeDeduplicationKey } = __nccwpck_require__(7659)
+const { getInterceptorOrigin, normalizeHeaders, makeCacheKey, makeDeduplicationKey } = __nccwpck_require__(7659)
 
 const pendingRequestsChannel = diagnosticsChannel.channel('undici:request:pending-requests')
 
@@ -23551,9 +26812,10 @@ module.exports = (opts = {}) => {
    */
   const pendingRequests = new Map()
 
-  return dispatch => {
+  return (dispatch, interceptorOrigin) => {
     return (opts, handler) => {
-      if (opts.upgrade || methods.includes(opts.method) === false) {
+      const requestOrigin = getInterceptorOrigin(opts, interceptorOrigin)
+      if (!requestOrigin || opts.upgrade || methods.includes(opts.method) === false) {
         return dispatch(opts, handler)
       }
 
@@ -23571,7 +26833,7 @@ module.exports = (opts = {}) => {
         }
       }
 
-      const cacheKey = makeCacheKey(opts)
+      const cacheKey = makeCacheKey(opts, requestOrigin)
       const dedupeKey = makeDeduplicationKey(cacheKey, excludeHeaderNamesSet)
 
       // Check if there's already a pending request for this key
@@ -23621,6 +26883,7 @@ const { isIP } = __nccwpck_require__(7030)
 const { lookup } = __nccwpck_require__(610)
 const DecoratorHandler = __nccwpck_require__(8155)
 const { InvalidArgumentError, InformationalError } = __nccwpck_require__(8707)
+const { kRequestOrigin } = __nccwpck_require__(6443)
 const maxInt = Math.pow(2, 31) - 1
 
 function hasSafeIterator (headers) {
@@ -23807,6 +27070,16 @@ class DNSInstance {
           newOpts.affinity
         )
 
+        // The lookup succeeded, but nothing it returned is usable here: with
+        // dualStack disabled and an affinity set, records of the other family
+        // cannot be picked. Running the lookup again would return the same
+        // records, so report it the way an empty result is reported.
+        if (ip == null) {
+          this.storage.delete(origin.hostname)
+          cb(new InformationalError('No DNS entries found'))
+          return
+        }
+
         let port
         if (typeof ip.port === 'number') {
           port = `:${ip.port}`
@@ -23963,6 +27236,7 @@ class DNSInstance {
       // We delete expired records
       // It is possible that they have different TTL, so we manage them individually
       family.ips.splice(position, 1)
+      return this.pickFamily(origin, ipFamily)
     }
 
     return ip
@@ -24052,6 +27326,9 @@ class DNSDispatchHandler extends DecoratorHandler {
             origin: `${this.#origin.protocol}//${
               ip.family === 6 ? `[${ip.address}]` : ip.address
             }${port}`,
+            [kRequestOrigin]: this.#opts[kRequestOrigin] === undefined
+              ? this.#origin
+              : this.#opts[kRequestOrigin],
             headers: withHostHeader(this.#origin.host, this.#opts.headers)
           }
           this.#dispatch(dispatchOpts, this)
@@ -24175,6 +27452,9 @@ module.exports = interceptorOpts => {
           ...origDispatchOpts,
           servername: origin.hostname, // For SNI on TLS
           origin: newOrigin.origin,
+          [kRequestOrigin]: origDispatchOpts[kRequestOrigin] === undefined
+            ? origin
+            : origDispatchOpts[kRequestOrigin],
           headers: withHostHeader(origin.host, origDispatchOpts.headers)
         }
 
@@ -24207,7 +27487,6 @@ class DumpHandler extends DecoratorHandler {
   #maxSize = 1024 * 1024
   #dumped = false
   #size = 0
-  #controller = null
   aborted = false
   reason = false
 
@@ -24229,7 +27508,6 @@ class DumpHandler extends DecoratorHandler {
 
   onRequestStart (controller, context) {
     controller.abort = this.#abort.bind(this)
-    this.#controller = controller
 
     return super.onRequestStart(controller, context)
   }
@@ -24253,43 +27531,32 @@ class DumpHandler extends DecoratorHandler {
   }
 
   onResponseError (controller, err) {
-    if (this.#dumped) {
-      return
-    }
-
-    // On network errors before connect, controller will be null
-    err = this.#controller?.reason ?? err
-
-    super.onResponseError(controller, err)
+    super.onResponseError(controller, this.aborted === true ? this.reason : err)
   }
 
   onResponseData (controller, chunk) {
     this.#size = this.#size + chunk.length
 
-    if (this.#size >= this.#maxSize) {
-      this.#dumped = true
+    if (this.#size > this.#maxSize) {
+      throw new RequestAbortedError(
+        `Response size (${this.#size}) larger than maxSize (${this.#maxSize})`
+      )
+    }
 
-      if (this.aborted === true) {
-        super.onResponseError(controller, this.reason)
-      } else {
-        super.onResponseEnd(controller, {})
-      }
+    if (this.#size === this.#maxSize) {
+      this.#dumped = true
     }
 
     return true
   }
 
   onResponseEnd (controller, trailers) {
-    if (this.#dumped) {
-      return
-    }
-
-    if (this.#controller.aborted === true) {
+    if (this.aborted === true) {
       super.onResponseError(controller, this.reason)
       return
     }
 
-    super.onResponseEnd(controller, trailers)
+    super.onResponseEnd(controller, this.#dumped ? {} : trailers)
   }
 }
 
@@ -24349,7 +27616,9 @@ module.exports = createRedirectInterceptor
 
 // const { parseHeaders } = require('../core/util')
 const DecoratorHandler = __nccwpck_require__(8155)
-const { ResponseError } = __nccwpck_require__(8707)
+const { InvalidArgumentError, ResponseError } = __nccwpck_require__(8707)
+
+const defaultMaxSize = 1024 * 1024
 
 class ResponseErrorHandler extends DecoratorHandler {
   #statusCode
@@ -24357,9 +27626,13 @@ class ResponseErrorHandler extends DecoratorHandler {
   #decoder
   #headers
   #body
+  #bodySize
+  #bodyTruncated
+  #maxSize
 
-  constructor (_opts, { handler }) {
+  constructor ({ maxSize }, { handler }) {
     super(handler)
+    this.#maxSize = maxSize
   }
 
   #checkContentType (contentType) {
@@ -24372,6 +27645,8 @@ class ResponseErrorHandler extends DecoratorHandler {
     this.#decoder = null
     this.#headers = null
     this.#body = ''
+    this.#bodySize = 0
+    this.#bodyTruncated = false
 
     return super.onRequestStart(controller, context)
   }
@@ -24390,39 +27665,69 @@ class ResponseErrorHandler extends DecoratorHandler {
     }
   }
 
+  #createResponseError () {
+    this.#body += this.#decoder?.decode(undefined, { stream: false }) ?? ''
+    this.#decoder = null
+
+    if (!this.#bodyTruncated && this.#checkContentType('application/json')) {
+      try {
+        this.#body = JSON.parse(this.#body)
+      } catch {
+        // Do nothing...
+      }
+    }
+
+    let err
+    const stackTraceLimit = Error.stackTraceLimit
+    Error.stackTraceLimit = 0
+    try {
+      err = new ResponseError('Response Error', this.#statusCode, {
+        body: this.#body,
+        bodyTruncated: this.#bodyTruncated,
+        headers: this.#headers
+      })
+    } finally {
+      Error.stackTraceLimit = stackTraceLimit
+    }
+
+    return err
+  }
+
   onResponseData (controller, chunk) {
     if (this.#statusCode < 400) {
       return super.onResponseData(controller, chunk)
     }
 
-    this.#body += this.#decoder?.decode(chunk, { stream: true }) ?? ''
+    if (this.#decoder == null) {
+      return
+    }
+
+    if (this.#maxSize === 0) {
+      this.#body += this.#decoder.decode(chunk, { stream: true })
+      return
+    }
+
+    const remaining = this.#maxSize - this.#bodySize
+
+    if (chunk.length <= remaining) {
+      this.#bodySize += chunk.length
+      this.#body += this.#decoder.decode(chunk, { stream: true })
+      return
+    }
+
+    if (remaining > 0) {
+      this.#body += this.#decoder.decode(chunk.subarray(0, remaining), { stream: true })
+      this.#bodySize = this.#maxSize
+    }
+
+    this.#bodyTruncated = true
+    this.#body += this.#decoder.decode(undefined, { stream: false })
+    this.#decoder = null
   }
 
   onResponseEnd (controller, trailers) {
     if (this.#statusCode >= 400) {
-      this.#body += this.#decoder?.decode(undefined, { stream: false }) ?? ''
-
-      if (this.#checkContentType('application/json')) {
-        try {
-          this.#body = JSON.parse(this.#body)
-        } catch {
-          // Do nothing...
-        }
-      }
-
-      let err
-      const stackTraceLimit = Error.stackTraceLimit
-      Error.stackTraceLimit = 0
-      try {
-        err = new ResponseError('Response Error', this.#statusCode, {
-          body: this.#body,
-          headers: this.#headers
-        })
-      } finally {
-        Error.stackTraceLimit = stackTraceLimit
-      }
-
-      super.onResponseError(controller, err)
+      super.onResponseError(controller, this.#createResponseError())
     } else {
       super.onResponseEnd(controller, trailers)
     }
@@ -24433,10 +27738,16 @@ class ResponseErrorHandler extends DecoratorHandler {
   }
 }
 
-module.exports = () => {
+module.exports = (opts = {}) => {
+  const { maxSize = defaultMaxSize } = opts
+
+  if (!Number.isSafeInteger(maxSize) || maxSize < 0) {
+    throw new InvalidArgumentError('maxSize must be a non-negative integer')
+  }
+
   return (dispatch) => {
     return function Intercept (opts, handler) {
-      return dispatch(opts, new ResponseErrorHandler(opts, { handler }))
+      return dispatch(opts, new ResponseErrorHandler({ maxSize }, { handler }))
     }
   }
 }
@@ -25073,6 +28384,2024 @@ function enumToMap(obj, filter = [], exceptions = []) {
 
 /***/ }),
 
+/***/ 5997:
+/***/ ((module) => {
+
+const wasmModule = new WebAssembly.Module(
+  Buffer.from(
+    'AGFzbQEAAAABQgtgA39/fwBgAX8Bf2ACf38AYAF/AGABfwF+YAJ/fgBgBH9/f38AYAABf2AIf39/f39/f3wAYAN/f38Bf2ACf38BfwKUBBwDZW52CG9uX2Vycm9yAAADZW52Cm9uX2hlYWRlcnMACANlbnYJb25fZmluaXNoAAADZW52EG9uX21lc3NhZ2Vfc3RhcnQAAANlbnYTb25fbWVzc2FnZV9jb21wbGV0ZQAAA2Vudgpvbl9yZXF1ZXN0AAADZW52C29uX3Jlc3BvbnNlAAADZW52CG9uX3Jlc2V0AAADZW52CW9uX21ldGhvZAAAA2VudgZvbl91cmwAAANlbnYLb25fcHJvdG9jb2wAAANlbnYKb25fdmVyc2lvbgAAA2Vudglvbl9zdGF0dXMAAANlbnYJb25fcmVhc29uAAADZW52Dm9uX2hlYWRlcl9uYW1lAAADZW52D29uX2hlYWRlcl92YWx1ZQAAA2Vudgpvbl9jb25uZWN0AAADZW52Cm9uX3VwZ3JhZGUAAANlbnYPb25fY2h1bmtfbGVuZ3RoAAADZW52F29uX2NodW5rX2V4dGVuc2lvbl9uYW1lAAADZW52GG9uX2NodW5rX2V4dGVuc2lvbl92YWx1ZQAAA2Vudghvbl9jaHVuawAAA2Vudgdvbl9ib2R5AAADZW52B29uX2RhdGEAAANlbnYPb25fdHJhaWxlcl9uYW1lAAADZW52EG9uX3RyYWlsZXJfdmFsdWUAAANlbnYLb25fdHJhaWxlcnMAAANlbnYPb25fc3RhdGVfY2hhbmdlAAADQUAGAQMDBwIDBgMEBAEEBAEBAQQBBAQBAQEBAQEBAQEBAQEBAQcJAwIDBQUCAgIFAgICAgICAgEBAQEKAQIDAgICBQMBABEGCQF/AUGAgMAACwedCDkGbWVtb3J5AgAFYWxsb2MAHQVjbGVhcgAeCGNvbXBsZXRlAB8GY3JlYXRlACAHZGVhbGxvYwAhB2Rlc3Ryb3kAIgRmYWlsACMGZmluaXNoACQOZ2V0X2NodW5rX3NpemUAJRJnZXRfY29udGVudF9sZW5ndGgAJg5nZXRfZXJyb3JfY29kZQAnGWdldF9lcnJvcl9kZXNjcmlwdGlvbl9yYXcAKBRnZXRfbWF4X2JvZHlfcGF5bG9hZAApFWdldF9tYXhfaGVhZGVyX2xlbmd0aAAqGWdldF9tYXhfc3RhcnRfbGluZV9sZW5ndGgAKwpnZXRfbWV0aG9kACwKZ2V0X3BhcnNlZAAtDGdldF9wb3NpdGlvbgAuGGdldF9yZW1haW5pbmdfY2h1bmtfc2l6ZQAvHGdldF9yZW1haW5pbmdfY29udGVudF9sZW5ndGgAMAlnZXRfc3RhdGUAMQpnZXRfc3RhdHVzADIdaGFzX2NodW5rZWRfdHJhbnNmZXJfZW5jb2RpbmcAMxRoYXNfY29ubmVjdGlvbl9jbG9zZQA0Fmhhc19jb25uZWN0aW9uX3VwZ3JhZGUANRJoYXNfY29udGVudF9sZW5ndGgANgxoYXNfdHJhaWxlcnMANxVoYXNfdHJhbnNmZXJfZW5jb2RpbmcAOAtoYXNfdXBncmFkZQA5DWlzX2F1dG9kZXRlY3QAOgppc19jb25uZWN0ADsIaXNfZGVidWcAPAlpc19wYXVzZWQAPQppc19yZXF1ZXN0AD4ObWlsb19oYXNfZGVidWcAPwVwYXJzZQBABXBhdXNlAEEFcmVzZXQAQgZyZXN1bWUAQxRzZXRfYWN0aXZlX2NhbGxiYWNrcwBEEXNldF9hY3RpdmVfZXZlbnRzAEUJc2V0X2RlYnVnAEYOc2V0X2lzX2Nvbm5lY3QARw5zZXRfaXNfcmVxdWVzdABIFHNldF9tYXhfYm9keV9wYXlsb2FkAEkVc2V0X21heF9oZWFkZXJfbGVuZ3RoAEoZc2V0X21heF9zdGFydF9saW5lX2xlbmd0aABLFXNldF9zaG91bGRfYXV0b2RldGVjdABMIHNldF9zaG91bGRfY29udGludWVfd2l0aG91dF9kYXRhAE0cc2V0X3Nob3VsZF9tYW5hZ2VfdW5jb25zdW1lZABOFHNldF9zaG91bGRfc2tpcF9ib2R5AE8gc2V0X3Nob3VsZF9zdXNwZW5kX2FmdGVyX2hlYWRlcnMAUBxzaG91bGRfY29udGludWVfd2l0aG91dF9kYXRhAFEYc2hvdWxkX21hbmFnZV91bmNvbnN1bWVkAFIQc2hvdWxkX3NraXBfYm9keQBTHHNob3VsZF9zdXNwZW5kX2FmdGVyX2hlYWRlcnMAVAr7pwJAlgIBBH8CQCACIANPDQAgAS0AACEFAkAgAyACayIHQQNNBEAMAQtBgIKECCAFQYGChAhsIgEgAigAAHMiBmsgBnJBgIGChHhxQYCBgoR4RwRADAELIAJBfHFBBGohAgJAIAdBCU8EQCACIANBCGsiB0sNAQNAQYCChAggAigCACABcyIGayAGckGAgYKEeHFBgIGChHhHDQJBgIKECCACQQRqKAIAIAFzIgZrIAZyQYCBgoR4cUGAgYKEeEcNAiACQQhqIgIgB00NAAsMAQsgAiADTw0CDAELIAIgA08NAQsgA0EBa0EBIQQDQCAFIAItAABGDQEgAkEBaiICIANHDQALIQJBACEECyAAIAI2AgQgACAENgIACyYAAkAgAEEATgRAIABFBEBBASEADAILIABBARBVIgANAQsACyAACzMAIABCADcDKCAAQQA6ABUgAEIANwMwIABCADcDOCAAQgA3A0AgAEIANwNIIABBADYCUAvSAwIDfwF+AkAgACIBLQAkIgBBDk1BAEEBIAB0QYDPAXEbRQRAIAFBAzoAJiABQQI6ACQgAUENOgD0AkEAIQAgAUEAOgB5IAFBp5jAACkAADcAbCABQayYwAApAAA3AHECQCABKQNYIAEpA2CEp0EBcUUEQCABKAL4AiECDAELIAEoAvgCIgJBAToAACACQQVqQQM6AAAgAkEBaiABKAIgNgAAQQYhAAsgACACakEAOgAADAELAn9BACABKQNYIAEpA2CEIgRCyACDUA0AGiAEQgiDQgBSBEAgASgC+AIiAEEEOgAAIABBBWpBADYAACAAQQFqIAEoAiA2AABBCSECCyACIARCwACDUA0AGiABKAL4AiACaiIAQQc6AAAgAEEFakEANgAAIABBAWogASgCIDYAACACQQlqCyECIAFBADoAFiABQQA6ABQCQCABLQBSQQFGBEBBDiEAIAEtABFBAXENAQsgAS0AUCEDIARCAoNQBEAgAyEADAELQQEhACADQQFxRQRAIAMhAAwBCyABKAL4AiACaiIDQQI6AAAgA0EFakEANgAAIANBAWogASgCIDYAACACQQlqIQILIAEgADoAJCABKAL4AiACakEAOgAACwvfAgEDfyMAQeAAayIAJAACQEGAgAQQViICRQ0AIAJBBGstAABBA3FFDQAgAkEAQYCABPwLAAsCQCACRQ0AIABBADYAXCAAQgA3AFQgAEIANwBMIABCADcARCAAQgA3ADwgAEIANwA0IABCADcCHCAAQgA3AiQgAEEANgIsIABCADcADyAAQQA6ABdBgANBCBBVIgFFDQAgAUIANwARIAFBAToAECABQgA3AwggAUKAwICAgIAINwMAIAFCADcAGSABQgA3AB8gASAAKQAzNwAnIAEgACkAOzcALyABIAApAEM3ADcgASAAKQBLNwA/IAEgACkAUzcARyABIAApAFg3AEwgASAAKAIoNgJkIAEgACkCIDcCXCABIAApAhg3AlQgAUHsAGpBAEH/AfwLACABIAI2AvgCIAEgAC8AFjsA8wIgASAAKQAONwDrAiABIAE2AmggAEHgAGokACABDwsACxUAAkAgAEUNACABRQ0AIAAgARBXCws4AQF/IAAEQCAAKALwAiIBBEAgACgC7AIgARBXCyAAKAL4AiIBBEAgAUGAgAQQVwsgAEGAAxBXCwuSAQEBfyAAIAE6ACYgAEECOgAkIABB7ABqIQRB/gEgAyADQf4BTxsiAwRAIAQgAiAD/AoAAAsgACADOgD0AiADIARqQQA6AABBACEDIAApA1ggACkDYIRCAYOnBH8gACgC+AIiAkEBOgAAIAJBBWogAToAACACQQFqIAAoAiA2AABBBgVBAAsgACgC+AJqQQA6AAALrAIBAn8CQAJAAkAgAC0AJCIBQQlNBEBBASABdEEbcQ0BIAFBAkYNAyABQQlGDQILIABBBToAJiAAQQI6ACQgAEEWOgD0AiAAQQA6AIIBIABBgIjAACkAADcAbCAAQYiIwAApAAA3AHQgAEGOiMAAKQAANwB6AkAgACkDWCAAKQNghKdBAXFFBEAgACgC+AIhAQwBCyAAKAL4AiIBQQE6AAAgAUEFakEFOgAAIAFBAWogACgCIDYAAEEGIQILIAEgAmpBADoAAA8LIABBAToAJA8LAn8gACkDWCAAKQNghEIIg1AEQCAAKAL4AiEBQQAMAQsgACgC+AIiAUEEOgAAIAFBBWpBADYAACABQQFqIAAoAiA2AABBCQshAiAAQQE6ACQgASACakEAOgAACwsHACAAKQMwCwcAIAApAygLBwAgAC0AJgsTACAAMQD0AiAAQewAaq1CIIaECwcAIAApAwgLBwAgACgCBAsHACAAKAIACwcAIAAtAEwLBwAgACkDGAsHACAAKAIgCwcAIAApA0ALBwAgACkDOAsHACAALQAkCwcAIAAoAkgL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DQEMAgsgBkEJRg0BCyADQQY6ACYgA0ECOgAkIANB64rAACkAADcAbCADQfOKwAApAAA3AHQgA0H7isAAKQAANwB8IANBgovAACkAADcAgwEMJwsgAEEBaiEAIAlBAWsiCQ0ACwsgAyAHQeQAbCAOQQpsQf4BcWogC2o2AkggIkUNAyA7QgBSBEAgBUEQakGBgARPDTQgAygCICEAIAMoAvgCIAVqQQo6AAAgAygC+AIgBWpBAWogADYAACADKAL4AiAFakEFakEENgAAIAVBCWohBQsgOkIAUgRAIAVBEGpBgYAETw00IAMoAiAhACADKAL4AiAFakELOgAAIAMoAvgCIAVqQQFqIABBBWo2AAAgAygC+AIgBWpBBWpBAzYAACAFQQlqIQULIEJCAFIEQCAFQRBqQYGABE8NNCADKAIgIQAgAygC+AIgBWpBDDoAACADKAL4AiAFakEBaiAAQQlqNgAAIAMoAvgCIAVqQQVqQQM2AAAgBUEJaiEFCyBBUA0DIA0NAyAFQRBqQYCABEsNMyADKAIgIQAgAygC+AIgBWpBDToAACADKAL4AiAFakEBaiAAQQ1qNgAAIAMoAvgCIAVqQQVqIAJBDWs2AAAgBUEJaiEFDAMLIANBDDoAJiADQQI6ACQgA0GKi8AAKQAANwBsIANBkovAACkAADcAdCADQZqLwAApAAA3AHwgA0Gii8AAKQAANwCEASADQaqLwAApAAA3AIwBIANBsYvAACgAADYAkwFBKyEIQZcBDDELIANBBjoAJiADQQI6ACQgA0HSi8AAKQAANwBsIANB2ovAACkAADcAdCADQd+LwAApAAA3AHkMCwsgBC0AAkHUAEcNBCAELQADQdAARw0EIAQtAARBL0cNBCADQRE6ACYgA0ECOgAkIANBhonAACkAADcAbCADQY6JwAApAAA3AHQgA0GWicAAKQAANwB8DAgLIAJBAmohACADLQAkQQJGDScgA0EGOgAkDCcLIANBDDoAJiADQQI6ACQgA0HPisAAKQAANwBsIANB14rAACkAADcAdCADQd+KwAApAAA3AHwgA0HnisAAKAAANgCEAQwcCyADKAIAIAhLDS0gA0EGOgAmIANBAjoAJCADQbuKwAApAAA3AGwgA0HDisAAKQAANwB0IANBy4rAACgAADYAfAwdCyAIRQ0FIAhBAWsgCk8N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KQAANwBsIANBwojAACkAADcAdCADQcqIwAApAAA3AHwMBQsgEyANayITIAtqIRUgCSEHIAYhAAJAA0AgACAKTw0pIAAgBGotAAAtAICGQARAIABBAWohACAHQQFrIgdFDQIMAQsLIANBBjoAJiADQQI6ACQgA0HSiMAAKQAANwBsIANB2ojAACkAADcAdCADQd+IwAApAAA3AHkMBwsgDiAQQQlqRw0CAkAgDiALa0EIRw0AIA0pAAAiLkLIqNGC9cWMlzBRDQIgLkLIqNGC9aWMlzFSDQAgD0UNBCADQRE6ACYgA0ECOgAkIANB54jAACkAADcAbCADQe+IwAApAAA3AHQgA0H3iMAAKQAANwB8IANB/ojAACkAADcAgwEMHgsLIANBBjoAJiADQQI6ACQgA0GeicAAKQAANwBsIANBponAACkAADcAdEEQIQhB/AAMKgsgDw0BIANBEToAJiADQQI6ACQgA0GGicAAKQAANwBsIANBjonAACkAADcAdCADQZaJwAApAAA3AHwMAgsgA0EGOgAmIANBAjoAJCADQa6JwAApAAA3AGwgA0G2icAAKQAANwB0IANBu4nAACkAADcAeQwDCwJAICNFDQAgQEIAUgRAIAVBEGpBgYAETw0qIAMoAiAhACADKAL4AiAFakEIOgAAIAMoAvgCIAVqQQFqIAA2AAAgAygC+AIgBWpBBWogAjYAACAFQQlqIQULID9CAFIEQCAFQRBqQYGABE8NKiADKAIgIQAgAygC+AIgBWpBCToAACADKAL4AiAFakEBaiAAIAZqNgAAIAMoAvgCIAVqQQVqIAk2AAAgBUEJaiEFCyA7QgBSBEAgBUEQakGBgARPDSogAygCICEAIAMoAvgCIAVqQQo6AAAgAygC+AIgBWpBAWogACALajYAACADKAL4AiAFakEFaiATNgAAIAVBCWohBQsgOlANACAFQRBqQYCABEsNKSADKAIgIQAgAygC+AIgBWpBCzoAACADKAL4AiAFakEBaiAAIBVBAWpqNgAAIAMoAvgCIAVqQQVqQQM2AAAgBUEJaiEFCyAOQQJqIQAgAy0AJCECIAMtAExBCkYEQCACQQJGDSEgA0EFOgAkDCELIAJBAkYNICADQQY6ACQMIAtBGCEIQYQBDCYLIAMoAgAgCEsNJiADQQY6ACYgA0ECOgAkIANBpYjA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EFkgASAAIAJqIgBBAXI2AgQgACABaiAANgIAIAFB3JvAACgCAEcNAUHUm8AAIAA2AgAPCyACIANBfnE2AgQgASAAQQFyNgIEIAAgAWogADYCAAsgAEGAAkkNBCABIAAQW0H0m8AAQfSbwAAoAgBBAWsiADYCACAADQZBvJnAACgCACIADQJB/x8MAwtB4JvAACABNgIAQdibwABB2JvAACgCACAAaiIANgIAIAEgAEEBcjYCBEHcm8AAKAIAIAFGBEBB1JvAAEEANgIAQdybwABBADYCAAsgAEHsm8AAKAIAIgJNDQVB4JvAACgCACIARQ0FQdibwAAoAgAiA0EpSQ0EQbSZwAAhAQNAIAAgASgCACIETwRAIAAgBCABKAIEakkNBgsgASgCCCEBDAALAAtB3JvAACABNgIAQdSbwABB1JvAACgCACAAaiIANgIAIAEgAEEBcjYCBCAAIAFqIAA2AgAPC0EAIQEDQCABQQFqIQEgACgCCCIADQALQf8fIAEgAUH/H00bCzYCAA8LAkBBzJvAACgCACICQQEgAEEDdnQiA3FFBEBBzJvAACACIANyNgIAIABB+AFxQcSZwABqIgAhAgwBCyAAQfgBcSIAQcSZwABqIQIgAEHMmcAAaigCACEACyACIAE2AgggACABNgIMIAEgAjYCDCABIAA2AggPC0H0m8AAQbyZwAAoAgAiAAR/QQAhAQNAIAFBAWohASAAKAIIIgANAAtB/x8gASABQf8fTRsFQf8fCzYCACACIANPDQBB7JvAAEF/NgIACwuCAwEEfyAAKAIMIQICQAJAAkAgAUGAAk8EQCAAKAIYIQMCQAJAIAAgAkYEQCAAQRRBECAAKAIUIgIbaigCACIBDQFBACECDAILIAAoAggiASACNgIMIAIgATYCCAwBCyAAQRRqIABBEGogAhshBANAIAQhBSABIgJBFGogAkEQaiACKAIUIgEbIQQgAkEUQRAgARtqKAIAIgENAAsgBUEANgIACyADRQ0CAkAgACgCHEECdEG0mMAAaiIBKAIAIABHBEAgAygCECAARg0BIAMgAjYCFCACDQMMBAsgASACNgIAIAJFDQQMAgsgAyACNgIQIAINAQwCCyAAKAIIIgAgAkcEQCAAIAI2AgwgAiAANgIIDwtBzJvAAEHMm8AAKAIAQX4gAUEDdndxNgIADwsgAiADNgIYIAAoAhAiAQRAIAIgATYCECABIAI2AhgLIAAoAhQiAEUNACACIAA2AhQgACACNgIYDwsPC0HQm8AAQdCbwAAoAgBBfiAAKAIcd3E2AgALjgQBAn8gACABaiECAkACQAJAIAAoAgQiA0EBcQ0AIANBAnFFDQEgACgCACIDIAFqIQEgACADayIAQdybwAAoAgBGBEAgAigCBEEDcUEDRw0BQdSbwAAgATYCACACIAIoAgRBfnE2AgQgACABQQFyNgIEIAIgATYCAA8LIAAgAxBZCwJAAkAgAigCBCIDQQJxRQRAIAJB4JvAACgCAEYNAiACQdybwAAoAgBGDQQgAiADQXhxIgIQWSAAIAEgAmoiAUEBcjYCBCAAIAFqIAE2AgAgAEHcm8AAKAIARw0BQdSbwAAgATYCAA8LIAIgA0F+cTYCBCAAIAFBAXI2AgQgACABaiABNgIACyABQYACTwRAIAAgARBbDwsCQEHMm8AAKAIAIgJBASABQQN2dCIDcUUEQEHMm8AAIAIgA3I2AgAgAUH4AXFBxJnAAGoiASECDAELIAFB+AFxIgFBxJnAAGohAiABQcyZwABqKAIAIQELIAIgADYCCCABIAA2AgwgACACNgIMIAAgATYCCA8LQeCbwAAgADYCAEHYm8AAQdibwAAoAgAgAWoiATYCACAAIAFBAXI2AgQgAEHcm8AAKAIARw0AQdSbwABBADYCAEHcm8AAQQA2AgALDwtB3JvAACAANgIAQdSbwABB1JvAACgCACABaiIBNgIAIAAgAUEBcjYCBCAAIAFqIAE2AgALwwIBBH8gAEIANwIQIAACf0EAIAFBCHYiA0UNABpBHyABQYCAgAhPDQAaIAFBJiADZyIDa3ZBAXEgA0EBdHJBPnMLIgI2AhwgAkECdEG0mMAAaiEEQQEgAnQiA0HQm8AAKAIAcUUEQCAEIAA2AgAgACAENgIYIAAgADYCDCAAIAA2AghB0JvAAEHQm8AAKAIAIANyNgIADwsCQAJAIAEgBCgCACIDKAIEQXhxRgRAIAMhAgwBCyABQRkgAkEBdmtBACACQR9HG3QhBQNAIAMgBUEddkEEcWoiBCgCECICRQ0CIAVBAXQhBSACIQMgAigCBEF4cSABRw0ACwsgAigCCCIBIAA2AgwgAiAANgIIIABBADYCGCAAIAI2AgwgACABNgIIDwsgBEEQaiAANgIAIAAgAzYCGCAAIAA2AgwgACAANgIICwvuFQcAQaGAwAALXgEAAQEBAQEAAAEBAAEBAAEBAQEBAQEBAQEAAAAAAAAAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAAEAQYmCwAALAQEAQaCCwAAL4AEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQBBiYTAAAsBAQBBoITAAAvgAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAEGhhsAAC14BAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAAEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAAABAEGAiMAAC7QQVW5leHBlY3RlZCBlbmQgb2YgZGF0YVVuZXhwZWN0ZWQgZGF0YVJlcXVlc3QgbGluZSB0b28gbG9uZ0ludmFsaWQgbWV0aG9kIGNoYXJhY3RlckludmFsaWQgVVJMIGNoYXJhY3RlclBSSSBpcyBvbmx5IHZhbGlkIHdpdGggSFRUUC8yLjBVbnN1cHBvcnRlZCBIVFRQIHZlcnNpb25JbnZhbGlkIHByb3RvY29sSW52YWxpZCBwcm90b2NvbCBuYW1lRXhwZWN0ZWQgLyBhZnRlciB0aGUgcHJvdG9jb2wgbmFtZUV4cGVjdGVkIHNwYWNlIGFmdGVyIFVSTEV4cGVjdGVkIHNwYWNlIGFmdGVyIG1ldGhvZFJlcXVlc3QgbGluZSB0b28gc2hvcnRFeHBlY3RlZCBDUkxGU3RhdHVzIGxpbmUgdG9vIGxvbmdJbnZhbGlkIEhUVFAgcmVzcG9uc2Ugc3RhdHVzSW52YWxpZCBzdGF0dXMgcmVhc29uIGNoYXJhY3RlckV4cGVjdGVkIGEgc3BhY2UgYWZ0ZXIgSFRUUCByZXNwb25zZSBzdGF0dXNFeHBlY3RlZCBzcGFjZSBhZnRlciBwcm90b2NvbFN0YXR1cyBsaW5lIHRvbyBzaG9ydE1hbGZvcm1lZCBIVFRQLzIuMCBwcmVmYWNlSGVhZGVyIGxpbmUgdG9vIGxvbmdVbmV4cGVjdGVkIENvbnRlbnQtTGVuZ3RoIGhlYWRlciBmb3IgYSByZXNwb25zZSB3aXRob3V0IGJvZHlFeHBlY3RlZCBDb250ZW50LUxlbmd0aCBoZWFkZXIgdmFsdWVJbnZhbGlkIENvbnRlbnQtTGVuZ3RoIGhlYWRlckludmFsaWQgZHVwbGljYXRlIENvbnRlbnQtTGVuZ3RoIGhlYWRlclVuZXhwZWN0ZWQgQ29udGVudC1MZW5ndGggaGVhZGVyIHdoZW4gVHJhbnNmZXItRW5jb2RpbmcgaGVhZGVyIGlzIHByZXNlbnRVbmV4cGVjdGVkIFRyYW5zZmVyLUVuY29kaW5nIGhlYWRlciBmb3IgYSByZXNwb25zZSB3aXRob3V0IGJvZHlFeHBlY3RlZCBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgdmFsdWVUaGUgdmFsdWUgImNodW5rZWQiIGluIHRoZSBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgbXVzdCBiZSB0aGUgbGFzdCBwcm92aWRlZCBhbmQgY2FuIGJlIHByb3ZpZGVkIG9ubHkgb25jZVRoZSB2YWx1ZSAiY2h1bmtlZCIgaW4gdGhlIFRyYW5zZmVyLUVuY29kaW5nIGhlYWRlciBtdXN0IGJlIHRoZSBsYXN0IHByb3ZpZGVkVW5leHBlY3RlZCBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgd2hlbiBDb250ZW50LUxlbmd0aCBoZWFkZXIgaXMgcHJlc2VudEV4cGVjdGVkIENvbm5lY3Rpb24gaGVhZGVyIHZhbHVlSW52YWxpZCBDb25uZWN0aW9uIGhlYWRlciB2YWx1ZUV4cGVjdGVkIFRyYWlsZXIgaGVhZGVyIHZhbHVlRXhwZWN0ZWQgVXBncmFkZSBoZWFkZXIgdmFsdWVJbnZhbGlkIFVwZ3JhZGUgaGVhZGVyIHZhbHVlSW52YWxpZCBoZWFkZXIgZmllbGQgbmFtZSBjaGFyYWN0ZXJJbnZhbGlkIGhlYWRlciBmaWVsZCB2YWx1ZSBjaGFyYWN0ZXJNaXNzaW5nIENvbm5lY3Rpb24gaGVhZGVyIHNldCB0byAidXBncmFkZSIgd2hlbiB1c2luZyB0aGUgVXBncmFkZSBoZWFkZXJUcmFpbGVycyBhcmUgbm90IGFsbG93ZWQgd2hlbiBub3QgdXNpbmcgY2h1bmtlZCB0cmFuc2ZlciBlbmNvZGluZ1VuZXhwZWN0ZWQgY29udGVudCBmb3IgdGhlIHJlcXVlc3QgKEdFVCBvciBIRUFEKVRyYW5zZmVyLUVuY29kaW5nIGxhc3QgaGVhZGVyIHZhbHVlIG11c3QgYmUgImNodW5rZWQiIGlmIHRoZSBoZWFkZXIgaXMgcHJlc2VudENodW5rIGhlYWRlciB0b28gbG9uZ0ludmFsaWQgY2h1bmsgbGVuZ3RoIGNoYXJhY3RlckludmFsaWQgY2h1bmsgbGVuZ3RoIHNpemVFeHBlY3RlZCBjaHVuayBleHRlbnNpb24gbmFtZUludmFsaWQgY2h1bmsgZXh0ZW5zaW9uIG5hbWUgY2hhcmFjdGVyRXhwZWN0ZWQgY2xvc2luZyBxdW90ZSBmb3IgY2h1bmsgZXh0ZW5zaW9uIHZhbHVlSW52YWxpZCBjaHVuayBleHRlbnNpb24gcXVvdGVkIHZhbHVlIGNoYXJhY3RlckV4cGVjdGVkIGNodW5rIGV4dGVuc2lvbiB2YWx1ZUludmFsaWQgY2h1bmsgZXh0ZW5zaW9uIHZhbHVlIGNoYXJhY3RlckludmFsaWQgY2h1bmsgZXh0ZW5zaW9uIGNoYXJhY3RlciBhZnRlciB2YWx1ZUV4cGVjdGVkIENSTEYgYWZ0ZXIgY2h1bmsgZGF0YVRyYWlsZXIgbGluZSB0b28gbG9uZ0ludmFsaWQgdHJhaWxlciBmaWVsZCBuYW1lIGNoYXJhY3RlckludmFsaWQgdHJhaWxlciBmaWVsZCB2YWx1ZSBjaGFyYWN0ZXJJbnZhbGlkIHN0YXRl',
+    'base64'
+  )
+)
+
+const textEncoder = new TextEncoder()
+const textDecoder = new TextDecoder()
+
+function log (logger, raw) {
+  const len = Number(BigInt.asUintN(32, raw))
+  const ptr = Number(raw >> 32n)
+
+  logger(textDecoder.decode(new Uint8Array(this.memory.buffer, ptr, len)))
+}
+
+function alloc (len) {
+  return this.alloc(len) >>> 0
+}
+
+function dealloc (ptr, len) {
+  return this.dealloc(ptr, len)
+}
+
+function create () {
+  return this.create() >>> 0
+}
+
+function destroy (parser) {
+  this.destroy(parser)
+}
+
+function parse (parser, data, limit) {
+  return this.parse(parser, data, limit) >>> 0
+}
+
+function fail (parser, code, description) {
+  const len = description.length
+  const ptr = this.alloc(len)
+  const buffer = new Uint8Array(this.memory.buffer, ptr, len)
+  textEncoder.encodeInto(description, buffer)
+
+  this.fail(parser, code, ptr, len)
+  this.dealloc(ptr, len)
+}
+
+function hasDebug () {
+  return this.milo_has_debug() !== 0
+}
+
+const Errors = Object.freeze({
+  NONE: 0,
+  USER: 1,
+  CALLBACK_ERROR: 2,
+  UNEXPECTED_STATE: 3,
+  UNEXPECTED_DATA: 4,
+  UNEXPECTED_EOF: 5,
+  UNEXPECTED_CHARACTER: 6,
+  UNEXPECTED_CONTENT_LENGTH: 7,
+  UNEXPECTED_TRANSFER_ENCODING: 8,
+  UNEXPECTED_CONTENT: 9,
+  UNEXPECTED_TRAILERS: 10,
+  INVALID_VERSION: 11,
+  INVALID_STATUS: 12,
+  INVALID_CONTENT_LENGTH: 13,
+  INVALID_TRANSFER_ENCODING: 14,
+  INVALID_CHUNK_SIZE: 15,
+  MISSING_CONNECTION_UPGRADE: 16,
+  UNSUPPORTED_HTTP_VERSION: 17,
+  0: 'NONE',
+  1: 'USER',
+  2: 'CALLBACK_ERROR',
+  3: 'UNEXPECTED_STATE',
+  4: 'UNEXPECTED_DATA',
+  5: 'UNEXPECTED_EOF',
+  6: 'UNEXPECTED_CHARACTER',
+  7: 'UNEXPECTED_CONTENT_LENGTH',
+  8: 'UNEXPECTED_TRANSFER_ENCODING',
+  9: 'UNEXPECTED_CONTENT',
+  10: 'UNEXPECTED_TRAILERS',
+  11: 'INVALID_VERSION',
+  12: 'INVALID_STATUS',
+  13: 'INVALID_CONTENT_LENGTH',
+  14: 'INVALID_TRANSFER_ENCODING',
+  15: 'INVALID_CHUNK_SIZE',
+  16: 'MISSING_CONNECTION_UPGRADE',
+  17: 'UNSUPPORTED_HTTP_VERSION'
+})
+
+const Methods = Object.freeze({
+  OTHER: 0,
+  GET: 1,
+  HEAD: 2,
+  POST: 3,
+  PUT: 4,
+  DELETE: 5,
+  CONNECT: 6,
+  OPTIONS: 7,
+  TRACE: 8,
+  PATCH: 9,
+  PRI: 10,
+  0: 'OTHER',
+  1: 'GET',
+  2: 'HEAD',
+  3: 'POST',
+  4: 'PUT',
+  5: 'DELETE',
+  6: 'CONNECT',
+  7: 'OPTIONS',
+  8: 'TRACE',
+  9: 'PATCH',
+  10: 'PRI'
+})
+
+const Callbacks = Object.freeze({
+  ON_ERROR: 0,
+  ON_FINISH: 1,
+  ON_MESSAGE_START: 2,
+  ON_MESSAGE_COMPLETE: 3,
+  ON_REQUEST: 4,
+  ON_RESPONSE: 5,
+  ON_RESET: 6,
+  ON_METHOD: 7,
+  ON_URL: 8,
+  ON_PROTOCOL: 9,
+  ON_VERSION: 10,
+  ON_STATUS: 11,
+  ON_REASON: 12,
+  ON_HEADER_NAME: 13,
+  ON_HEADER_VALUE: 14,
+  ON_HEADERS: 15,
+  ON_CONNECT: 16,
+  ON_UPGRADE: 17,
+  ON_CHUNK_LENGTH: 18,
+  ON_CHUNK_EXTENSION_NAME: 19,
+  ON_CHUNK_EXTENSION_VALUE: 20,
+  ON_CHUNK: 21,
+  ON_BODY: 22,
+  ON_DATA: 23,
+  ON_TRAILER_NAME: 24,
+  ON_TRAILER_VALUE: 25,
+  ON_TRAILERS: 26,
+  ON_STATE_CHANGE: 27,
+  0: 'ON_ERROR',
+  1: 'ON_FINISH',
+  2: 'ON_MESSAGE_START',
+  3: 'ON_MESSAGE_COMPLETE',
+  4: 'ON_REQUEST',
+  5: 'ON_RESPONSE',
+  6: 'ON_RESET',
+  7: 'ON_METHOD',
+  8: 'ON_URL',
+  9: 'ON_PROTOCOL',
+  10: 'ON_VERSION',
+  11: 'ON_STATUS',
+  12: 'ON_REASON',
+  13: 'ON_HEADER_NAME',
+  14: 'ON_HEADER_VALUE',
+  15: 'ON_HEADERS',
+  16: 'ON_CONNECT',
+  17: 'ON_UPGRADE',
+  18: 'ON_CHUNK_LENGTH',
+  19: 'ON_CHUNK_EXTENSION_NAME',
+  20: 'ON_CHUNK_EXTENSION_VALUE',
+  21: 'ON_CHUNK',
+  22: 'ON_BODY',
+  23: 'ON_DATA',
+  24: 'ON_TRAILER_NAME',
+  25: 'ON_TRAILER_VALUE',
+  26: 'ON_TRAILERS',
+  27: 'ON_STATE_CHANGE'
+})
+
+const CallbackActives = Object.freeze({
+  NONE: 0n,
+  ON_ERROR: 1n,
+  ON_FINISH: 2n,
+  ON_MESSAGE_START: 4n,
+  ON_MESSAGE_COMPLETE: 8n,
+  ON_REQUEST: 16n,
+  ON_RESPONSE: 32n,
+  ON_RESET: 64n,
+  ON_METHOD: 128n,
+  ON_URL: 256n,
+  ON_PROTOCOL: 512n,
+  ON_VERSION: 1024n,
+  ON_STATUS: 2048n,
+  ON_REASON: 4096n,
+  ON_HEADER_NAME: 8192n,
+  ON_HEADER_VALUE: 16384n,
+  ON_HEADERS: 32768n,
+  ON_CONNECT: 65536n,
+  ON_UPGRADE: 131072n,
+  ON_CHUNK_LENGTH: 262144n,
+  ON_CHUNK_EXTENSION_NAME: 524288n,
+  ON_CHUNK_EXTENSION_VALUE: 1048576n,
+  ON_CHUNK: 2097152n,
+  ON_BODY: 4194304n,
+  ON_DATA: 8388608n,
+  ON_TRAILER_NAME: 16777216n,
+  ON_TRAILER_VALUE: 33554432n,
+  ON_TRAILERS: 67108864n,
+  ON_STATE_CHANGE: 134217728n,
+  ALL: 268435455n,
+  0n: 'NONE',
+  1n: 'ON_ERROR',
+  2n: 'ON_FINISH',
+  4n: 'ON_MESSAGE_START',
+  8n: 'ON_MESSAGE_COMPLETE',
+  16n: 'ON_REQUEST',
+  32n: 'ON_RESPONSE',
+  64n: 'ON_RESET',
+  128n: 'ON_METHOD',
+  256n: 'ON_URL',
+  512n: 'ON_PROTOCOL',
+  1024n: 'ON_VERSION',
+  2048n: 'ON_STATUS',
+  4096n: 'ON_REASON',
+  8192n: 'ON_HEADER_NAME',
+  16384n: 'ON_HEADER_VALUE',
+  32768n: 'ON_HEADERS',
+  65536n: 'ON_CONNECT',
+  131072n: 'ON_UPGRADE',
+  262144n: 'ON_CHUNK_LENGTH',
+  524288n: 'ON_CHUNK_EXTENSION_NAME',
+  1048576n: 'ON_CHUNK_EXTENSION_VALUE',
+  2097152n: 'ON_CHUNK',
+  4194304n: 'ON_BODY',
+  8388608n: 'ON_DATA',
+  16777216n: 'ON_TRAILER_NAME',
+  33554432n: 'ON_TRAILER_VALUE',
+  67108864n: 'ON_TRAILERS',
+  134217728n: 'ON_STATE_CHANGE',
+  268435455n: 'ALL'
+})
+
+const Events = Object.freeze({
+  END: 0,
+  ERROR: 1,
+  FINISH: 2,
+  MESSAGE_START: 3,
+  MESSAGE_COMPLETE: 4,
+  REQUEST: 5,
+  RESPONSE: 6,
+  RESET: 7,
+  METHOD: 8,
+  URL: 9,
+  PROTOCOL: 10,
+  VERSION: 11,
+  STATUS: 12,
+  REASON: 13,
+  HEADER_NAME: 14,
+  HEADER_VALUE: 15,
+  HEADERS: 16,
+  CONNECT: 17,
+  UPGRADE: 18,
+  CHUNK_LENGTH: 19,
+  CHUNK_EXTENSION_NAME: 20,
+  CHUNK_EXTENSION_VALUE: 21,
+  CHUNK: 22,
+  BODY: 23,
+  DATA: 24,
+  TRAILER_NAME: 25,
+  TRAILER_VALUE: 26,
+  TRAILERS: 27,
+  STATE_CHANGE: 28,
+  0: 'END',
+  1: 'ERROR',
+  2: 'FINISH',
+  3: 'MESSAGE_START',
+  4: 'MESSAGE_COMPLETE',
+  5: 'REQUEST',
+  6: 'RESPONSE',
+  7: 'RESET',
+  8: 'METHOD',
+  9: 'URL',
+  10: 'PROTOCOL',
+  11: 'VERSION',
+  12: 'STATUS',
+  13: 'REASON',
+  14: 'HEADER_NAME',
+  15: 'HEADER_VALUE',
+  16: 'HEADERS',
+  17: 'CONNECT',
+  18: 'UPGRADE',
+  19: 'CHUNK_LENGTH',
+  20: 'CHUNK_EXTENSION_NAME',
+  21: 'CHUNK_EXTENSION_VALUE',
+  22: 'CHUNK',
+  23: 'BODY',
+  24: 'DATA',
+  25: 'TRAILER_NAME',
+  26: 'TRAILER_VALUE',
+  27: 'TRAILERS',
+  28: 'STATE_CHANGE'
+})
+
+const EventActives = Object.freeze({
+  NONE: 0n,
+  ON_ERROR: 1n,
+  ON_FINISH: 2n,
+  ON_MESSAGE_START: 4n,
+  ON_MESSAGE_COMPLETE: 8n,
+  ON_REQUEST: 16n,
+  ON_RESPONSE: 32n,
+  ON_RESET: 64n,
+  ON_METHOD: 128n,
+  ON_URL: 256n,
+  ON_PROTOCOL: 512n,
+  ON_VERSION: 1024n,
+  ON_STATUS: 2048n,
+  ON_REASON: 4096n,
+  ON_HEADER_NAME: 8192n,
+  ON_HEADER_VALUE: 16384n,
+  ON_HEADERS: 32768n,
+  ON_CONNECT: 65536n,
+  ON_UPGRADE: 131072n,
+  ON_CHUNK_LENGTH: 262144n,
+  ON_CHUNK_EXTENSION_NAME: 524288n,
+  ON_CHUNK_EXTENSION_VALUE: 1048576n,
+  ON_CHUNK: 2097152n,
+  ON_BODY: 4194304n,
+  ON_DATA: 8388608n,
+  ON_TRAILER_NAME: 16777216n,
+  ON_TRAILER_VALUE: 33554432n,
+  ON_TRAILERS: 67108864n,
+  ON_STATE_CHANGE: 134217728n,
+  ALL: 268435455n,
+  0n: 'NONE',
+  1n: 'ON_ERROR',
+  2n: 'ON_FINISH',
+  4n: 'ON_MESSAGE_START',
+  8n: 'ON_MESSAGE_COMPLETE',
+  16n: 'ON_REQUEST',
+  32n: 'ON_RESPONSE',
+  64n: 'ON_RESET',
+  128n: 'ON_METHOD',
+  256n: 'ON_URL',
+  512n: 'ON_PROTOCOL',
+  1024n: 'ON_VERSION',
+  2048n: 'ON_STATUS',
+  4096n: 'ON_REASON',
+  8192n: 'ON_HEADER_NAME',
+  16384n: 'ON_HEADER_VALUE',
+  32768n: 'ON_HEADERS',
+  65536n: 'ON_CONNECT',
+  131072n: 'ON_UPGRADE',
+  262144n: 'ON_CHUNK_LENGTH',
+  524288n: 'ON_CHUNK_EXTENSION_NAME',
+  1048576n: 'ON_CHUNK_EXTENSION_VALUE',
+  2097152n: 'ON_CHUNK',
+  4194304n: 'ON_BODY',
+  8388608n: 'ON_DATA',
+  16777216n: 'ON_TRAILER_NAME',
+  33554432n: 'ON_TRAILER_VALUE',
+  67108864n: 'ON_TRAILERS',
+  134217728n: 'ON_STATE_CHANGE',
+  268435455n: 'ALL'
+})
+
+const States = Object.freeze({
+  START: 0,
+  FINISH: 1,
+  ERROR: 2,
+  REQUEST_LINE: 3,
+  STATUS_LINE: 4,
+  HTTP2_PREFACE: 5,
+  HEADER: 6,
+  BODY_DECISION: 7,
+  BODY_VIA_CONTENT_LENGTH: 8,
+  BODY_WITH_NO_LENGTH: 9,
+  CHUNK_HEADER: 10,
+  CHUNK_EXTENSIONS: 11,
+  CHUNK_DATA: 12,
+  TRAILER: 13,
+  TUNNEL: 14,
+  0: 'START',
+  1: 'FINISH',
+  2: 'ERROR',
+  3: 'REQUEST_LINE',
+  4: 'STATUS_LINE',
+  5: 'HTTP2_PREFACE',
+  6: 'HEADER',
+  7: 'BODY_DECISION',
+  8: 'BODY_VIA_CONTENT_LENGTH',
+  9: 'BODY_WITH_NO_LENGTH',
+  10: 'CHUNK_HEADER',
+  11: 'CHUNK_EXTENSIONS',
+  12: 'CHUNK_DATA',
+  13: 'TRAILER',
+  14: 'TUNNEL'
+})
+
+const ParserFields = Object.freeze({
+  MAX_START_LINE_LENGTH: 0,
+  MAX_HEADER_LENGTH: 4,
+  MAX_BODY_PAYLOAD: 8,
+  AUTODETECT: 16,
+  IS_REQUEST: 17,
+  SUSPEND_AFTER_HEADERS: 18,
+  MANAGE_UNCONSUMED: 19,
+  CONTINUE_WITHOUT_DATA: 20,
+  IS_CONNECT: 21,
+  SKIP_BODY: 22,
+  DEBUG: 23,
+  PARSED: 24,
+  POSITION: 32,
+  STATE: 36,
+  PAUSED: 37,
+  ERROR_CODE: 38,
+  CONTENT_LENGTH: 40,
+  CHUNK_SIZE: 48,
+  REMAINING_CONTENT_LENGTH: 56,
+  REMAINING_CHUNK_SIZE: 64,
+  STATUS: 72,
+  METHOD: 76,
+  HAS_CONTENT_LENGTH: 77,
+  HAS_TRANSFER_ENCODING: 78,
+  HAS_CHUNKED_TRANSFER_ENCODING: 79,
+  HAS_CONNECTION_CLOSE: 80,
+  HAS_CONNECTION_UPGRADE: 81,
+  HAS_UPGRADE: 82,
+  HAS_TRAILERS: 83,
+  ACTIVE_CALLBACKS: 88,
+  ACTIVE_EVENTS: 96,
+  PTR: 104,
+  ERROR_DESCRIPTION: 108,
+  UNCONSUMED: 364,
+  UNCONSUMED_LEN: 368,
+  ERROR_DESCRIPTION_LEN: 372,
+  EVENTS: 376,
+  0: 'MAX_START_LINE_LENGTH',
+  4: 'MAX_HEADER_LENGTH',
+  8: 'MAX_BODY_PAYLOAD',
+  16: 'AUTODETECT',
+  17: 'IS_REQUEST',
+  18: 'SUSPEND_AFTER_HEADERS',
+  19: 'MANAGE_UNCONSUMED',
+  20: 'CONTINUE_WITHOUT_DATA',
+  21: 'IS_CONNECT',
+  22: 'SKIP_BODY',
+  23: 'DEBUG',
+  24: 'PARSED',
+  32: 'POSITION',
+  36: 'STATE',
+  37: 'PAUSED',
+  38: 'ERROR_CODE',
+  40: 'CONTENT_LENGTH',
+  48: 'CHUNK_SIZE',
+  56: 'REMAINING_CONTENT_LENGTH',
+  64: 'REMAINING_CHUNK_SIZE',
+  72: 'STATUS',
+  76: 'METHOD',
+  77: 'HAS_CONTENT_LENGTH',
+  78: 'HAS_TRANSFER_ENCODING',
+  79: 'HAS_CHUNKED_TRANSFER_ENCODING',
+  80: 'HAS_CONNECTION_CLOSE',
+  81: 'HAS_CONNECTION_UPGRADE',
+  82: 'HAS_UPGRADE',
+  83: 'HAS_TRAILERS',
+  88: 'ACTIVE_CALLBACKS',
+  96: 'ACTIVE_EVENTS',
+  104: 'PTR',
+  108: 'ERROR_DESCRIPTION',
+  364: 'UNCONSUMED',
+  368: 'UNCONSUMED_LEN',
+  372: 'ERROR_DESCRIPTION_LEN',
+  376: 'EVENTS'
+})
+
+function isAutodetect (parser) {
+  return this.is_autodetect(parser) !== 0
+}
+
+function isRequest (parser) {
+  return this.is_request(parser) !== 0
+}
+
+function isPaused (parser) {
+  return this.is_paused(parser) !== 0
+}
+
+function shouldManageUnconsumed (parser) {
+  return this.should_manage_unconsumed(parser) !== 0
+}
+
+function shouldSuspendAfterHeaders (parser) {
+  return this.should_suspend_after_headers(parser) !== 0
+}
+
+function getMaxStartLineLength (parser) {
+  return this.get_max_start_line_length(parser) >>> 0
+}
+
+function getMaxHeaderLength (parser) {
+  return this.get_max_header_length(parser) >>> 0
+}
+
+function getMaxBodyPayload (parser) {
+  return BigInt.asUintN(64, this.get_max_body_payload(parser))
+}
+
+function shouldContinueWithoutData (parser) {
+  return this.should_continue_without_data(parser) !== 0
+}
+
+function isConnect (parser) {
+  return this.is_connect(parser) !== 0
+}
+
+function isDebug (parser) {
+  return this.is_debug(parser) !== 0
+}
+
+function shouldSkipBody (parser) {
+  return this.should_skip_body(parser) !== 0
+}
+
+function getState (parser) {
+  return this.get_state(parser) >>> 0
+}
+
+function getPosition (parser) {
+  return this.get_position(parser) >>> 0
+}
+
+function getParsed (parser) {
+  return BigInt.asUintN(64, this.get_parsed(parser))
+}
+
+function getErrorCode (parser) {
+  return this.get_error_code(parser) >>> 0
+}
+
+function getMethod (parser) {
+  return this.get_method(parser) >>> 0
+}
+
+function getStatus (parser) {
+  return this.get_status(parser) >>> 0
+}
+
+function hasConnectionClose (parser) {
+  return this.has_connection_close(parser) !== 0
+}
+
+function hasConnectionUpgrade (parser) {
+  return this.has_connection_upgrade(parser) !== 0
+}
+
+function getContentLength (parser) {
+  return BigInt.asUintN(64, this.get_content_length(parser))
+}
+
+function getChunkSize (parser) {
+  return BigInt.asUintN(64, this.get_chunk_size(parser))
+}
+
+function getRemainingContentLength (parser) {
+  return BigInt.asUintN(64, this.get_remaining_content_length(parser))
+}
+
+function getRemainingChunkSize (parser) {
+  return BigInt.asUintN(64, this.get_remaining_chunk_size(parser))
+}
+
+function hasContentLength (parser) {
+  return this.has_content_length(parser) !== 0
+}
+
+function hasTransferEncoding (parser) {
+  return this.has_transfer_encoding(parser) !== 0
+}
+
+function hasChunkedTransferEncoding (parser) {
+  return this.has_chunked_transfer_encoding(parser) !== 0
+}
+
+function hasUpgrade (parser) {
+  return this.has_upgrade(parser) !== 0
+}
+
+function hasTrailers (parser) {
+  return this.has_trailers(parser) !== 0
+}
+
+function getErrorDescription (parser) {
+  const raw = this.get_error_description_raw(parser)
+  const len = Number(BigInt.asUintN(32, raw))
+  const ptr = Number(raw >> 32n)
+  return textDecoder.decode(new Uint8Array(this.memory.buffer, ptr, len))
+}
+
+function setShouldAutodetect (parser, value) {
+  this.set_should_autodetect(parser, value)
+}
+
+function setShouldContinueWithoutData (parser, value) {
+  this.set_should_continue_without_data(parser, value)
+}
+
+function setIsRequest (parser, value) {
+  this.set_is_request(parser, value)
+}
+
+function setIsConnect (parser, value) {
+  this.set_is_connect(parser, value)
+}
+
+function setDebug (parser, value) {
+  this.set_debug(parser, value)
+}
+
+function setShouldManageUnconsumed (parser, value) {
+  this.set_should_manage_unconsumed(parser, value)
+}
+
+function setShouldSuspendAfterHeaders (parser, value) {
+  this.set_should_suspend_after_headers(parser, value)
+}
+
+function setMaxStartLineLength (parser, value) {
+  this.set_max_start_line_length(parser, value)
+}
+
+function setMaxHeaderLength (parser, value) {
+  this.set_max_header_length(parser, value)
+}
+
+function setMaxBodyPayload (parser, value) {
+  this.set_max_body_payload(parser, value)
+}
+
+function setShouldSkipBody (parser, value) {
+  this.set_should_skip_body(parser, value)
+}
+
+function setActiveCallbacks (parser, value) {
+  this.set_active_callbacks(parser, value)
+}
+
+function setActiveEvents (parser, value) {
+  this.set_active_events(parser, value)
+}
+
+function simpleCreate (spans, create) {
+  const parser = create()
+  spans[parser] = []
+  this.setActiveCallbacks(parser, this.CALLBACK_ACTIVE_ALL)
+  return parser
+}
+
+function simpleDestroy (spans, destroy, parser) {
+  spans[parser] = undefined
+  destroy(parser)
+}
+
+function noop () {}
+
+function setup (env = {}) {
+  let { logger: logOption, ...instanceEnvironment } = env
+  let logger = noop
+  const context = {}
+
+  if (logOption) {
+    if (typeof logOption !== 'function') {
+      logOption = console.log
+    }
+
+    logger = log.bind(context, logOption)
+  }
+
+  // Create the WASM instance
+  /* eslint-disable-next-line no-undef */
+  const instance = new WebAssembly.Instance(wasmModule, {
+    env: {
+      logger,
+      on_error: noop,
+      on_finish: noop,
+      on_message_start: noop,
+      on_message_complete: noop,
+      on_request: noop,
+      on_response: noop,
+      on_reset: noop,
+      on_method: noop,
+      on_url: noop,
+      on_protocol: noop,
+      on_version: noop,
+      on_status: noop,
+      on_reason: noop,
+      on_header_name: noop,
+      on_header_value: noop,
+      on_headers: noop,
+      on_connect: noop,
+      on_upgrade: noop,
+      on_chunk_length: noop,
+      on_chunk_extension_name: noop,
+      on_chunk_extension_value: noop,
+      on_chunk: noop,
+      on_body: noop,
+      on_data: noop,
+      on_trailer_name: noop,
+      on_trailer_value: noop,
+      on_trailers: noop,
+      on_state_change: noop,
+      ...instanceEnvironment
+    }
+  })
+
+  const wasm = instance.exports
+  context.memory = wasm.memory
+
+  const milo = {
+    version: {
+      raw: '0.9.0',
+      major: 0,
+      minor: 9,
+      patch: 0,
+      prerelease: ''
+    },
+    METHOD_OTHER: 0,
+    METHOD_GET: 1,
+    METHOD_HEAD: 2,
+    METHOD_POST: 3,
+    METHOD_PUT: 4,
+    METHOD_DELETE: 5,
+    METHOD_CONNECT: 6,
+    METHOD_OPTIONS: 7,
+    METHOD_TRACE: 8,
+    METHOD_PATCH: 9,
+    METHOD_PRI: 10,
+    CALLBACK_ON_ERROR: 0,
+    CALLBACK_ON_FINISH: 1,
+    CALLBACK_ON_MESSAGE_START: 2,
+    CALLBACK_ON_MESSAGE_COMPLETE: 3,
+    CALLBACK_ON_REQUEST: 4,
+    CALLBACK_ON_RESPONSE: 5,
+    CALLBACK_ON_RESET: 6,
+    CALLBACK_ON_METHOD: 7,
+    CALLBACK_ON_URL: 8,
+    CALLBACK_ON_PROTOCOL: 9,
+    CALLBACK_ON_VERSION: 10,
+    CALLBACK_ON_STATUS: 11,
+    CALLBACK_ON_REASON: 12,
+    CALLBACK_ON_HEADER_NAME: 13,
+    CALLBACK_ON_HEADER_VALUE: 14,
+    CALLBACK_ON_HEADERS: 15,
+    CALLBACK_ON_CONNECT: 16,
+    CALLBACK_ON_UPGRADE: 17,
+    CALLBACK_ON_CHUNK_LENGTH: 18,
+    CALLBACK_ON_CHUNK_EXTENSION_NAME: 19,
+    CALLBACK_ON_CHUNK_EXTENSION_VALUE: 20,
+    CALLBACK_ON_CHUNK: 21,
+    CALLBACK_ON_BODY: 22,
+    CALLBACK_ON_DATA: 23,
+    CALLBACK_ON_TRAILER_NAME: 24,
+    CALLBACK_ON_TRAILER_VALUE: 25,
+    CALLBACK_ON_TRAILERS: 26,
+    CALLBACK_ON_STATE_CHANGE: 27,
+    EVENT_END: 0,
+    EVENT_ERROR: 1,
+    EVENT_FINISH: 2,
+    EVENT_MESSAGE_START: 3,
+    EVENT_MESSAGE_COMPLETE: 4,
+    EVENT_REQUEST: 5,
+    EVENT_RESPONSE: 6,
+    EVENT_RESET: 7,
+    EVENT_METHOD: 8,
+    EVENT_URL: 9,
+    EVENT_PROTOCOL: 10,
+    EVENT_VERSION: 11,
+    EVENT_STATUS: 12,
+    EVENT_REASON: 13,
+    EVENT_HEADER_NAME: 14,
+    EVENT_HEADER_VALUE: 15,
+    EVENT_HEADERS: 16,
+    EVENT_CONNECT: 17,
+    EVENT_UPGRADE: 18,
+    EVENT_CHUNK_LENGTH: 19,
+    EVENT_CHUNK_EXTENSION_NAME: 20,
+    EVENT_CHUNK_EXTENSION_VALUE: 21,
+    EVENT_CHUNK: 22,
+    EVENT_BODY: 23,
+    EVENT_DATA: 24,
+    EVENT_TRAILER_NAME: 25,
+    EVENT_TRAILER_VALUE: 26,
+    EVENT_TRAILERS: 27,
+    EVENT_STATE_CHANGE: 28,
+    CALLBACK_ACTIVE_NONE: 0n,
+    EVENT_ACTIVE_NONE: 0n,
+    CALLBACK_ACTIVE_ON_ERROR: 1n,
+    EVENT_ACTIVE_ON_ERROR: 1n,
+    CALLBACK_ACTIVE_ON_FINISH: 2n,
+    EVENT_ACTIVE_ON_FINISH: 2n,
+    CALLBACK_ACTIVE_ON_MESSAGE_START: 4n,
+    EVENT_ACTIVE_ON_MESSAGE_START: 4n,
+    CALLBACK_ACTIVE_ON_MESSAGE_COMPLETE: 8n,
+    EVENT_ACTIVE_ON_MESSAGE_COMPLETE: 8n,
+    CALLBACK_ACTIVE_ON_REQUEST: 16n,
+    EVENT_ACTIVE_ON_REQUEST: 16n,
+    CALLBACK_ACTIVE_ON_RESPONSE: 32n,
+    EVENT_ACTIVE_ON_RESPONSE: 32n,
+    CALLBACK_ACTIVE_ON_RESET: 64n,
+    EVENT_ACTIVE_ON_RESET: 64n,
+    CALLBACK_ACTIVE_ON_METHOD: 128n,
+    EVENT_ACTIVE_ON_METHOD: 128n,
+    CALLBACK_ACTIVE_ON_URL: 256n,
+    EVENT_ACTIVE_ON_URL: 256n,
+    CALLBACK_ACTIVE_ON_PROTOCOL: 512n,
+    EVENT_ACTIVE_ON_PROTOCOL: 512n,
+    CALLBACK_ACTIVE_ON_VERSION: 1024n,
+    EVENT_ACTIVE_ON_VERSION: 1024n,
+    CALLBACK_ACTIVE_ON_STATUS: 2048n,
+    EVENT_ACTIVE_ON_STATUS: 2048n,
+    CALLBACK_ACTIVE_ON_REASON: 4096n,
+    EVENT_ACTIVE_ON_REASON: 4096n,
+    CALLBACK_ACTIVE_ON_HEADER_NAME: 8192n,
+    EVENT_ACTIVE_ON_HEADER_NAME: 8192n,
+    CALLBACK_ACTIVE_ON_HEADER_VALUE: 16384n,
+    EVENT_ACTIVE_ON_HEADER_VALUE: 16384n,
+    CALLBACK_ACTIVE_ON_HEADERS: 32768n,
+    EVENT_ACTIVE_ON_HEADERS: 32768n,
+    CALLBACK_ACTIVE_ON_CONNECT: 65536n,
+    EVENT_ACTIVE_ON_CONNECT: 65536n,
+    CALLBACK_ACTIVE_ON_UPGRADE: 131072n,
+    EVENT_ACTIVE_ON_UPGRADE: 131072n,
+    CALLBACK_ACTIVE_ON_CHUNK_LENGTH: 262144n,
+    EVENT_ACTIVE_ON_CHUNK_LENGTH: 262144n,
+    CALLBACK_ACTIVE_ON_CHUNK_EXTENSION_NAME: 524288n,
+    EVENT_ACTIVE_ON_CHUNK_EXTENSION_NAME: 524288n,
+    CALLBACK_ACTIVE_ON_CHUNK_EXTENSION_VALUE: 1048576n,
+    EVENT_ACTIVE_ON_CHUNK_EXTENSION_VALUE: 1048576n,
+    CALLBACK_ACTIVE_ON_CHUNK: 2097152n,
+    EVENT_ACTIVE_ON_CHUNK: 2097152n,
+    CALLBACK_ACTIVE_ON_BODY: 4194304n,
+    EVENT_ACTIVE_ON_BODY: 4194304n,
+    CALLBACK_ACTIVE_ON_DATA: 8388608n,
+    EVENT_ACTIVE_ON_DATA: 8388608n,
+    CALLBACK_ACTIVE_ON_TRAILER_NAME: 16777216n,
+    EVENT_ACTIVE_ON_TRAILER_NAME: 16777216n,
+    CALLBACK_ACTIVE_ON_TRAILER_VALUE: 33554432n,
+    EVENT_ACTIVE_ON_TRAILER_VALUE: 33554432n,
+    CALLBACK_ACTIVE_ON_TRAILERS: 67108864n,
+    EVENT_ACTIVE_ON_TRAILERS: 67108864n,
+    CALLBACK_ACTIVE_ON_STATE_CHANGE: 134217728n,
+    EVENT_ACTIVE_ON_STATE_CHANGE: 134217728n,
+    CALLBACK_ACTIVE_ALL: 268435455n,
+    EVENT_ACTIVE_ALL: 268435455n,
+    ERROR_NONE: 0,
+    ERROR_USER: 1,
+    ERROR_CALLBACK_ERROR: 2,
+    ERROR_UNEXPECTED_STATE: 3,
+    ERROR_UNEXPECTED_DATA: 4,
+    ERROR_UNEXPECTED_EOF: 5,
+    ERROR_UNEXPECTED_CHARACTER: 6,
+    ERROR_UNEXPECTED_CONTENT_LENGTH: 7,
+    ERROR_UNEXPECTED_TRANSFER_ENCODING: 8,
+    ERROR_UNEXPECTED_CONTENT: 9,
+    ERROR_UNEXPECTED_TRAILERS: 10,
+    ERROR_INVALID_VERSION: 11,
+    ERROR_INVALID_STATUS: 12,
+    ERROR_INVALID_CONTENT_LENGTH: 13,
+    ERROR_INVALID_TRANSFER_ENCODING: 14,
+    ERROR_INVALID_CHUNK_SIZE: 15,
+    ERROR_MISSING_CONNECTION_UPGRADE: 16,
+    ERROR_UNSUPPORTED_HTTP_VERSION: 17,
+    STATE_START: 0,
+    STATE_FINISH: 1,
+    STATE_ERROR: 2,
+    STATE_REQUEST_LINE: 3,
+    STATE_STATUS_LINE: 4,
+    STATE_HTTP2_PREFACE: 5,
+    STATE_HEADER: 6,
+    STATE_BODY_DECISION: 7,
+    STATE_BODY_VIA_CONTENT_LENGTH: 8,
+    STATE_BODY_WITH_NO_LENGTH: 9,
+    STATE_CHUNK_HEADER: 10,
+    STATE_CHUNK_EXTENSIONS: 11,
+    STATE_CHUNK_DATA: 12,
+    STATE_TRAILER: 13,
+    STATE_TUNNEL: 14,
+    PARSER_FIELD_MAX_START_LINE_LENGTH: 0,
+    PARSER_FIELD_MAX_HEADER_LENGTH: 4,
+    PARSER_FIELD_MAX_BODY_PAYLOAD: 8,
+    PARSER_FIELD_AUTODETECT: 16,
+    PARSER_FIELD_IS_REQUEST: 17,
+    PARSER_FIELD_SUSPEND_AFTER_HEADERS: 18,
+    PARSER_FIELD_MANAGE_UNCONSUMED: 19,
+    PARSER_FIELD_CONTINUE_WITHOUT_DATA: 20,
+    PARSER_FIELD_IS_CONNECT: 21,
+    PARSER_FIELD_SKIP_BODY: 22,
+    PARSER_FIELD_DEBUG: 23,
+    PARSER_FIELD_PARSED: 24,
+    PARSER_FIELD_POSITION: 32,
+    PARSER_FIELD_STATE: 36,
+    PARSER_FIELD_PAUSED: 37,
+    PARSER_FIELD_ERROR_CODE: 38,
+    PARSER_FIELD_CONTENT_LENGTH: 40,
+    PARSER_FIELD_CHUNK_SIZE: 48,
+    PARSER_FIELD_REMAINING_CONTENT_LENGTH: 56,
+    PARSER_FIELD_REMAINING_CHUNK_SIZE: 64,
+    PARSER_FIELD_STATUS: 72,
+    PARSER_FIELD_METHOD: 76,
+    PARSER_FIELD_HAS_CONTENT_LENGTH: 77,
+    PARSER_FIELD_HAS_TRANSFER_ENCODING: 78,
+    PARSER_FIELD_HAS_CHUNKED_TRANSFER_ENCODING: 79,
+    PARSER_FIELD_HAS_CONNECTION_CLOSE: 80,
+    PARSER_FIELD_HAS_CONNECTION_UPGRADE: 81,
+    PARSER_FIELD_HAS_UPGRADE: 82,
+    PARSER_FIELD_HAS_TRAILERS: 83,
+    PARSER_FIELD_ACTIVE_CALLBACKS: 88,
+    PARSER_FIELD_ACTIVE_EVENTS: 96,
+    PARSER_FIELD_PTR: 104,
+    PARSER_FIELD_ERROR_DESCRIPTION: 108,
+    PARSER_FIELD_UNCONSUMED: 364,
+    PARSER_FIELD_UNCONSUMED_LEN: 368,
+    PARSER_FIELD_ERROR_DESCRIPTION_LEN: 372,
+    PARSER_FIELD_EVENTS: 376,
+    Errors,
+    Methods,
+    Callbacks,
+    CallbackActives,
+    Events,
+    EventActives,
+    States,
+    ParserFields,
+    isAutodetect: isAutodetect.bind(wasm),
+    isRequest: isRequest.bind(wasm),
+    isPaused: isPaused.bind(wasm),
+    shouldManageUnconsumed: shouldManageUnconsumed.bind(wasm),
+    shouldSuspendAfterHeaders: shouldSuspendAfterHeaders.bind(wasm),
+    getMaxStartLineLength: getMaxStartLineLength.bind(wasm),
+    getMaxHeaderLength: getMaxHeaderLength.bind(wasm),
+    getMaxBodyPayload: getMaxBodyPayload.bind(wasm),
+    shouldContinueWithoutData: shouldContinueWithoutData.bind(wasm),
+    isConnect: isConnect.bind(wasm),
+    isDebug: isDebug.bind(wasm),
+    shouldSkipBody: shouldSkipBody.bind(wasm),
+    getState: getState.bind(wasm),
+    getPosition: getPosition.bind(wasm),
+    getParsed: getParsed.bind(wasm),
+    getErrorCode: getErrorCode.bind(wasm),
+    getMethod: getMethod.bind(wasm),
+    getStatus: getStatus.bind(wasm),
+    hasConnectionClose: hasConnectionClose.bind(wasm),
+    hasConnectionUpgrade: hasConnectionUpgrade.bind(wasm),
+    getContentLength: getContentLength.bind(wasm),
+    getChunkSize: getChunkSize.bind(wasm),
+    getRemainingContentLength: getRemainingContentLength.bind(wasm),
+    getRemainingChunkSize: getRemainingChunkSize.bind(wasm),
+    hasContentLength: hasContentLength.bind(wasm),
+    hasTransferEncoding: hasTransferEncoding.bind(wasm),
+    hasChunkedTransferEncoding: hasChunkedTransferEncoding.bind(wasm),
+    hasUpgrade: hasUpgrade.bind(wasm),
+    hasTrailers: hasTrailers.bind(wasm),
+    getErrorDescription: getErrorDescription.bind(wasm),
+    setShouldAutodetect: setShouldAutodetect.bind(wasm),
+    setShouldContinueWithoutData: setShouldContinueWithoutData.bind(wasm),
+    setIsRequest: setIsRequest.bind(wasm),
+    setIsConnect: setIsConnect.bind(wasm),
+    setDebug: setDebug.bind(wasm),
+    setShouldManageUnconsumed: setShouldManageUnconsumed.bind(wasm),
+    setShouldSuspendAfterHeaders: setShouldSuspendAfterHeaders.bind(wasm),
+    setMaxStartLineLength: setMaxStartLineLength.bind(wasm),
+    setMaxHeaderLength: setMaxHeaderLength.bind(wasm),
+    setMaxBodyPayload: setMaxBodyPayload.bind(wasm),
+    setShouldSkipBody: setShouldSkipBody.bind(wasm),
+    setActiveCallbacks: setActiveCallbacks.bind(wasm),
+    setActiveEvents: setActiveEvents.bind(wasm),
+    memory: wasm.memory,
+    alloc: alloc.bind(wasm),
+    dealloc: dealloc.bind(wasm),
+    create: create.bind(wasm),
+    destroy: destroy.bind(wasm),
+    parse: parse.bind(wasm),
+    fail: fail.bind(wasm),
+    hasDebug: hasDebug.bind(wasm),
+    clear: wasm.clear,
+    complete: wasm.complete,
+    finish: wasm.finish,
+    pause: wasm.pause,
+    reset: wasm.reset,
+    resume: wasm.resume
+  }
+
+  return milo
+}
+
+function simple () {
+  const spans = {}
+
+  const milo = setup({/* REPLACE: callbacks:simple */})
+
+  milo.spans = spans
+  milo.create = simpleCreate.bind(milo, spans, milo.create)
+  milo.destroy = simpleDestroy.bind(milo, spans, milo.destroy)
+
+  return milo
+}
+
+module.exports = { wasmModule, noop, setup, simple }
+
+
+/***/ }),
+
+/***/ 9545:
+/***/ ((module) => {
+
+const wasmModule = new WebAssembly.Module(
+  Buffer.from(
+    'AGFzbQEAAAABQgtgA39/fwBgAX8Bf2ACf38AYAF/AGABfwF+YAJ/fgBgBH9/f38AYAABf2AIf39/f39/f3wAYAN/f38Bf2ACf38BfwKUBBwDZW52CG9uX2Vycm9yAAADZW52Cm9uX2hlYWRlcnMACANlbnYJb25fZmluaXNoAAADZW52EG9uX21lc3NhZ2Vfc3RhcnQAAANlbnYTb25fbWVzc2FnZV9jb21wbGV0ZQAAA2Vudgpvbl9yZXF1ZXN0AAADZW52C29uX3Jlc3BvbnNlAAADZW52CG9uX3Jlc2V0AAADZW52CW9uX21ldGhvZAAAA2VudgZvbl91cmwAAANlbnYLb25fcHJvdG9jb2wAAANlbnYKb25fdmVyc2lvbgAAA2Vudglvbl9zdGF0dXMAAANlbnYJb25fcmVhc29uAAADZW52Dm9uX2hlYWRlcl9uYW1lAAADZW52D29uX2hlYWRlcl92YWx1ZQAAA2Vudgpvbl9jb25uZWN0AAADZW52Cm9uX3VwZ3JhZGUAAANlbnYPb25fY2h1bmtfbGVuZ3RoAAADZW52F29uX2NodW5rX2V4dGVuc2lvbl9uYW1lAAADZW52GG9uX2NodW5rX2V4dGVuc2lvbl92YWx1ZQAAA2Vudghvbl9jaHVuawAAA2Vudgdvbl9ib2R5AAADZW52B29uX2RhdGEAAANlbnYPb25fdHJhaWxlcl9uYW1lAAADZW52EG9uX3RyYWlsZXJfdmFsdWUAAANlbnYLb25fdHJhaWxlcnMAAANlbnYPb25fc3RhdGVfY2hhbmdlAAADQkEGAAEDAwcCAwYDBAQBBAQBAQEEAQQEAQEBAQEBAQEBAQEBAQEHCQMCAwUFAgICBQICAgICAgIBAQEBCgECAwICAgUDAQARBgkBfwFBgIDAAAsHnQg5Bm1lbW9yeQIABWFsbG9jAB4FY2xlYXIAHwhjb21wbGV0ZQAgBmNyZWF0ZQAhB2RlYWxsb2MAIgdkZXN0cm95ACMEZmFpbAAkBmZpbmlzaAAlDmdldF9jaHVua19zaXplACYSZ2V0X2NvbnRlbnRfbGVuZ3RoACcOZ2V0X2Vycm9yX2NvZGUAKBlnZXRfZXJyb3JfZGVzY3JpcHRpb25fcmF3ACkUZ2V0X21heF9ib2R5X3BheWxvYWQAKhVnZXRfbWF4X2hlYWRlcl9sZW5ndGgAKxlnZXRfbWF4X3N0YXJ0X2xpbmVfbGVuZ3RoACwKZ2V0X21ldGhvZAAtCmdldF9wYXJzZWQALgxnZXRfcG9zaXRpb24ALxhnZXRfcmVtYWluaW5nX2NodW5rX3NpemUAMBxnZXRfcmVtYWluaW5nX2NvbnRlbnRfbGVuZ3RoADEJZ2V0X3N0YXRlADIKZ2V0X3N0YXR1cwAzHWhhc19jaHVua2VkX3RyYW5zZmVyX2VuY29kaW5nADQUaGFzX2Nvbm5lY3Rpb25fY2xvc2UANRZoYXNfY29ubmVjdGlvbl91cGdyYWRlADYSaGFzX2NvbnRlbnRfbGVuZ3RoADcMaGFzX3RyYWlsZXJzADgVaGFzX3RyYW5zZmVyX2VuY29kaW5nADkLaGFzX3VwZ3JhZGUAOg1pc19hdXRvZGV0ZWN0ADsKaXNfY29ubmVjdAA8CGlzX2RlYnVnAD0JaXNfcGF1c2VkAD4KaXNfcmVxdWVzdAA/Dm1pbG9faGFzX2RlYnVnAEAFcGFyc2UAQQVwYXVzZQBCBXJlc2V0AEMGcmVzdW1lAEQUc2V0X2FjdGl2ZV9jYWxsYmFja3MARRFzZXRfYWN0aXZlX2V2ZW50cwBGCXNldF9kZWJ1ZwBHDnNldF9pc19jb25uZWN0AEgOc2V0X2lzX3JlcXVlc3QASRRzZXRfbWF4X2JvZHlfcGF5bG9hZABKFXNldF9tYXhfaGVhZGVyX2xlbmd0aABLGXNldF9tYXhfc3RhcnRfbGluZV9sZW5ndGgATBVzZXRfc2hvdWxkX2F1dG9kZXRlY3QATSBzZXRfc2hvdWxkX2NvbnRpbnVlX3dpdGhvdXRfZGF0YQBOHHNldF9zaG91bGRfbWFuYWdlX3VuY29uc3VtZWQATxRzZXRfc2hvdWxkX3NraXBfYm9keQBQIHNldF9zaG91bGRfc3VzcGVuZF9hZnRlcl9oZWFkZXJzAFEcc2hvdWxkX2NvbnRpbnVlX3dpdGhvdXRfZGF0YQBSGHNob3VsZF9tYW5hZ2VfdW5jb25zdW1lZABTEHNob3VsZF9za2lwX2JvZHkAVBxzaG91bGRfc3VzcGVuZF9hZnRlcl9oZWFkZXJzAFUKoLQCQdgDAgJ/BXsCQCACIANPDQAgAS0AACEBIAMgAmsiBUEPTQRAIANBAWsDQCAB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QgBSBEAgBUEQakGBgARJDQEMGQsgA0EBOgAUIANCADcDOCAFQV5IDRgMAwsgAygCICEBIAMoAvgCIAVqQRc6AAAgAygC+AIgBWpBAWogACABajYAACADKAL4AiAFakEFakEANgAAIANBAToAFCADQgA3AzggBUEJaiEFDAILIAMoAiAhASADKAL4AiAFakEYOgAAIAMoAvgCIAVqQQFqIAE2AAAgAygC+AIgBWpBBWogADYAACAFQQlqIQULIAMgAykDOCAvfTcDOEEAIQcMAwsCQCAXRQ0AIDRCAFIEQCAFQXBIDRYgAygCICECIAMoAvgCIAVqIgFBBDoAACABQQVqQQA2AAAgAUEBaiAAIAJqNgAAIAVBCWohBQsgM1ANACAFQXBIDRUgAygCICECIAMoAvgCIAVqIgFBBzoAACABQQVqQQA2AAAgAUEBaiAAIAJqNgAAIAVBCWohBQsgA0EAOgAWIANBADoAFAJAAkAgAy0AUkEBRgRAIAMtABFBAXENAQsgAy0AUA0BIAMtACRBAkcNAkEAIQcMBAtBACEHIAMtACRBAkYNAyADQQ46ACQMAwsgGUUNASAFQXBIDRQgAygCICECIAMoAvgCIAVqIgFBAjoAACABQQVqQQA2AAAgAUEBaiACNgAAIAVBCWohBQwBC0EAIQcgA0EAOgAkDAELQQAhByADLQAkQQJGDQAgA0EBOgAkCyADIAMoAiAgAGo2AiAgACAJSw0NIAsgAGshCyAAIARqIQQgCSAAayEJDAkLIANBAToAFCAFQd//A2tB//97SQ0QAkAgF0UNACA0QgBSBEAgBUFwSA0SIAMoAiAhASADKAL4AiAFaiIAQQQ6AAAgAEEFakEANgAAIABBAWogATYAACAFQQlqIQULIDNQDQAgBUFwSA0RIAMoAiAhASADKAL4AiAFaiIAQQc6AAAgAEEFakEANgAAIABBAWogATYAACAFQQlqIQULIANBADoAFiADQQA6ABQLIAMtAFBBAUcNASAZBEAgBUFwSA0QIAMoAiAhASADKAL4AiAFaiIAQQI6AAAgAEEFakEANgAAIABBAWogATYAACAFQQlqIQULIANBAToAJAtBACEHDAYLQQAhByADQQA6ACQMBQsgAygCACALSwRAQQEhEQwNCyADQQY6ACYgA0ECOgAkIANBu4rAAP0AAAD9CwBsIANBy4rAACgAADYAfAtBgAEhC0EUDAoLIAMoAgAgC0sEQEEBIREMCwsgA0EGOgAmIANBAjoAJCADQaWIwAD9AAAA/QsAbCADQbKIwAApAAA3AHkLQYEBIQtBFQwIC0EAIQcgAy0AJEECRg0AIANBBDoAJAtBASERIAdBAXENByADLQAlQQFxRQ0ACwwGCwALIAMoAvgCQQA6AAAMBQsAC0H5ACELQQ0MAQsgA0EGOgAmIANBAjoAJCADQZaIwAApAAA3AGwgA0GdiMAAKQAANwBzQfsAIQtBDws6APQCQQAhESADIAtqQQA6AAALIAMgAykDGCADKAIgIgutfDcDGAJAIAMtABNFDQAgAygC8AIiAARAIAMoAuwCIAAQWAsgA0IANwLsAiALIBRPDQACQAJAIAlFBEBBASEADAELIAlBARBWIgBFDQEgCUUNACAAIAQgCfwKAAALIAMgADYC7AIgAyAJNgLwAgwBCwALAkACQCAuQgGDUCARcgRAICBFDQEMAgsgBUH6/wNrQf//e0kNACADKAL4AiAFaiIAQQE6AAAgAEEBaiADKAIgNgAAIABBBWogAy0AJjoAACAFQQZqIQULIAMoAvgCIAVqQQA6AAALAkAgAykDWCIuUA0AIC5CAYMhLyAuQoCAAoMhMCAuQgKDITEgLkIEgyEzIC5CCIMhNCAuQhCDITUgLkIggyE2IC5CwACDITcgLkKAAYMhMiAuQoACgyE5IC5CgASDITogLkKACIMhOyAuQoAQgyE8IC5CgCCDIT0gLkKAwACDIT4gLkKAgAGDIT8gLkKAgASDIUAgLkKAgAiDIUEgLkKAgBCDIUIgLkKAgCCDIUMgLkKAgMAAgyFEIC5CgICAAYMhRSAuQoCAgAKDIUYgLkKAgIAEgyFHIC5CgICACIMhOCAuQoCAgBCDIUggLkKAgIAggyFJIC5CgICAwACDIS4gAygCaCECIAMoAvgCIQZBACEEA0ACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkAgBCAGaiIALQAAQQFrDhwAAgMEBQYHCAkKCwwNDg8BEBESExQVFhcYGRobHwtBBiEBIC9QDRsgAiAAQQFqKAAAQQAQACAEQQZqIQQMHQtBEyEBIDBQDRogAiAAQQFqKAAAIABBBWovAAAgAEEHai0AAEEARyAAQQhqLQAAQQBHIABBCWotAABBAEcgAEEKai0AACAAQQtqKQAAuhABIARBE2ohBAwcC0EJIQEgMVANGSACIABBAWooAAAgAEEFaigAABACIARBCWohBAwbC0EJIQEgM1ANGCACIABBAWooAAAgAEEFaigAABADIARBCWohBAwaC0EJIQEgNFANFyACIABBAWooAAAgAEEFaigAABAEIARBCWohBAwZC0EJIQEgNVANFiACIABBAWooAAAgAEEFaigAABAFIARBCWohBAwYC0EJIQEgNlANFSACIABBAWooAAAgAEEFaigAABAGIARBCWohBAwXC0EJIQEgN1ANFCACIABBAWooAAAgAEEFaigAABAHIARBCWohBAwWC0EJIQEgMlANEyACIABBAWooAAAgAEEFaigAABAIIARBCWohBAwVC0EJIQEgOVANEiACIABBAWooAAAgAEEFaigAABAJIARBCWohBAwUC0EJIQEgOlANESACIABBAWooAAAgAEEFaigAABAKIARBCWohBAwTC0EJIQEgO1ANECACIABBAWooAAAgAEEFaigAABALIARBCWohBAwSC0EJIQEgPFANDyACIABBAWooAAAgAEEFaigAABAMIARBCWohBAwRC0EJIQEgPVANDiACIABBAWooAAAgAEEFaigAABANIARBCWohBAwQC0EJIQEgPlANDSACIABBAWooAAAgAEEFaigAABAOIARBCWohBAwPC0EJIQEgP1ANDCACIABBAWooAAAgAEEFaigAABAPIARBCWohBAwOC0EJIQEgQFANCyACIABBAWooAAAgAEEFaigAABAQIARBCWohBAwNC0EJIQEgQVANCiACIABBAWooAAAgAEEFaigAABARIARBCWohBAwMC0EJIQEgQlANCSACIABBAWooAAAgAEEFaigAABASIARBCWohBAwLC0EJIQEgQ1ANCCACIABBAWooAAAgAEEFaigAABATIARBCWohBAwKC0EJIQEgRFANByACIABBAWooAAAgAEEFaigAABAUIARBCWohBAwJC0EJIQEgRVANBiACIABBAWooAAAgAEEFaigAABAVIARBCWohBAwIC0EJIQEgRlANBSACIABBAWooAAAgAEEFaigAABAWIARBCWohBAwHC0EJIQEgR1ANBCAC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AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAEGJhMAACwEBAEGghMAAC+ABAQEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEAQaGGwAALXgEAAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQABAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEAAQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQAAAAEAQYCIwAALtBBVbmV4cGVjdGVkIGVuZCBvZiBkYXRhVW5leHBlY3RlZCBkYXRhUmVxdWVzdCBsaW5lIHRvbyBsb25nSW52YWxpZCBtZXRob2QgY2hhcmFjdGVySW52YWxpZCBVUkwgY2hhcmFjdGVyUFJJIGlzIG9ubHkgdmFsaWQgd2l0aCBIVFRQLzIuMFVuc3VwcG9ydGVkIEhUVFAgdmVyc2lvbkludmFsaWQgcHJvdG9jb2xJbnZhbGlkIHByb3RvY29sIG5hbWVFeHBlY3RlZCAvIGFmdGVyIHRoZSBwcm90b2NvbCBuYW1lRXhwZWN0ZWQgc3BhY2UgYWZ0ZXIgVVJMRXhwZWN0ZWQgc3BhY2UgYWZ0ZXIgbWV0aG9kUmVxdWVzdCBsaW5lIHRvbyBzaG9ydEV4cGVjdGVkIENSTEZTdGF0dXMgbGluZSB0b28gbG9uZ0ludmFsaWQgSFRUUCByZXNwb25zZSBzdGF0dXNJbnZhbGlkIHN0YXR1cyByZWFzb24gY2hhcmFjdGVyRXhwZWN0ZWQgYSBzcGFjZSBhZnRlciBIVFRQIHJlc3BvbnNlIHN0YXR1c0V4cGVjdGVkIHNwYWNlIGFmdGVyIHByb3RvY29sU3RhdHVzIGxpbmUgdG9vIHNob3J0TWFsZm9ybWVkIEhUVFAvMi4wIHByZWZhY2VVbmV4cGVjdGVkIENvbnRlbnQtTGVuZ3RoIGhlYWRlciBmb3IgYSByZXNwb25zZSB3aXRob3V0IGJvZHlFeHBlY3RlZCBDb250ZW50LUxlbmd0aCBoZWFkZXIgdmFsdWVJbnZhbGlkIENvbnRlbnQtTGVuZ3RoIGhlYWRlckludmFsaWQgZHVwbGljYXRlIENvbnRlbnQtTGVuZ3RoIGhlYWRlclVuZXhwZWN0ZWQgQ29udGVudC1MZW5ndGggaGVhZGVyIHdoZW4gVHJhbnNmZXItRW5jb2RpbmcgaGVhZGVyIGlzIHByZXNlbnRVbmV4cGVjdGVkIFRyYW5zZmVyLUVuY29kaW5nIGhlYWRlciBmb3IgYSByZXNwb25zZSB3aXRob3V0IGJvZHlFeHBlY3RlZCBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgdmFsdWVUaGUgdmFsdWUgImNodW5rZWQiIGluIHRoZSBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgbXVzdCBiZSB0aGUgbGFzdCBwcm92aWRlZCBhbmQgY2FuIGJlIHByb3ZpZGVkIG9ubHkgb25jZVRoZSB2YWx1ZSAiY2h1bmtlZCIgaW4gdGhlIFRyYW5zZmVyLUVuY29kaW5nIGhlYWRlciBtdXN0IGJlIHRoZSBsYXN0IHByb3ZpZGVkVW5leHBlY3RlZCBUcmFuc2Zlci1FbmNvZGluZyBoZWFkZXIgd2hlbiBDb250ZW50LUxlbmd0aCBoZWFkZXIgaXMgcHJlc2VudEV4cGVjdGVkIENvbm5lY3Rpb24gaGVhZGVyIHZhbHVlSW52YWxpZCBDb25uZWN0aW9uIGhlYWRlciB2YWx1ZUV4cGVjdGVkIFRyYWlsZXIgaGVhZGVyIHZhbHVlRXhwZWN0ZWQgVXBncmFkZSBoZWFkZXIgdmFsdWVJbnZhbGlkIFVwZ3JhZGUgaGVhZGVyIHZhbHVlSW52YWxpZCBoZWFkZXIgZmllbGQgbmFtZSBjaGFyYWN0ZXJJbnZhbGlkIGhlYWRlciBmaWVsZCB2YWx1ZSBjaGFyYWN0ZXJIZWFkZXIgbGluZSB0b28gbG9uZ01pc3NpbmcgQ29ubmVjdGlvbiBoZWFkZXIgc2V0IHRvICJ1cGdyYWRlIiB3aGVuIHVzaW5nIHRoZSBVcGdyYWRlIGhlYWRlclRyYWlsZXJzIGFyZSBub3QgYWxsb3dlZCB3aGVuIG5vdCB1c2luZyBjaHVua2VkIHRyYW5zZmVyIGVuY29kaW5nVW5leHBlY3RlZCBjb250ZW50IGZvciB0aGUgcmVxdWVzdCAoR0VUIG9yIEhFQUQpVHJhbnNmZXItRW5jb2RpbmcgbGFzdCBoZWFkZXIgdmFsdWUgbXVzdCBiZSAiY2h1bmtlZCIgaWYgdGhlIGhlYWRlciBpcyBwcmVzZW50Q2h1bmsgaGVhZGVyIHRvbyBsb25nSW52YWxpZCBjaHVuayBsZW5ndGggY2hhcmFjdGVySW52YWxpZCBjaHVuayBsZW5ndGggc2l6ZUV4cGVjdGVkIGNodW5rIGV4dGVuc2lvbiBuYW1lSW52YWxpZCBjaHVuayBleHRlbnNpb24gbmFtZSBjaGFyYWN0ZXJFeHBlY3RlZCBjbG9zaW5nIHF1b3RlIGZvciBjaHVuayBleHRlbnNpb24gdmFsdWVJbnZhbGlkIGNodW5rIGV4dGVuc2lvbiBxdW90ZWQgdmFsdWUgY2hhcmFjdGVyRXhwZWN0ZWQgY2h1bmsgZXh0ZW5zaW9uIHZhbHVlSW52YWxpZCBjaHVuayBleHRlbnNpb24gdmFsdWUgY2hhcmFjdGVySW52YWxpZCBjaHVuayBleHRlbnNpb24gY2hhcmFjdGVyIGFmdGVyIHZhbHVlRXhwZWN0ZWQgQ1JMRiBhZnRlciBjaHVuayBkYXRhSW52YWxpZCB0cmFpbGVyIGZpZWxkIG5hbWUgY2hhcmFjdGVySW52YWxpZCB0cmFpbGVyIGZpZWxkIHZhbHVlIGNoYXJhY3RlclRyYWlsZXIgbGluZSB0b28gbG9uZ0ludmFsaWQgc3RhdGU=',
+    'base64'
+  )
+)
+
+const textEncoder = new TextEncoder()
+const textDecoder = new TextDecoder()
+
+function log (logger, raw) {
+  const len = Number(BigInt.asUintN(32, raw))
+  const ptr = Number(raw >> 32n)
+
+  logger(textDecoder.decode(new Uint8Array(this.memory.buffer, ptr, len)))
+}
+
+function alloc (len) {
+  return this.alloc(len) >>> 0
+}
+
+function dealloc (ptr, len) {
+  return this.dealloc(ptr, len)
+}
+
+function create () {
+  return this.create() >>> 0
+}
+
+function destroy (parser) {
+  this.destroy(parser)
+}
+
+function parse (parser, data, limit) {
+  return this.parse(parser, data, limit) >>> 0
+}
+
+function fail (parser, code, description) {
+  const len = description.length
+  const ptr = this.alloc(len)
+  const buffer = new Uint8Array(this.memory.buffer, ptr, len)
+  textEncoder.encodeInto(description, buffer)
+
+  this.fail(parser, code, ptr, len)
+  this.dealloc(ptr, len)
+}
+
+function hasDebug () {
+  return this.milo_has_debug() !== 0
+}
+
+const Errors = Object.freeze({
+  NONE: 0,
+  USER: 1,
+  CALLBACK_ERROR: 2,
+  UNEXPECTED_STATE: 3,
+  UNEXPECTED_DATA: 4,
+  UNEXPECTED_EOF: 5,
+  UNEXPECTED_CHARACTER: 6,
+  UNEXPECTED_CONTENT_LENGTH: 7,
+  UNEXPECTED_TRANSFER_ENCODING: 8,
+  UNEXPECTED_CONTENT: 9,
+  UNEXPECTED_TRAILERS: 10,
+  INVALID_VERSION: 11,
+  INVALID_STATUS: 12,
+  INVALID_CONTENT_LENGTH: 13,
+  INVALID_TRANSFER_ENCODING: 14,
+  INVALID_CHUNK_SIZE: 15,
+  MISSING_CONNECTION_UPGRADE: 16,
+  UNSUPPORTED_HTTP_VERSION: 17,
+  0: 'NONE',
+  1: 'USER',
+  2: 'CALLBACK_ERROR',
+  3: 'UNEXPECTED_STATE',
+  4: 'UNEXPECTED_DATA',
+  5: 'UNEXPECTED_EOF',
+  6: 'UNEXPECTED_CHARACTER',
+  7: 'UNEXPECTED_CONTENT_LENGTH',
+  8: 'UNEXPECTED_TRANSFER_ENCODING',
+  9: 'UNEXPECTED_CONTENT',
+  10: 'UNEXPECTED_TRAILERS',
+  11: 'INVALID_VERSION',
+  12: 'INVALID_STATUS',
+  13: 'INVALID_CONTENT_LENGTH',
+  14: 'INVALID_TRANSFER_ENCODING',
+  15: 'INVALID_CHUNK_SIZE',
+  16: 'MISSING_CONNECTION_UPGRADE',
+  17: 'UNSUPPORTED_HTTP_VERSION'
+})
+
+const Methods = Object.freeze({
+  OTHER: 0,
+  GET: 1,
+  HEAD: 2,
+  POST: 3,
+  PUT: 4,
+  DELETE: 5,
+  CONNECT: 6,
+  OPTIONS: 7,
+  TRACE: 8,
+  PATCH: 9,
+  PRI: 10,
+  0: 'OTHER',
+  1: 'GET',
+  2: 'HEAD',
+  3: 'POST',
+  4: 'PUT',
+  5: 'DELETE',
+  6: 'CONNECT',
+  7: 'OPTIONS',
+  8: 'TRACE',
+  9: 'PATCH',
+  10: 'PRI'
+})
+
+const Callbacks = Object.freeze({
+  ON_ERROR: 0,
+  ON_FINISH: 1,
+  ON_MESSAGE_START: 2,
+  ON_MESSAGE_COMPLETE: 3,
+  ON_REQUEST: 4,
+  ON_RESPONSE: 5,
+  ON_RESET: 6,
+  ON_METHOD: 7,
+  ON_URL: 8,
+  ON_PROTOCOL: 9,
+  ON_VERSION: 10,
+  ON_STATUS: 11,
+  ON_REASON: 12,
+  ON_HEADER_NAME: 13,
+  ON_HEADER_VALUE: 14,
+  ON_HEADERS: 15,
+  ON_CONNECT: 16,
+  ON_UPGRADE: 17,
+  ON_CHUNK_LENGTH: 18,
+  ON_CHUNK_EXTENSION_NAME: 19,
+  ON_CHUNK_EXTENSION_VALUE: 20,
+  ON_CHUNK: 21,
+  ON_BODY: 22,
+  ON_DATA: 23,
+  ON_TRAILER_NAME: 24,
+  ON_TRAILER_VALUE: 25,
+  ON_TRAILERS: 26,
+  ON_STATE_CHANGE: 27,
+  0: 'ON_ERROR',
+  1: 'ON_FINISH',
+  2: 'ON_MESSAGE_START',
+  3: 'ON_MESSAGE_COMPLETE',
+  4: 'ON_REQUEST',
+  5: 'ON_RESPONSE',
+  6: 'ON_RESET',
+  7: 'ON_METHOD',
+  8: 'ON_URL',
+  9: 'ON_PROTOCOL',
+  10: 'ON_VERSION',
+  11: 'ON_STATUS',
+  12: 'ON_REASON',
+  13: 'ON_HEADER_NAME',
+  14: 'ON_HEADER_VALUE',
+  15: 'ON_HEADERS',
+  16: 'ON_CONNECT',
+  17: 'ON_UPGRADE',
+  18: 'ON_CHUNK_LENGTH',
+  19: 'ON_CHUNK_EXTENSION_NAME',
+  20: 'ON_CHUNK_EXTENSION_VALUE',
+  21: 'ON_CHUNK',
+  22: 'ON_BODY',
+  23: 'ON_DATA',
+  24: 'ON_TRAILER_NAME',
+  25: 'ON_TRAILER_VALUE',
+  26: 'ON_TRAILERS',
+  27: 'ON_STATE_CHANGE'
+})
+
+const CallbackActives = Object.freeze({
+  NONE: 0n,
+  ON_ERROR: 1n,
+  ON_FINISH: 2n,
+  ON_MESSAGE_START: 4n,
+  ON_MESSAGE_COMPLETE: 8n,
+  ON_REQUEST: 16n,
+  ON_RESPONSE: 32n,
+  ON_RESET: 64n,
+  ON_METHOD: 128n,
+  ON_URL: 256n,
+  ON_PROTOCOL: 512n,
+  ON_VERSION: 1024n,
+  ON_STATUS: 2048n,
+  ON_REASON: 4096n,
+  ON_HEADER_NAME: 8192n,
+  ON_HEADER_VALUE: 16384n,
+  ON_HEADERS: 32768n,
+  ON_CONNECT: 65536n,
+  ON_UPGRADE: 131072n,
+  ON_CHUNK_LENGTH: 262144n,
+  ON_CHUNK_EXTENSION_NAME: 524288n,
+  ON_CHUNK_EXTENSION_VALUE: 1048576n,
+  ON_CHUNK: 2097152n,
+  ON_BODY: 4194304n,
+  ON_DATA: 8388608n,
+  ON_TRAILER_NAME: 16777216n,
+  ON_TRAILER_VALUE: 33554432n,
+  ON_TRAILERS: 67108864n,
+  ON_STATE_CHANGE: 134217728n,
+  ALL: 268435455n,
+  0n: 'NONE',
+  1n: 'ON_ERROR',
+  2n: 'ON_FINISH',
+  4n: 'ON_MESSAGE_START',
+  8n: 'ON_MESSAGE_COMPLETE',
+  16n: 'ON_REQUEST',
+  32n: 'ON_RESPONSE',
+  64n: 'ON_RESET',
+  128n: 'ON_METHOD',
+  256n: 'ON_URL',
+  512n: 'ON_PROTOCOL',
+  1024n: 'ON_VERSION',
+  2048n: 'ON_STATUS',
+  4096n: 'ON_REASON',
+  8192n: 'ON_HEADER_NAME',
+  16384n: 'ON_HEADER_VALUE',
+  32768n: 'ON_HEADERS',
+  65536n: 'ON_CONNECT',
+  131072n: 'ON_UPGRADE',
+  262144n: 'ON_CHUNK_LENGTH',
+  524288n: 'ON_CHUNK_EXTENSION_NAME',
+  1048576n: 'ON_CHUNK_EXTENSION_VALUE',
+  2097152n: 'ON_CHUNK',
+  4194304n: 'ON_BODY',
+  8388608n: 'ON_DATA',
+  16777216n: 'ON_TRAILER_NAME',
+  33554432n: 'ON_TRAILER_VALUE',
+  67108864n: 'ON_TRAILERS',
+  134217728n: 'ON_STATE_CHANGE',
+  268435455n: 'ALL'
+})
+
+const Events = Object.freeze({
+  END: 0,
+  ERROR: 1,
+  FINISH: 2,
+  MESSAGE_START: 3,
+  MESSAGE_COMPLETE: 4,
+  REQUEST: 5,
+  RESPONSE: 6,
+  RESET: 7,
+  METHOD: 8,
+  URL: 9,
+  PROTOCOL: 10,
+  VERSION: 11,
+  STATUS: 12,
+  REASON: 13,
+  HEADER_NAME: 14,
+  HEADER_VALUE: 15,
+  HEADERS: 16,
+  CONNECT: 17,
+  UPGRADE: 18,
+  CHUNK_LENGTH: 19,
+  CHUNK_EXTENSION_NAME: 20,
+  CHUNK_EXTENSION_VALUE: 21,
+  CHUNK: 22,
+  BODY: 23,
+  DATA: 24,
+  TRAILER_NAME: 25,
+  TRAILER_VALUE: 26,
+  TRAILERS: 27,
+  STATE_CHANGE: 28,
+  0: 'END',
+  1: 'ERROR',
+  2: 'FINISH',
+  3: 'MESSAGE_START',
+  4: 'MESSAGE_COMPLETE',
+  5: 'REQUEST',
+  6: 'RESPONSE',
+  7: 'RESET',
+  8: 'METHOD',
+  9: 'URL',
+  10: 'PROTOCOL',
+  11: 'VERSION',
+  12: 'STATUS',
+  13: 'REASON',
+  14: 'HEADER_NAME',
+  15: 'HEADER_VALUE',
+  16: 'HEADERS',
+  17: 'CONNECT',
+  18: 'UPGRADE',
+  19: 'CHUNK_LENGTH',
+  20: 'CHUNK_EXTENSION_NAME',
+  21: 'CHUNK_EXTENSION_VALUE',
+  22: 'CHUNK',
+  23: 'BODY',
+  24: 'DATA',
+  25: 'TRAILER_NAME',
+  26: 'TRAILER_VALUE',
+  27: 'TRAILERS',
+  28: 'STATE_CHANGE'
+})
+
+const EventActives = Object.freeze({
+  NONE: 0n,
+  ON_ERROR: 1n,
+  ON_FINISH: 2n,
+  ON_MESSAGE_START: 4n,
+  ON_MESSAGE_COMPLETE: 8n,
+  ON_REQUEST: 16n,
+  ON_RESPONSE: 32n,
+  ON_RESET: 64n,
+  ON_METHOD: 128n,
+  ON_URL: 256n,
+  ON_PROTOCOL: 512n,
+  ON_VERSION: 1024n,
+  ON_STATUS: 2048n,
+  ON_REASON: 4096n,
+  ON_HEADER_NAME: 8192n,
+  ON_HEADER_VALUE: 16384n,
+  ON_HEADERS: 32768n,
+  ON_CONNECT: 65536n,
+  ON_UPGRADE: 131072n,
+  ON_CHUNK_LENGTH: 262144n,
+  ON_CHUNK_EXTENSION_NAME: 524288n,
+  ON_CHUNK_EXTENSION_VALUE: 1048576n,
+  ON_CHUNK: 2097152n,
+  ON_BODY: 4194304n,
+  ON_DATA: 8388608n,
+  ON_TRAILER_NAME: 16777216n,
+  ON_TRAILER_VALUE: 33554432n,
+  ON_TRAILERS: 67108864n,
+  ON_STATE_CHANGE: 134217728n,
+  ALL: 268435455n,
+  0n: 'NONE',
+  1n: 'ON_ERROR',
+  2n: 'ON_FINISH',
+  4n: 'ON_MESSAGE_START',
+  8n: 'ON_MESSAGE_COMPLETE',
+  16n: 'ON_REQUEST',
+  32n: 'ON_RESPONSE',
+  64n: 'ON_RESET',
+  128n: 'ON_METHOD',
+  256n: 'ON_URL',
+  512n: 'ON_PROTOCOL',
+  1024n: 'ON_VERSION',
+  2048n: 'ON_STATUS',
+  4096n: 'ON_REASON',
+  8192n: 'ON_HEADER_NAME',
+  16384n: 'ON_HEADER_VALUE',
+  32768n: 'ON_HEADERS',
+  65536n: 'ON_CONNECT',
+  131072n: 'ON_UPGRADE',
+  262144n: 'ON_CHUNK_LENGTH',
+  524288n: 'ON_CHUNK_EXTENSION_NAME',
+  1048576n: 'ON_CHUNK_EXTENSION_VALUE',
+  2097152n: 'ON_CHUNK',
+  4194304n: 'ON_BODY',
+  8388608n: 'ON_DATA',
+  16777216n: 'ON_TRAILER_NAME',
+  33554432n: 'ON_TRAILER_VALUE',
+  67108864n: 'ON_TRAILERS',
+  134217728n: 'ON_STATE_CHANGE',
+  268435455n: 'ALL'
+})
+
+const States = Object.freeze({
+  START: 0,
+  FINISH: 1,
+  ERROR: 2,
+  REQUEST_LINE: 3,
+  STATUS_LINE: 4,
+  HTTP2_PREFACE: 5,
+  HEADER: 6,
+  BODY_DECISION: 7,
+  BODY_VIA_CONTENT_LENGTH: 8,
+  BODY_WITH_NO_LENGTH: 9,
+  CHUNK_HEADER: 10,
+  CHUNK_EXTENSIONS: 11,
+  CHUNK_DATA: 12,
+  TRAILER: 13,
+  TUNNEL: 14,
+  0: 'START',
+  1: 'FINISH',
+  2: 'ERROR',
+  3: 'REQUEST_LINE',
+  4: 'STATUS_LINE',
+  5: 'HTTP2_PREFACE',
+  6: 'HEADER',
+  7: 'BODY_DECISION',
+  8: 'BODY_VIA_CONTENT_LENGTH',
+  9: 'BODY_WITH_NO_LENGTH',
+  10: 'CHUNK_HEADER',
+  11: 'CHUNK_EXTENSIONS',
+  12: 'CHUNK_DATA',
+  13: 'TRAILER',
+  14: 'TUNNEL'
+})
+
+const ParserFields = Object.freeze({
+  MAX_START_LINE_LENGTH: 0,
+  MAX_HEADER_LENGTH: 4,
+  MAX_BODY_PAYLOAD: 8,
+  AUTODETECT: 16,
+  IS_REQUEST: 17,
+  SUSPEND_AFTER_HEADERS: 18,
+  MANAGE_UNCONSUMED: 19,
+  CONTINUE_WITHOUT_DATA: 20,
+  IS_CONNECT: 21,
+  SKIP_BODY: 22,
+  DEBUG: 23,
+  PARSED: 24,
+  POSITION: 32,
+  STATE: 36,
+  PAUSED: 37,
+  ERROR_CODE: 38,
+  CONTENT_LENGTH: 40,
+  CHUNK_SIZE: 48,
+  REMAINING_CONTENT_LENGTH: 56,
+  REMAINING_CHUNK_SIZE: 64,
+  STATUS: 72,
+  METHOD: 76,
+  HAS_CONTENT_LENGTH: 77,
+  HAS_TRANSFER_ENCODING: 78,
+  HAS_CHUNKED_TRANSFER_ENCODING: 79,
+  HAS_CONNECTION_CLOSE: 80,
+  HAS_CONNECTION_UPGRADE: 81,
+  HAS_UPGRADE: 82,
+  HAS_TRAILERS: 83,
+  ACTIVE_CALLBACKS: 88,
+  ACTIVE_EVENTS: 96,
+  PTR: 104,
+  ERROR_DESCRIPTION: 108,
+  UNCONSUMED: 364,
+  UNCONSUMED_LEN: 368,
+  ERROR_DESCRIPTION_LEN: 372,
+  EVENTS: 376,
+  0: 'MAX_START_LINE_LENGTH',
+  4: 'MAX_HEADER_LENGTH',
+  8: 'MAX_BODY_PAYLOAD',
+  16: 'AUTODETECT',
+  17: 'IS_REQUEST',
+  18: 'SUSPEND_AFTER_HEADERS',
+  19: 'MANAGE_UNCONSUMED',
+  20: 'CONTINUE_WITHOUT_DATA',
+  21: 'IS_CONNECT',
+  22: 'SKIP_BODY',
+  23: 'DEBUG',
+  24: 'PARSED',
+  32: 'POSITION',
+  36: 'STATE',
+  37: 'PAUSED',
+  38: 'ERROR_CODE',
+  40: 'CONTENT_LENGTH',
+  48: 'CHUNK_SIZE',
+  56: 'REMAINING_CONTENT_LENGTH',
+  64: 'REMAINING_CHUNK_SIZE',
+  72: 'STATUS',
+  76: 'METHOD',
+  77: 'HAS_CONTENT_LENGTH',
+  78: 'HAS_TRANSFER_ENCODING',
+  79: 'HAS_CHUNKED_TRANSFER_ENCODING',
+  80: 'HAS_CONNECTION_CLOSE',
+  81: 'HAS_CONNECTION_UPGRADE',
+  82: 'HAS_UPGRADE',
+  83: 'HAS_TRAILERS',
+  88: 'ACTIVE_CALLBACKS',
+  96: 'ACTIVE_EVENTS',
+  104: 'PTR',
+  108: 'ERROR_DESCRIPTION',
+  364: 'UNCONSUMED',
+  368: 'UNCONSUMED_LEN',
+  372: 'ERROR_DESCRIPTION_LEN',
+  376: 'EVENTS'
+})
+
+function isAutodetect (parser) {
+  return this.is_autodetect(parser) !== 0
+}
+
+function isRequest (parser) {
+  return this.is_request(parser) !== 0
+}
+
+function isPaused (parser) {
+  return this.is_paused(parser) !== 0
+}
+
+function shouldManageUnconsumed (parser) {
+  return this.should_manage_unconsumed(parser) !== 0
+}
+
+function shouldSuspendAfterHeaders (parser) {
+  return this.should_suspend_after_headers(parser) !== 0
+}
+
+function getMaxStartLineLength (parser) {
+  return this.get_max_start_line_length(parser) >>> 0
+}
+
+function getMaxHeaderLength (parser) {
+  return this.get_max_header_length(parser) >>> 0
+}
+
+function getMaxBodyPayload (parser) {
+  return BigInt.asUintN(64, this.get_max_body_payload(parser))
+}
+
+function shouldContinueWithoutData (parser) {
+  return this.should_continue_without_data(parser) !== 0
+}
+
+function isConnect (parser) {
+  return this.is_connect(parser) !== 0
+}
+
+function isDebug (parser) {
+  return this.is_debug(parser) !== 0
+}
+
+function shouldSkipBody (parser) {
+  return this.should_skip_body(parser) !== 0
+}
+
+function getState (parser) {
+  return this.get_state(parser) >>> 0
+}
+
+function getPosition (parser) {
+  return this.get_position(parser) >>> 0
+}
+
+function getParsed (parser) {
+  return BigInt.asUintN(64, this.get_parsed(parser))
+}
+
+function getErrorCode (parser) {
+  return this.get_error_code(parser) >>> 0
+}
+
+function getMethod (parser) {
+  return this.get_method(parser) >>> 0
+}
+
+function getStatus (parser) {
+  return this.get_status(parser) >>> 0
+}
+
+function hasConnectionClose (parser) {
+  return this.has_connection_close(parser) !== 0
+}
+
+function hasConnectionUpgrade (parser) {
+  return this.has_connection_upgrade(parser) !== 0
+}
+
+function getContentLength (parser) {
+  return BigInt.asUintN(64, this.get_content_length(parser))
+}
+
+function getChunkSize (parser) {
+  return BigInt.asUintN(64, this.get_chunk_size(parser))
+}
+
+function getRemainingContentLength (parser) {
+  return BigInt.asUintN(64, this.get_remaining_content_length(parser))
+}
+
+function getRemainingChunkSize (parser) {
+  return BigInt.asUintN(64, this.get_remaining_chunk_size(parser))
+}
+
+function hasContentLength (parser) {
+  return this.has_content_length(parser) !== 0
+}
+
+function hasTransferEncoding (parser) {
+  return this.has_transfer_encoding(parser) !== 0
+}
+
+function hasChunkedTransferEncoding (parser) {
+  return this.has_chunked_transfer_encoding(parser) !== 0
+}
+
+function hasUpgrade (parser) {
+  return this.has_upgrade(parser) !== 0
+}
+
+function hasTrailers (parser) {
+  return this.has_trailers(parser) !== 0
+}
+
+function getErrorDescription (parser) {
+  const raw = this.get_error_description_raw(parser)
+  const len = Number(BigInt.asUintN(32, raw))
+  const ptr = Number(raw >> 32n)
+  return textDecoder.decode(new Uint8Array(this.memory.buffer, ptr, len))
+}
+
+function setShouldAutodetect (parser, value) {
+  this.set_should_autodetect(parser, value)
+}
+
+function setShouldContinueWithoutData (parser, value) {
+  this.set_should_continue_without_data(parser, value)
+}
+
+function setIsRequest (parser, value) {
+  this.set_is_request(parser, value)
+}
+
+function setIsConnect (parser, value) {
+  this.set_is_connect(parser, value)
+}
+
+function setDebug (parser, value) {
+  this.set_debug(parser, value)
+}
+
+function setShouldManageUnconsumed (parser, value) {
+  this.set_should_manage_unconsumed(parser, value)
+}
+
+function setShouldSuspendAfterHeaders (parser, value) {
+  this.set_should_suspend_after_headers(parser, value)
+}
+
+function setMaxStartLineLength (parser, value) {
+  this.set_max_start_line_length(parser, value)
+}
+
+function setMaxHeaderLength (parser, value) {
+  this.set_max_header_length(parser, value)
+}
+
+function setMaxBodyPayload (parser, value) {
+  this.set_max_body_payload(parser, value)
+}
+
+function setShouldSkipBody (parser, value) {
+  this.set_should_skip_body(parser, value)
+}
+
+function setActiveCallbacks (parser, value) {
+  this.set_active_callbacks(parser, value)
+}
+
+function setActiveEvents (parser, value) {
+  this.set_active_events(parser, value)
+}
+
+function simpleCreate (spans, create) {
+  const parser = create()
+  spans[parser] = []
+  this.setActiveCallbacks(parser, this.CALLBACK_ACTIVE_ALL)
+  return parser
+}
+
+function simpleDestroy (spans, destroy, parser) {
+  spans[parser] = undefined
+  destroy(parser)
+}
+
+function noop () {}
+
+function setup (env = {}) {
+  let { logger: logOption, ...instanceEnvironment } = env
+  let logger = noop
+  const context = {}
+
+  if (logOption) {
+    if (typeof logOption !== 'function') {
+      logOption = console.log
+    }
+
+    logger = log.bind(context, logOption)
+  }
+
+  // Create the WASM instance
+  /* eslint-disable-next-line no-undef */
+  const instance = new WebAssembly.Instance(wasmModule, {
+    env: {
+      logger,
+      on_error: noop,
+      on_finish: noop,
+      on_message_start: noop,
+      on_message_complete: noop,
+      on_request: noop,
+      on_response: noop,
+      on_reset: noop,
+      on_method: noop,
+      on_url: noop,
+      on_protocol: noop,
+      on_version: noop,
+      on_status: noop,
+      on_reason: noop,
+      on_header_name: noop,
+      on_header_value: noop,
+      on_headers: noop,
+      on_connect: noop,
+      on_upgrade: noop,
+      on_chunk_length: noop,
+      on_chunk_extension_name: noop,
+      on_chunk_extension_value: noop,
+      on_chunk: noop,
+      on_body: noop,
+      on_data: noop,
+      on_trailer_name: noop,
+      on_trailer_value: noop,
+      on_trailers: noop,
+      on_state_change: noop,
+      ...instanceEnvironment
+    }
+  })
+
+  const wasm = instance.exports
+  context.memory = wasm.memory
+
+  const milo = {
+    version: {
+      raw: '0.9.0',
+      major: 0,
+      minor: 9,
+      patch: 0,
+      prerelease: ''
+    },
+    METHOD_OTHER: 0,
+    METHOD_GET: 1,
+    METHOD_HEAD: 2,
+    METHOD_POST: 3,
+    METHOD_PUT: 4,
+    METHOD_DELETE: 5,
+    METHOD_CONNECT: 6,
+    METHOD_OPTIONS: 7,
+    METHOD_TRACE: 8,
+    METHOD_PATCH: 9,
+    METHOD_PRI: 10,
+    CALLBACK_ON_ERROR: 0,
+    CALLBACK_ON_FINISH: 1,
+    CALLBACK_ON_MESSAGE_START: 2,
+    CALLBACK_ON_MESSAGE_COMPLETE: 3,
+    CALLBACK_ON_REQUEST: 4,
+    CALLBACK_ON_RESPONSE: 5,
+    CALLBACK_ON_RESET: 6,
+    CALLBACK_ON_METHOD: 7,
+    CALLBACK_ON_URL: 8,
+    CALLBACK_ON_PROTOCOL: 9,
+    CALLBACK_ON_VERSION: 10,
+    CALLBACK_ON_STATUS: 11,
+    CALLBACK_ON_REASON: 12,
+    CALLBACK_ON_HEADER_NAME: 13,
+    CALLBACK_ON_HEADER_VALUE: 14,
+    CALLBACK_ON_HEADERS: 15,
+    CALLBACK_ON_CONNECT: 16,
+    CALLBACK_ON_UPGRADE: 17,
+    CALLBACK_ON_CHUNK_LENGTH: 18,
+    CALLBACK_ON_CHUNK_EXTENSION_NAME: 19,
+    CALLBACK_ON_CHUNK_EXTENSION_VALUE: 20,
+    CALLBACK_ON_CHUNK: 21,
+    CALLBACK_ON_BODY: 22,
+    CALLBACK_ON_DATA: 23,
+    CALLBACK_ON_TRAILER_NAME: 24,
+    CALLBACK_ON_TRAILER_VALUE: 25,
+    CALLBACK_ON_TRAILERS: 26,
+    CALLBACK_ON_STATE_CHANGE: 27,
+    EVENT_END: 0,
+    EVENT_ERROR: 1,
+    EVENT_FINISH: 2,
+    EVENT_MESSAGE_START: 3,
+    EVENT_MESSAGE_COMPLETE: 4,
+    EVENT_REQUEST: 5,
+    EVENT_RESPONSE: 6,
+    EVENT_RESET: 7,
+    EVENT_METHOD: 8,
+    EVENT_URL: 9,
+    EVENT_PROTOCOL: 10,
+    EVENT_VERSION: 11,
+    EVENT_STATUS: 12,
+    EVENT_REASON: 13,
+    EVENT_HEADER_NAME: 14,
+    EVENT_HEADER_VALUE: 15,
+    EVENT_HEADERS: 16,
+    EVENT_CONNECT: 17,
+    EVENT_UPGRADE: 18,
+    EVENT_CHUNK_LENGTH: 19,
+    EVENT_CHUNK_EXTENSION_NAME: 20,
+    EVENT_CHUNK_EXTENSION_VALUE: 21,
+    EVENT_CHUNK: 22,
+    EVENT_BODY: 23,
+    EVENT_DATA: 24,
+    EVENT_TRAILER_NAME: 25,
+    EVENT_TRAILER_VALUE: 26,
+    EVENT_TRAILERS: 27,
+    EVENT_STATE_CHANGE: 28,
+    CALLBACK_ACTIVE_NONE: 0n,
+    EVENT_ACTIVE_NONE: 0n,
+    CALLBACK_ACTIVE_ON_ERROR: 1n,
+    EVENT_ACTIVE_ON_ERROR: 1n,
+    CALLBACK_ACTIVE_ON_FINISH: 2n,
+    EVENT_ACTIVE_ON_FINISH: 2n,
+    CALLBACK_ACTIVE_ON_MESSAGE_START: 4n,
+    EVENT_ACTIVE_ON_MESSAGE_START: 4n,
+    CALLBACK_ACTIVE_ON_MESSAGE_COMPLETE: 8n,
+    EVENT_ACTIVE_ON_MESSAGE_COMPLETE: 8n,
+    CALLBACK_ACTIVE_ON_REQUEST: 16n,
+    EVENT_ACTIVE_ON_REQUEST: 16n,
+    CALLBACK_ACTIVE_ON_RESPONSE: 32n,
+    EVENT_ACTIVE_ON_RESPONSE: 32n,
+    CALLBACK_ACTIVE_ON_RESET: 64n,
+    EVENT_ACTIVE_ON_RESET: 64n,
+    CALLBACK_ACTIVE_ON_METHOD: 128n,
+    EVENT_ACTIVE_ON_METHOD: 128n,
+    CALLBACK_ACTIVE_ON_URL: 256n,
+    EVENT_ACTIVE_ON_URL: 256n,
+    CALLBACK_ACTIVE_ON_PROTOCOL: 512n,
+    EVENT_ACTIVE_ON_PROTOCOL: 512n,
+    CALLBACK_ACTIVE_ON_VERSION: 1024n,
+    EVENT_ACTIVE_ON_VERSION: 1024n,
+    CALLBACK_ACTIVE_ON_STATUS: 2048n,
+    EVENT_ACTIVE_ON_STATUS: 2048n,
+    CALLBACK_ACTIVE_ON_REASON: 4096n,
+    EVENT_ACTIVE_ON_REASON: 4096n,
+    CALLBACK_ACTIVE_ON_HEADER_NAME: 8192n,
+    EVENT_ACTIVE_ON_HEADER_NAME: 8192n,
+    CALLBACK_ACTIVE_ON_HEADER_VALUE: 16384n,
+    EVENT_ACTIVE_ON_HEADER_VALUE: 16384n,
+    CALLBACK_ACTIVE_ON_HEADERS: 32768n,
+    EVENT_ACTIVE_ON_HEADERS: 32768n,
+    CALLBACK_ACTIVE_ON_CONNECT: 65536n,
+    EVENT_ACTIVE_ON_CONNECT: 65536n,
+    CALLBACK_ACTIVE_ON_UPGRADE: 131072n,
+    EVENT_ACTIVE_ON_UPGRADE: 131072n,
+    CALLBACK_ACTIVE_ON_CHUNK_LENGTH: 262144n,
+    EVENT_ACTIVE_ON_CHUNK_LENGTH: 262144n,
+    CALLBACK_ACTIVE_ON_CHUNK_EXTENSION_NAME: 524288n,
+    EVENT_ACTIVE_ON_CHUNK_EXTENSION_NAME: 524288n,
+    CALLBACK_ACTIVE_ON_CHUNK_EXTENSION_VALUE: 1048576n,
+    EVENT_ACTIVE_ON_CHUNK_EXTENSION_VALUE: 1048576n,
+    CALLBACK_ACTIVE_ON_CHUNK: 2097152n,
+    EVENT_ACTIVE_ON_CHUNK: 2097152n,
+    CALLBACK_ACTIVE_ON_BODY: 4194304n,
+    EVENT_ACTIVE_ON_BODY: 4194304n,
+    CALLBACK_ACTIVE_ON_DATA: 8388608n,
+    EVENT_ACTIVE_ON_DATA: 8388608n,
+    CALLBACK_ACTIVE_ON_TRAILER_NAME: 16777216n,
+    EVENT_ACTIVE_ON_TRAILER_NAME: 16777216n,
+    CALLBACK_ACTIVE_ON_TRAILER_VALUE: 33554432n,
+    EVENT_ACTIVE_ON_TRAILER_VALUE: 33554432n,
+    CALLBACK_ACTIVE_ON_TRAILERS: 67108864n,
+    EVENT_ACTIVE_ON_TRAILERS: 67108864n,
+    CALLBACK_ACTIVE_ON_STATE_CHANGE: 134217728n,
+    EVENT_ACTIVE_ON_STATE_CHANGE: 134217728n,
+    CALLBACK_ACTIVE_ALL: 268435455n,
+    EVENT_ACTIVE_ALL: 268435455n,
+    ERROR_NONE: 0,
+    ERROR_USER: 1,
+    ERROR_CALLBACK_ERROR: 2,
+    ERROR_UNEXPECTED_STATE: 3,
+    ERROR_UNEXPECTED_DATA: 4,
+    ERROR_UNEXPECTED_EOF: 5,
+    ERROR_UNEXPECTED_CHARACTER: 6,
+    ERROR_UNEXPECTED_CONTENT_LENGTH: 7,
+    ERROR_UNEXPECTED_TRANSFER_ENCODING: 8,
+    ERROR_UNEXPECTED_CONTENT: 9,
+    ERROR_UNEXPECTED_TRAILERS: 10,
+    ERROR_INVALID_VERSION: 11,
+    ERROR_INVALID_STATUS: 12,
+    ERROR_INVALID_CONTENT_LENGTH: 13,
+    ERROR_INVALID_TRANSFER_ENCODING: 14,
+    ERROR_INVALID_CHUNK_SIZE: 15,
+    ERROR_MISSING_CONNECTION_UPGRADE: 16,
+    ERROR_UNSUPPORTED_HTTP_VERSION: 17,
+    STATE_START: 0,
+    STATE_FINISH: 1,
+    STATE_ERROR: 2,
+    STATE_REQUEST_LINE: 3,
+    STATE_STATUS_LINE: 4,
+    STATE_HTTP2_PREFACE: 5,
+    STATE_HEADER: 6,
+    STATE_BODY_DECISION: 7,
+    STATE_BODY_VIA_CONTENT_LENGTH: 8,
+    STATE_BODY_WITH_NO_LENGTH: 9,
+    STATE_CHUNK_HEADER: 10,
+    STATE_CHUNK_EXTENSIONS: 11,
+    STATE_CHUNK_DATA: 12,
+    STATE_TRAILER: 13,
+    STATE_TUNNEL: 14,
+    PARSER_FIELD_MAX_START_LINE_LENGTH: 0,
+    PARSER_FIELD_MAX_HEADER_LENGTH: 4,
+    PARSER_FIELD_MAX_BODY_PAYLOAD: 8,
+    PARSER_FIELD_AUTODETECT: 16,
+    PARSER_FIELD_IS_REQUEST: 17,
+    PARSER_FIELD_SUSPEND_AFTER_HEADERS: 18,
+    PARSER_FIELD_MANAGE_UNCONSUMED: 19,
+    PARSER_FIELD_CONTINUE_WITHOUT_DATA: 20,
+    PARSER_FIELD_IS_CONNECT: 21,
+    PARSER_FIELD_SKIP_BODY: 22,
+    PARSER_FIELD_DEBUG: 23,
+    PARSER_FIELD_PARSED: 24,
+    PARSER_FIELD_POSITION: 32,
+    PARSER_FIELD_STATE: 36,
+    PARSER_FIELD_PAUSED: 37,
+    PARSER_FIELD_ERROR_CODE: 38,
+    PARSER_FIELD_CONTENT_LENGTH: 40,
+    PARSER_FIELD_CHUNK_SIZE: 48,
+    PARSER_FIELD_REMAINING_CONTENT_LENGTH: 56,
+    PARSER_FIELD_REMAINING_CHUNK_SIZE: 64,
+    PARSER_FIELD_STATUS: 72,
+    PARSER_FIELD_METHOD: 76,
+    PARSER_FIELD_HAS_CONTENT_LENGTH: 77,
+    PARSER_FIELD_HAS_TRANSFER_ENCODING: 78,
+    PARSER_FIELD_HAS_CHUNKED_TRANSFER_ENCODING: 79,
+    PARSER_FIELD_HAS_CONNECTION_CLOSE: 80,
+    PARSER_FIELD_HAS_CONNECTION_UPGRADE: 81,
+    PARSER_FIELD_HAS_UPGRADE: 82,
+    PARSER_FIELD_HAS_TRAILERS: 83,
+    PARSER_FIELD_ACTIVE_CALLBACKS: 88,
+    PARSER_FIELD_ACTIVE_EVENTS: 96,
+    PARSER_FIELD_PTR: 104,
+    PARSER_FIELD_ERROR_DESCRIPTION: 108,
+    PARSER_FIELD_UNCONSUMED: 364,
+    PARSER_FIELD_UNCONSUMED_LEN: 368,
+    PARSER_FIELD_ERROR_DESCRIPTION_LEN: 372,
+    PARSER_FIELD_EVENTS: 376,
+    Errors,
+    Methods,
+    Callbacks,
+    CallbackActives,
+    Events,
+    EventActives,
+    States,
+    ParserFields,
+    isAutodetect: isAutodetect.bind(wasm),
+    isRequest: isRequest.bind(wasm),
+    isPaused: isPaused.bind(wasm),
+    shouldManageUnconsumed: shouldManageUnconsumed.bind(wasm),
+    shouldSuspendAfterHeaders: shouldSuspendAfterHeaders.bind(wasm),
+    getMaxStartLineLength: getMaxStartLineLength.bind(wasm),
+    getMaxHeaderLength: getMaxHeaderLength.bind(wasm),
+    getMaxBodyPayload: getMaxBodyPayload.bind(wasm),
+    shouldContinueWithoutData: shouldContinueWithoutData.bind(wasm),
+    isConnect: isConnect.bind(wasm),
+    isDebug: isDebug.bind(wasm),
+    shouldSkipBody: shouldSkipBody.bind(wasm),
+    getState: getState.bind(wasm),
+    getPosition: getPosition.bind(wasm),
+    getParsed: getParsed.bind(wasm),
+    getErrorCode: getErrorCode.bind(wasm),
+    getMethod: getMethod.bind(wasm),
+    getStatus: getStatus.bind(wasm),
+    hasConnectionClose: hasConnectionClose.bind(wasm),
+    hasConnectionUpgrade: hasConnectionUpgrade.bind(wasm),
+    getContentLength: getContentLength.bind(wasm),
+    getChunkSize: getChunkSize.bind(wasm),
+    getRemainingContentLength: getRemainingContentLength.bind(wasm),
+    getRemainingChunkSize: getRemainingChunkSize.bind(wasm),
+    hasContentLength: hasContentLength.bind(wasm),
+    hasTransferEncoding: hasTransferEncoding.bind(wasm),
+    hasChunkedTransferEncoding: hasChunkedTransferEncoding.bind(wasm),
+    hasUpgrade: hasUpgrade.bind(wasm),
+    hasTrailers: hasTrailers.bind(wasm),
+    getErrorDescription: getErrorDescription.bind(wasm),
+    setShouldAutodetect: setShouldAutodetect.bind(wasm),
+    setShouldContinueWithoutData: setShouldContinueWithoutData.bind(wasm),
+    setIsRequest: setIsRequest.bind(wasm),
+    setIsConnect: setIsConnect.bind(wasm),
+    setDebug: setDebug.bind(wasm),
+    setShouldManageUnconsumed: setShouldManageUnconsumed.bind(wasm),
+    setShouldSuspendAfterHeaders: setShouldSuspendAfterHeaders.bind(wasm),
+    setMaxStartLineLength: setMaxStartLineLength.bind(wasm),
+    setMaxHeaderLength: setMaxHeaderLength.bind(wasm),
+    setMaxBodyPayload: setMaxBodyPayload.bind(wasm),
+    setShouldSkipBody: setShouldSkipBody.bind(wasm),
+    setActiveCallbacks: setActiveCallbacks.bind(wasm),
+    setActiveEvents: setActiveEvents.bind(wasm),
+    memory: wasm.memory,
+    alloc: alloc.bind(wasm),
+    dealloc: dealloc.bind(wasm),
+    create: create.bind(wasm),
+    destroy: destroy.bind(wasm),
+    parse: parse.bind(wasm),
+    fail: fail.bind(wasm),
+    hasDebug: hasDebug.bind(wasm),
+    clear: wasm.clear,
+    complete: wasm.complete,
+    finish: wasm.finish,
+    pause: wasm.pause,
+    reset: wasm.reset,
+    resume: wasm.resume
+  }
+
+  return milo
+}
+
+function simple () {
+  const spans = {}
+
+  const milo = setup({/* REPLACE: callbacks:simple */})
+
+  milo.spans = spans
+  milo.create = simpleCreate.bind(milo, spans, milo.create)
+  milo.destroy = simpleDestroy.bind(milo, spans, milo.destroy)
+
+  return milo
+}
+
+module.exports = { wasmModule, noop, setup, simple }
+
+
+/***/ }),
+
 /***/ 7501:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
@@ -25133,6 +30462,17 @@ class MockAgent extends Dispatcher {
     }
   }
 
+  // WebSocket and EventSource read their receive limits from the dispatcher
+  // they are given, so report the settings of the agent that makes real
+  // connections.
+  get webSocketOptions () {
+    return this[kAgent].webSocketOptions
+  }
+
+  get eventSourceOptions () {
+    return this[kAgent].eventSourceOptions
+  }
+
   get (origin) {
     // Normalize origin to handle URL objects and case-insensitive hostnames
     const normalizedOrigin = normalizeOrigin(origin)
@@ -25151,13 +30491,25 @@ class MockAgent extends Dispatcher {
     opts.origin = normalizeOrigin(opts.origin)
 
     // Call MockAgent.get to perform additional setup before dispatching as normal
-    this.get(opts.origin)
+    const mockDispatcher = this.get(opts.origin)
 
     this[kMockAgentAddCallHistoryLog](opts)
 
     const acceptNonStandardSearchParameters = this[kMockAgentAcceptsNonStandardSearchParameters]
 
     const dispatchOpts = { ...opts }
+
+    // Agent keeps HTTP/1.1-only dispatchers under a separate key. Legacy
+    // global dispatcher consumers use that path, so mirror the mock dispatches
+    // before delegating to the internal Agent.
+    if (dispatchOpts.allowH2 === false) {
+      const http1OnlyKey = `${dispatchOpts.origin}#http1-only`
+      if (!this[kClients].has(http1OnlyKey)) {
+        const http1OnlyDispatcher = this[kFactory](dispatchOpts.origin)
+        http1OnlyDispatcher[kDispatches] = mockDispatcher[kDispatches]
+        this[kMockAgentSet](http1OnlyKey, http1OnlyDispatcher)
+      }
+    }
 
     if (acceptNonStandardSearchParameters && dispatchOpts.path) {
       const [path, searchParams] = dispatchOpts.path.split('?')
@@ -26271,6 +31623,13 @@ function removeTrailingSlash (path) {
     return path
   }
 
+  // Only strip slashes from the pathname, not from a query string after it
+  const queryIndex = path.indexOf('?')
+  const search = queryIndex === -1 ? '' : path.slice(queryIndex)
+  if (queryIndex !== -1) {
+    path = path.slice(0, queryIndex)
+  }
+
   while (path.endsWith('/')) {
     path = path.slice(0, -1)
   }
@@ -26279,7 +31638,7 @@ function removeTrailingSlash (path) {
     path = '/'
   }
 
-  return path
+  return path + search
 }
 
 function buildKey (opts) {
@@ -26364,8 +31723,7 @@ function mockDispatch (opts, handler) {
             handler.onResponseError(null, new InvalidArgumentError('reply options callback must return an object'))
             return
           }
-          mockDispatch.data = { ...responseDefaults, ...resolvedData }
-          dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler)
+          dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler, { ...responseDefaults, ...resolvedData })
         },
         (error) => {
           handler.onResponseError(null, error)
@@ -26378,7 +31736,7 @@ function mockDispatch (opts, handler) {
       throw new InvalidArgumentError('reply options callback must return an object')
     }
 
-    mockDispatch.data = { ...responseDefaults, ...callbackResult }
+    return dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler, { ...responseDefaults, ...callbackResult })
   }
 
   return dispatchMockReply(mockDispatches, mockDispatch, key, opts, handler)
@@ -26387,9 +31745,13 @@ function mockDispatch (opts, handler) {
 /**
  * Replies to a request once the mock dispatch data is fully resolved
  */
-function dispatchMockReply (mockDispatches, mockDispatch, key, opts, handler) {
-  // Parse mockDispatch data
-  const { data: response, delay } = mockDispatch
+function dispatchMockReply (mockDispatches, mockDispatch, key, opts, handler, resolvedResponse) {
+  // Parse mockDispatch data. When a reply callback has already been resolved
+  // in mockDispatch() (i.e. no body lifecycle hooks are involved), the resolved
+  // response is passed in here, leaving mockDispatch.data untouched so the
+  // callback can be re-invoked for persistent / times() replies.
+  const { data: responseData, delay } = mockDispatch
+  const response = resolvedResponse ?? responseData
 
   // If specified, trigger dispatch error
   if (response.error !== null) {
@@ -26407,6 +31769,9 @@ function dispatchMockReply (mockDispatches, mockDispatch, key, opts, handler) {
     paused: false,
     rawHeaders: null,
     rawTrailers: null,
+    get aborted () {
+      return aborted
+    },
     pause () {
       this.paused = true
     },
@@ -26485,8 +31850,7 @@ function dispatchMockReply (mockDispatches, mockDispatch, key, opts, handler) {
               handler.onResponseError(null, new InvalidArgumentError('reply options callback must return an object'))
               return
             }
-            mockDispatch.data = { ...responseDefaults, ...resolvedData }
-            handleReply(dispatches, mockDispatch.data)
+            handleReply(dispatches, { ...responseDefaults, ...resolvedData })
           },
           (err) => {
             handler.onResponseError(null, err)
@@ -26499,8 +31863,7 @@ function dispatchMockReply (mockDispatches, mockDispatch, key, opts, handler) {
         throw new InvalidArgumentError('reply options callback must return an object')
       }
 
-      mockDispatch.data = { ...responseDefaults, ...callbackResult }
-      handleReply(dispatches, mockDispatch.data)
+      handleReply(dispatches, { ...responseDefaults, ...callbackResult })
       return
     }
 
@@ -27189,6 +32552,7 @@ const { writeFile, readFile, mkdir } = __nccwpck_require__(1455)
 const { dirname, resolve } = __nccwpck_require__(6760)
 const { setTimeout, clearTimeout } = __nccwpck_require__(7997)
 const { InvalidArgumentError, UndiciError } = __nccwpck_require__(8707)
+const { setHeader } = __nccwpck_require__(3440)
 const { hashId, isUrlExcludedFactory, normalizeHeaders, createHeaderFilters } = __nccwpck_require__(9683)
 
 /**
@@ -27354,7 +32718,7 @@ function filterHeadersForMatching (headers, headerFilters, matchOptions = {}) {
       if (!match.has(headerKey)) continue
     }
 
-    filtered[headerKey] = value
+    setHeader(filtered, headerKey, value)
   }
 
   return filtered
@@ -27383,7 +32747,7 @@ function filterHeadersForStorage (headers, headerFilters, matchOptions = {}) {
     // Skip if in exclude list (for security)
     if (excludeSet.has(headerKey)) continue
 
-    filtered[headerKey] = value
+    setHeader(filtered, headerKey, value)
   }
 
   return filtered
@@ -27816,6 +33180,7 @@ module.exports = { SnapshotRecorder, formatRequestKey, createRequestHash, filter
 
 
 const { InvalidArgumentError } = __nccwpck_require__(8707)
+const { setHeader } = __nccwpck_require__(3440)
 const { runtimeFeatures } = __nccwpck_require__(313)
 
 /**
@@ -27931,7 +33296,7 @@ function normalizeHeaders (headers) {
         // Convert Buffers to strings if needed
         const keyStr = Buffer.isBuffer(key) ? key.toString() : key
         const valueStr = Buffer.isBuffer(value) ? value.toString() : value
-        normalizedHeaders[keyStr.toLowerCase()] = valueStr
+        setHeader(normalizedHeaders, keyStr.toLowerCase(), valueStr)
       }
     }
     return normalizedHeaders
@@ -27941,7 +33306,7 @@ function normalizeHeaders (headers) {
   if (headers && typeof headers === 'object') {
     for (const [key, value] of Object.entries(headers)) {
       if (key && typeof key === 'string') {
-        normalizedHeaders[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : String(value)
+        setHeader(normalizedHeaders, key.toLowerCase(), Array.isArray(value) ? value.join(', ') : String(value))
       }
     }
   }
@@ -27984,10 +33349,12 @@ const {
   safeHTTPMethods,
   pathHasQueryOrFragment,
   hasSafeIterator,
-  isValidHTTPToken
+  isValidHTTPToken,
+  setHeader
 } = __nccwpck_require__(3440)
 
 const { serializePathWithQuery } = __nccwpck_require__(3440)
+const { kRequestOrigin } = __nccwpck_require__(6443)
 
 const MAX_DELTA_SECONDS = 2147483647
 const RESTRICTIVE_DIRECTIVE_NAMES = ['no-store', 'private', 'no-cache']
@@ -28127,8 +33494,47 @@ function getMalformedRestrictiveDirectiveName (key) {
 /**
  * @param {import('../../types/dispatcher.d.ts').default.DispatchOptions} opts
  */
-function makeCacheKey (opts) {
-  const origin = opts.origin ? opts.origin.toString() : ''
+function getRequestOrigin (opts) {
+  const origin = opts[kRequestOrigin] === undefined
+    ? opts.origin
+    : opts[kRequestOrigin]
+  return typeof origin === 'string' || origin instanceof URL
+    ? origin
+    : null
+}
+
+/**
+ * @param {import('../../types/dispatcher.d.ts').default.DispatchOptions} opts
+ * @param {string|null|undefined} interceptorOrigin
+ */
+function getInterceptorOrigin (opts, interceptorOrigin) {
+  const requestOrigin = getRequestOrigin(opts)
+  if (interceptorOrigin === undefined) {
+    return requestOrigin
+  }
+  if (interceptorOrigin === null) {
+    return null
+  }
+  if (requestOrigin) {
+    try {
+      if (new URL(requestOrigin).origin !== interceptorOrigin) {
+        return null
+      }
+    } catch {
+      return interceptorOrigin
+    }
+  }
+  return interceptorOrigin
+}
+
+/**
+ * @param {import('../../types/dispatcher.d.ts').default.DispatchOptions} opts
+ * @param {string|URL|null} [origin]
+ */
+function makeCacheKey (opts, origin = getRequestOrigin(opts)) {
+  if (!origin) {
+    throw new Error('opts.origin is undefined')
+  }
 
   let fullPath = opts.path || '/'
 
@@ -28137,7 +33543,7 @@ function makeCacheKey (opts) {
   }
 
   return {
-    origin,
+    origin: origin.toString(),
     method: opts.method,
     path: fullPath,
     headers: opts.headers
@@ -28146,15 +33552,20 @@ function makeCacheKey (opts) {
 
 function appendHeader (headers, key, val) {
   const headerName = key.toLowerCase()
-  const current = headers[headerName]
+  // Reading `headers[headerName]` directly would resolve `__proto__` (and any
+  // other inherited name) through the prototype chain rather than report the
+  // header as absent.
+  const current = Object.hasOwn(headers, headerName)
+    ? headers[headerName]
+    : undefined
   const values = Array.isArray(val) ? val : [val]
 
   if (current === undefined) {
-    headers[headerName] = Array.isArray(val) ? val.slice() : val
+    setHeader(headers, headerName, Array.isArray(val) ? val.slice() : val)
   } else if (Array.isArray(current)) {
     current.push(...values)
   } else {
-    headers[headerName] = [current, ...values]
+    setHeader(headers, headerName, [current, ...values])
   }
 }
 
@@ -28672,7 +34083,7 @@ function makeDeduplicationKey (cacheKey, excludeHeaders) {
       if (excludeHeaders?.has(header.toLowerCase())) {
         continue
       }
-      headers[header] = cacheKey.headers[header]
+      setHeader(headers, header, cacheKey.headers[header])
     }
   }
 
@@ -28680,6 +34091,8 @@ function makeDeduplicationKey (cacheKey, excludeHeaders) {
 }
 
 module.exports = {
+  getInterceptorOrigin,
+  getRequestOrigin,
   makeCacheKey,
   normalizeHeaders,
   assertCacheKey,
@@ -29992,7 +35405,7 @@ class Cache {
   }
 
   async match (request, options = {}) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.match'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -30010,7 +35423,7 @@ class Cache {
   }
 
   async matchAll (request = undefined, options = {}) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.matchAll'
     if (request !== undefined) request = webidl.converters.RequestInfo(request)
@@ -30020,7 +35433,7 @@ class Cache {
   }
 
   async add (request) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.add'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -30038,7 +35451,7 @@ class Cache {
   }
 
   async addAll (requests) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.addAll'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -30136,7 +35549,10 @@ class Cache {
             }
           }
         },
-        processResponseEndOfBody (response) {
+        // Possible spec bug. If the body is never read, `processResponseEndOfBody` (which is attached to a TransformStream's flush hook)
+        // never runs, so this would hang. This hook, on the other hand, always reads the body.
+        // https://github.com/nodejs/undici/issues/5615
+        processResponseConsumeBody (response) {
           // 1.
           if (response.aborted) {
             responsePromise.reject(new DOMException('aborted', 'AbortError'))
@@ -30208,7 +35624,7 @@ class Cache {
   }
 
   async put (request, response) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.put'
     webidl.argumentLengthCheck(arguments, 2, prefix)
@@ -30339,7 +35755,7 @@ class Cache {
   }
 
   async delete (request, options = {}) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.delete'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -30405,7 +35821,7 @@ class Cache {
    * @returns {Promise<readonly Request[]>}
    */
   async keys (request = undefined, options = {}) {
-    webidl.brandCheck(this, Cache)
+    webidl.brandCheck(this, webidl.is.Cache)
 
     const prefix = 'Cache.keys'
 
@@ -30755,6 +36171,12 @@ class Cache {
     // 6.
     return Object.freeze(responseList)
   }
+
+  static {
+    webidl.is.Cache = (arg) => {
+      return arg != null && typeof arg === 'object' && #relevantRequestResponseList in arg
+    }
+  }
 }
 
 Object.defineProperties(Cache.prototype, {
@@ -30841,7 +36263,7 @@ class CacheStorage {
   }
 
   async match (request, options = {}) {
-    webidl.brandCheck(this, CacheStorage)
+    webidl.brandCheck(this, webidl.is.CacheStorage)
     webidl.argumentLengthCheck(arguments, 1, 'CacheStorage.match')
 
     request = webidl.converters.RequestInfo(request)
@@ -30878,7 +36300,7 @@ class CacheStorage {
    * @returns {Promise<boolean>}
    */
   async has (cacheName) {
-    webidl.brandCheck(this, CacheStorage)
+    webidl.brandCheck(this, webidl.is.CacheStorage)
 
     const prefix = 'CacheStorage.has'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -30896,7 +36318,7 @@ class CacheStorage {
    * @returns {Promise<Cache>}
    */
   async open (cacheName) {
-    webidl.brandCheck(this, CacheStorage)
+    webidl.brandCheck(this, webidl.is.CacheStorage)
 
     const prefix = 'CacheStorage.open'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -30930,7 +36352,7 @@ class CacheStorage {
    * @returns {Promise<boolean>}
    */
   async delete (cacheName) {
-    webidl.brandCheck(this, CacheStorage)
+    webidl.brandCheck(this, webidl.is.CacheStorage)
 
     const prefix = 'CacheStorage.delete'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -30945,13 +36367,19 @@ class CacheStorage {
    * @returns {Promise<string[]>}
    */
   async keys () {
-    webidl.brandCheck(this, CacheStorage)
+    webidl.brandCheck(this, webidl.is.CacheStorage)
 
     // 2.1
     const keys = this.#caches.keys()
 
     // 2.2
     return [...keys]
+  }
+
+  static {
+    webidl.is.CacheStorage = (arg) => {
+      return arg != null && typeof arg === 'object' && #caches in arg
+    }
   }
 }
 
@@ -31053,9 +36481,19 @@ module.exports = {
 const { parseSetCookie } = __nccwpck_require__(1978)
 const { stringify } = __nccwpck_require__(7797)
 const { webidl } = __nccwpck_require__(7879)
-const { Headers } = __nccwpck_require__(660)
 
-const brandChecks = webidl.brandCheckMultiple([Headers, globalThis.Headers].filter(Boolean))
+const globalHeadersBrandCheck = (arg) => webidl.brandCheck(arg, webidl.util.MakeTypeAssertion(globalThis.Headers))
+const undiciHeadersBrandCheck = (arg) => webidl.brandCheck(arg, webidl.is.Headers)
+
+function brandCheckHeaders (arg) {
+  try {
+    undiciHeadersBrandCheck(arg)
+    return
+  } catch {
+  }
+
+  globalHeadersBrandCheck(arg)
+}
 
 /**
  * @typedef {Object} Cookie
@@ -31078,12 +36516,14 @@ const brandChecks = webidl.brandCheckMultiple([Headers, globalThis.Headers].filt
 function getCookies (headers) {
   webidl.argumentLengthCheck(arguments, 1, 'getCookies')
 
-  brandChecks(headers)
+  brandCheckHeaders(headers)
 
   const cookie = headers.get('cookie')
 
+  // A null prototype keeps a cookie named `__proto__` from hitting the
+  // Object.prototype setter, which would silently drop it.
   /** @type {Record<string, string>} */
-  const out = {}
+  const out = { __proto__: null }
 
   if (!cookie) {
     return out
@@ -31105,7 +36545,7 @@ function getCookies (headers) {
  * @returns {void}
  */
 function deleteCookie (headers, name, attributes) {
-  brandChecks(headers)
+  brandCheckHeaders(headers)
 
   const prefix = 'deleteCookie'
   webidl.argumentLengthCheck(arguments, 2, prefix)
@@ -31130,7 +36570,7 @@ function deleteCookie (headers, name, attributes) {
 function getSetCookies (headers) {
   webidl.argumentLengthCheck(arguments, 1, 'getSetCookies')
 
-  brandChecks(headers)
+  brandCheckHeaders(headers)
 
   const cookies = headers.getSetCookie()
 
@@ -31159,7 +36599,7 @@ function parseCookie (cookie) {
 function setCookie (headers, cookie) {
   webidl.argumentLengthCheck(arguments, 2, 'setCookie')
 
-  brandChecks(headers)
+  brandCheckHeaders(headers)
 
   cookie = webidl.converters.Cookie(cookie)
 
@@ -31348,221 +36788,224 @@ function parseSetCookie (header) {
  * @param {Object.<string, unknown>} [cookieAttributeList={}]
  */
 function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) {
-  // 1. If the unparsed-attributes string is empty, skip the rest of
-  //    these steps.
-  if (unparsedAttributes.length === 0) {
-    return cookieAttributeList
-  }
+  while (true) {
+    // 1. If the unparsed-attributes string is empty, skip the rest of
+    //    these steps.
+    if (unparsedAttributes.length === 0) {
+      return cookieAttributeList
+    }
 
-  // 2. Discard the first character of the unparsed-attributes (which
-  //    will be a %x3B (";") character).
-  assert(unparsedAttributes[0] === ';')
-  unparsedAttributes = unparsedAttributes.slice(1)
+    // 2. Discard the first character of the unparsed-attributes (which
+    //    will be a %x3B (";") character).
+    assert(unparsedAttributes[0] === ';')
+    unparsedAttributes = unparsedAttributes.slice(1)
 
-  let cookieAv = ''
+    let cookieAv = ''
 
-  // 3. If the remaining unparsed-attributes contains a %x3B (";")
-  //    character:
-  if (unparsedAttributes.includes(';')) {
+    // 3. If the remaining unparsed-attributes contains a %x3B (";")
+    //    character:
+    if (unparsedAttributes.includes(';')) {
     // 1. Consume the characters of the unparsed-attributes up to, but
     //    not including, the first %x3B (";") character.
-    cookieAv = collectASequenceOfCodePointsFast(
-      ';',
-      unparsedAttributes,
-      { position: 0 }
-    )
-    unparsedAttributes = unparsedAttributes.slice(cookieAv.length)
-  } else {
+      cookieAv = collectASequenceOfCodePointsFast(
+        ';',
+        unparsedAttributes,
+        { position: 0 }
+      )
+      unparsedAttributes = unparsedAttributes.slice(cookieAv.length)
+    } else {
     // Otherwise:
 
-    // 1. Consume the remainder of the unparsed-attributes.
-    cookieAv = unparsedAttributes
-    unparsedAttributes = ''
-  }
+      // 1. Consume the remainder of the unparsed-attributes.
+      cookieAv = unparsedAttributes
+      unparsedAttributes = ''
+    }
 
-  // Let the cookie-av string be the characters consumed in this step.
+    // Let the cookie-av string be the characters consumed in this step.
 
-  let attributeName = ''
-  let attributeValue = ''
+    let attributeName = ''
+    let attributeValue = ''
 
-  // 4. If the cookie-av string contains a %x3D ("=") character:
-  if (cookieAv.includes('=')) {
+    // 4. If the cookie-av string contains a %x3D ("=") character:
+    if (cookieAv.includes('=')) {
     // 1. The (possibly empty) attribute-name string consists of the
     //    characters up to, but not including, the first %x3D ("=")
     //    character, and the (possibly empty) attribute-value string
     //    consists of the characters after the first %x3D ("=")
     //    character.
-    const position = { position: 0 }
+      const position = { position: 0 }
 
-    attributeName = collectASequenceOfCodePointsFast(
-      '=',
-      cookieAv,
-      position
-    )
-    attributeValue = cookieAv.slice(position.position + 1)
-  } else {
+      attributeName = collectASequenceOfCodePointsFast(
+        '=',
+        cookieAv,
+        position
+      )
+      attributeValue = cookieAv.slice(position.position + 1)
+    } else {
     // Otherwise:
 
-    // 1. The attribute-name string consists of the entire cookie-av
-    //    string, and the attribute-value string is empty.
-    attributeName = cookieAv
-  }
+      // 1. The attribute-name string consists of the entire cookie-av
+      //    string, and the attribute-value string is empty.
+      attributeName = cookieAv
+    }
 
-  // 5. Remove any leading or trailing WSP characters from the attribute-
-  //    name string and the attribute-value string.
-  attributeName = attributeName.trim()
-  attributeValue = attributeValue.trim()
+    // 5. Remove any leading or trailing WSP characters from the attribute-
+    //    name string and the attribute-value string.
+    attributeName = attributeName.trim()
+    attributeValue = attributeValue.trim()
 
-  // 6. If the attribute-value is longer than 1024 octets, ignore the
-  //    cookie-av string and return to Step 1 of this algorithm.
-  if (attributeValue.length > maxAttributeValueSize) {
-    return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
-  }
+    // 6. If the attribute-value is longer than 1024 octets, ignore the
+    //    cookie-av string and return to Step 1 of this algorithm.
+    if (attributeValue.length > maxAttributeValueSize) {
+      continue
+    }
 
-  // 7. Process the attribute-name and attribute-value according to the
-  //    requirements in the following subsections.  (Notice that
-  //    attributes with unrecognized attribute-names are ignored.)
-  const attributeNameLowercase = attributeName.toLowerCase()
+    // 7. Process the attribute-name and attribute-value according to the
+    //    requirements in the following subsections.  (Notice that
+    //    attributes with unrecognized attribute-names are ignored.)
+    const attributeNameLowercase = attributeName.toLowerCase()
 
-  // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.1
-  // If the attribute-name case-insensitively matches the string
-  // "Expires", the user agent MUST process the cookie-av as follows.
-  if (attributeNameLowercase === 'expires') {
+    // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.1
+    // If the attribute-name case-insensitively matches the string
+    // "Expires", the user agent MUST process the cookie-av as follows.
+    if (attributeNameLowercase === 'expires') {
     // 1. Let the expiry-time be the result of parsing the attribute-value
     //    as cookie-date (see Section 5.1.1).
-    const expiryTime = new Date(attributeValue)
+      const expiryTime = new Date(attributeValue)
 
-    // 2. If the attribute-value failed to parse as a cookie date, ignore
-    //    the cookie-av.
-    if (!Number.isNaN(expiryTime.getTime())) {
-      cookieAttributeList.expires = expiryTime
-    }
-  } else if (attributeNameLowercase === 'max-age') {
+      // 2. If the attribute-value failed to parse as a cookie date, ignore
+      //    the cookie-av.
+      if (!Number.isNaN(expiryTime.getTime())) {
+        cookieAttributeList.expires = expiryTime
+      }
+    } else if (attributeNameLowercase === 'max-age') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.2
     // If the attribute-name case-insensitively matches the string "Max-
     // Age", the user agent MUST process the cookie-av as follows.
 
-    // 1. If the first character of the attribute-value is not a DIGIT or a
-    //    "-" character, ignore the cookie-av.
-    const charCode = attributeValue.charCodeAt(0)
+      // 1. If the first character of the attribute-value is not a DIGIT or a
+      //    "-" character, ignore the cookie-av.
+      const charCode = attributeValue.charCodeAt(0)
+      const startsWithDigit = charCode >= 48 && charCode <= 57
+      const startsWithSignedDigit = attributeValue[0] === '-' && attributeValue.length > 1
 
-    if ((charCode < 48 || charCode > 57) && attributeValue[0] !== '-') {
-      return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
-    }
+      if (!startsWithDigit && !startsWithSignedDigit) {
+        continue
+      }
 
-    // 2. If the remainder of attribute-value contains a non-DIGIT
-    //    character, ignore the cookie-av.
-    if (!/^\d+$/.test(attributeValue)) {
-      return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
-    }
+      // 2. If the remainder of attribute-value contains a non-DIGIT
+      //    character, ignore the cookie-av.
+      if (/[^\d]/.test(attributeValue.slice(1))) {
+        continue
+      }
 
-    // 3. Let delta-seconds be the attribute-value converted to an integer.
-    const deltaSeconds = Number(attributeValue)
+      // 3. Let delta-seconds be the attribute-value converted to an integer.
+      const deltaSeconds = Number(attributeValue)
 
-    // 4. Let cookie-age-limit be the maximum age of the cookie (which
-    //    SHOULD be 400 days or less, see Section 4.1.2.2).
+      // 4. Let cookie-age-limit be the maximum age of the cookie (which
+      //    SHOULD be 400 days or less, see Section 4.1.2.2).
 
-    // 5. Set delta-seconds to the smaller of its present value and cookie-
-    //    age-limit.
-    // deltaSeconds = Math.min(deltaSeconds * 1000, maxExpiresMs)
+      // 5. Set delta-seconds to the smaller of its present value and cookie-
+      //    age-limit.
+      // deltaSeconds = Math.min(deltaSeconds * 1000, maxExpiresMs)
 
-    // 6. If delta-seconds is less than or equal to zero (0), let expiry-
-    //    time be the earliest representable date and time.  Otherwise, let
-    //    the expiry-time be the current date and time plus delta-seconds
-    //    seconds.
-    // const expiryTime = deltaSeconds <= 0 ? Date.now() : Date.now() + deltaSeconds
+      // 6. If delta-seconds is less than or equal to zero (0), let expiry-
+      //    time be the earliest representable date and time.  Otherwise, let
+      //    the expiry-time be the current date and time plus delta-seconds
+      //    seconds.
+      // const expiryTime = deltaSeconds <= 0 ? Date.now() : Date.now() + deltaSeconds
 
-    // 7. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of Max-Age and an attribute-value of expiry-time.
-    cookieAttributeList.maxAge = deltaSeconds
-  } else if (attributeNameLowercase === 'domain') {
+      // 7. Append an attribute to the cookie-attribute-list with an
+      //    attribute-name of Max-Age and an attribute-value of expiry-time.
+      cookieAttributeList.maxAge = deltaSeconds
+    } else if (attributeNameLowercase === 'domain') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.3
     // If the attribute-name case-insensitively matches the string "Domain",
     // the user agent MUST process the cookie-av as follows.
 
-    // 1. Let cookie-domain be the attribute-value.
-    let cookieDomain = attributeValue
+      // 1. Let cookie-domain be the attribute-value.
+      let cookieDomain = attributeValue
 
-    // 2. If cookie-domain starts with %x2E ("."), let cookie-domain be
-    //    cookie-domain without its leading %x2E (".").
-    if (cookieDomain[0] === '.') {
-      cookieDomain = cookieDomain.slice(1)
-    }
+      // 2. If cookie-domain starts with %x2E ("."), let cookie-domain be
+      //    cookie-domain without its leading %x2E (".").
+      if (cookieDomain[0] === '.') {
+        cookieDomain = cookieDomain.slice(1)
+      }
 
-    // 3. Convert the cookie-domain to lower case.
-    cookieDomain = cookieDomain.toLowerCase()
+      // 3. Convert the cookie-domain to lower case.
+      cookieDomain = cookieDomain.toLowerCase()
 
-    // 4. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of Domain and an attribute-value of cookie-domain.
-    cookieAttributeList.domain = cookieDomain
-  } else if (attributeNameLowercase === 'path') {
+      // 4. Append an attribute to the cookie-attribute-list with an
+      //    attribute-name of Domain and an attribute-value of cookie-domain.
+      cookieAttributeList.domain = cookieDomain
+    } else if (attributeNameLowercase === 'path') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.4
     // If the attribute-name case-insensitively matches the string "Path",
     // the user agent MUST process the cookie-av as follows.
 
-    // 1. If the attribute-value is empty or if the first character of the
-    //    attribute-value is not %x2F ("/"):
-    let cookiePath = ''
-    if (attributeValue.length === 0 || attributeValue[0] !== '/') {
+      // 1. If the attribute-value is empty or if the first character of the
+      //    attribute-value is not %x2F ("/"):
+      let cookiePath = ''
+      if (attributeValue.length === 0 || attributeValue[0] !== '/') {
       // 1. Let cookie-path be the default-path.
-      cookiePath = '/'
-    } else {
+        cookiePath = '/'
+      } else {
       // Otherwise:
 
-      // 1. Let cookie-path be the attribute-value.
-      cookiePath = attributeValue
-    }
+        // 1. Let cookie-path be the attribute-value.
+        cookiePath = attributeValue
+      }
 
-    // 2. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of Path and an attribute-value of cookie-path.
-    cookieAttributeList.path = cookiePath
-  } else if (attributeNameLowercase === 'secure') {
+      // 2. Append an attribute to the cookie-attribute-list with an
+      //    attribute-name of Path and an attribute-value of cookie-path.
+      cookieAttributeList.path = cookiePath
+    } else if (attributeNameLowercase === 'secure') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.5
     // If the attribute-name case-insensitively matches the string "Secure",
     // the user agent MUST append an attribute to the cookie-attribute-list
     // with an attribute-name of Secure and an empty attribute-value.
 
-    cookieAttributeList.secure = true
-  } else if (attributeNameLowercase === 'httponly') {
+      cookieAttributeList.secure = true
+    } else if (attributeNameLowercase === 'httponly') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.6
     // If the attribute-name case-insensitively matches the string
     // "HttpOnly", the user agent MUST append an attribute to the cookie-
     // attribute-list with an attribute-name of HttpOnly and an empty
     // attribute-value.
 
-    cookieAttributeList.httpOnly = true
-  } else if (attributeNameLowercase === 'samesite') {
+      cookieAttributeList.httpOnly = true
+    } else if (attributeNameLowercase === 'samesite') {
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis#section-5.4.7
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    const attributeValueLowercase = attributeValue.toLowerCase()
+      const attributeValueLowercase = attributeValue.toLowerCase()
 
-    // 1. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of "None".
-    if (attributeValueLowercase === 'none') {
-      cookieAttributeList.sameSite = 'None'
-    } else if (attributeValueLowercase === 'strict') {
+      // 1. If cookie-av's attribute-value is a case-insensitive match for
+      //    "None", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "None".
+      if (attributeValueLowercase === 'none') {
+        cookieAttributeList.sameSite = 'None'
+      } else if (attributeValueLowercase === 'strict') {
       // 2. If cookie-av's attribute-value is a case-insensitive match for
       //    "Strict", append an attribute to the cookie-attribute-list with
       //    an attribute-name of "SameSite" and an attribute-value of
       //    "Strict".
-      cookieAttributeList.sameSite = 'Strict'
-    } else if (attributeValueLowercase === 'lax') {
+        cookieAttributeList.sameSite = 'Strict'
+      } else if (attributeValueLowercase === 'lax') {
       // 3. If cookie-av's attribute-value is a case-insensitive match for
       //    "Lax", append an attribute to the cookie-attribute-list with an
       //    attribute-name of "SameSite" and an attribute-value of "Lax".
-      cookieAttributeList.sameSite = 'Lax'
-    }
-  } else {
-    cookieAttributeList.unparsed ??= []
+        cookieAttributeList.sameSite = 'Lax'
+      }
+    } else {
+      cookieAttributeList.unparsed ??= []
 
-    cookieAttributeList.unparsed.push(`${attributeName}=${attributeValue}`)
-  }
+      cookieAttributeList.unparsed.push(`${attributeName}=${attributeValue}`)
+    }
 
   // 8. Return to Step 1 of this algorithm.
-  return parseUnparsedAttributes(unparsedAttributes, cookieAttributeList)
+  }
 }
 
 module.exports = {
@@ -31893,8 +37336,27 @@ function stringify (cookie) {
     out.push(`Path=${cookie.path}`)
   }
 
-  if (cookie.expires && cookie.expires.toString() !== 'Invalid Date') {
-    out.push(`Expires=${toIMFDate(cookie.expires)}`)
+  // A numeric 0 is the Unix epoch, not an absent value -- the same reason the
+  // Max-Age check above tests the type rather than truthiness.
+  //
+  // expires is Date | number, so the "Invalid Date" check only guards the Date
+  // form. A number that is not a valid time value (NaN, +/-Infinity, or outside
+  // the Date range) would otherwise reach toIMFDate, which splices undefined and
+  // NaN into the header value instead of failing.
+  if (cookie.expires != null) {
+    const expiresMs = cookie.expires instanceof Date
+      ? cookie.expires.getTime()
+      : cookie.expires
+
+    // The largest time value a Date can represent, in milliseconds, i.e.
+    // 100,000,000 days either side of the epoch (ECMA-262 Date Time Values).
+    // Anything within it is safe for toIMFDate to format; anything beyond it
+    // produces an invalid Date and must be ignored instead.
+    const maxTimeValue = 8640000000000000
+
+    if (typeof expiresMs === 'number' && Number.isFinite(expiresMs) && Math.abs(expiresMs) <= maxTimeValue) {
+      out.push(`Expires=${toIMFDate(cookie.expires)}`)
+    }
   }
 
   if (cookie.sameSite) {
@@ -31936,6 +37398,7 @@ module.exports = {
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
+const buffer = __nccwpck_require__(4573)
 const { Transform } = __nccwpck_require__(7075)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(4811)
 
@@ -31960,10 +37423,18 @@ const COLON = 0x3A
  */
 const SPACE = 0x20
 
+const defaultMaxEventSize = buffer.kStringMaxLength
+
 const DATA = Buffer.from('data')
 const EVENT = Buffer.from('event')
 const ID = Buffer.from('id')
 const RETRY = Buffer.from('retry')
+
+// Each data field creates a string node, and each unconsumed input chunk keeps
+// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+const minParserItems = 1024
+const maxParserItems = 131072
+const bytesPerParserItem = 128
 
 function isASCIINumberBytes (buffer, start) {
   if (start >= buffer.length) {
@@ -32001,6 +37472,12 @@ function isFieldName (line, length, field) {
   }
 
   return true
+}
+
+function createMaxEventSizeExceededError () {
+  const error = new Error('EventSource message size exceeded')
+  error.aborted = false
+  return error
 }
 
 /**
@@ -32051,6 +37528,13 @@ class EventSourceStream extends Transform {
   pos = 0
   lineChunkIndex = 0
   linePos = 0
+  lineLength = 0
+  eventSize = 0
+  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+  dataLineCount = 0
+  maxEventSize
+  maxDataLines
+  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -32062,6 +37546,7 @@ class EventSourceStream extends Transform {
   /**
    * @param {object} options
    * @param {boolean} [options.readableObjectMode]
+   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} [options.eventSourceSettings]
    * @param {(chunk: any, encoding?: BufferEncoding | undefined) => boolean} [options.push]
    */
@@ -32073,6 +37558,12 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
+    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
+    const parserItemLimit = this.maxEventSize > 0
+      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+      : 0
+    this.maxDataLines = parserItemLimit
+    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -32090,6 +37581,14 @@ class EventSourceStream extends Transform {
       return
     }
 
+    // A leading line ending can immediately release the currently buffered
+    // line, even when it uses the final allowed chunk slot.
+    if (this.maxEventSize > 0 &&
+        this.chunks.length >= this.maxBufferedChunks &&
+        chunk[0] !== LF && chunk[0] !== CR) {
+      callback(createMaxEventSizeExceededError())
+      return
+    }
     this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
@@ -32168,7 +37667,12 @@ class EventSourceStream extends Transform {
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        this.parseLine(this.readLine(), this.event)
+        try {
+          this.parseLine(this.readLine(), this.event)
+        } catch (error) {
+          callback(error)
+          return
+        }
         this.consumeCurrentByte()
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
@@ -32177,10 +37681,23 @@ class EventSourceStream extends Transform {
         continue
       }
 
+      // readLine() is only called after CR or LF. Reject an unfinished line
+      // before it can retain an unbounded number of decoded chunks. The seven
+      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+        callback(createMaxEventSizeExceededError())
+        return
+      }
       this.advanceCursor()
     }
 
     callback()
+  }
+
+  _destroy (error, callback) {
+    this.chunks.length = 0
+    this.clearEvent()
+    super._destroy(error, callback)
   }
 
   /**
@@ -32219,6 +37736,13 @@ class EventSourceStream extends Transform {
     }
 
     if (isFieldName(line, fieldLength, DATA)) {
+      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+        throw createMaxEventSizeExceededError()
+      }
+      const valueBytes = line.length - valueStart
+      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
+      this.setEventFieldSize('data', dataSize)
+
       const value = line.toString('utf8', valueStart)
 
       if (event.data === undefined) {
@@ -32226,11 +37750,13 @@ class EventSourceStream extends Transform {
       } else {
         event.data += `\n${value}`
       }
+      this.dataLineCount++
       return
     }
 
     if (isFieldName(line, fieldLength, RETRY)) {
       if (isASCIINumberBytes(line, valueStart)) {
+        this.setEventFieldSize('retry', line.length - valueStart)
         event.retry = line.toString('utf8', valueStart)
       }
       return
@@ -32238,18 +37764,27 @@ class EventSourceStream extends Transform {
 
     if (isFieldName(line, fieldLength, ID)) {
       if (isValidLastEventIdBytes(line, valueStart)) {
+        this.setEventFieldSize('id', line.length - valueStart)
         event.id = line.toString('utf8', valueStart)
       }
       return
     }
 
     if (isFieldName(line, fieldLength, EVENT)) {
-      const value = line.toString('utf8', valueStart)
-
-      if (value.length > 0) {
-        event.event = value
+      if (valueStart < line.length) {
+        this.setEventFieldSize('event', line.length - valueStart)
+        event.event = line.toString('utf8', valueStart)
       }
     }
+  }
+
+  setEventFieldSize (field, size) {
+    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
+    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+      throw createMaxEventSizeExceededError()
+    }
+    this.eventSize = eventSize
+    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -32282,6 +37817,12 @@ class EventSourceStream extends Transform {
     this.event.event = undefined
     this.event.id = undefined
     this.event.retry = undefined
+    this.eventSize = 0
+    this.dataLineCount = 0
+    this.eventFieldSizes.data = 0
+    this.eventFieldSizes.event = 0
+    this.eventFieldSizes.id = 0
+    this.eventFieldSizes.retry = 0
   }
 
   hasPendingEvent () {
@@ -32317,14 +37858,16 @@ class EventSourceStream extends Transform {
   syncLineStartToCursor () {
     this.lineChunkIndex = this.chunkIndex
     this.linePos = this.pos
+    this.lineLength = 0
     this.dropConsumedChunks()
   }
 
   dropConsumedChunks () {
-    while (this.lineChunkIndex > 0) {
-      this.chunks.shift()
-      this.lineChunkIndex--
-      this.chunkIndex--
+    if (this.lineChunkIndex > 0) {
+      const consumed = this.lineChunkIndex
+      this.chunks.splice(0, consumed)
+      this.lineChunkIndex = 0
+      this.chunkIndex -= consumed
     }
 
     if (this.chunkIndex === this.chunks.length) {
@@ -32445,9 +37988,14 @@ const { EventSourceStream } = __nccwpck_require__(4031)
 const { parseMIMEType } = __nccwpck_require__(1900)
 const { createFastMessageEvent } = __nccwpck_require__(5188)
 const { isNetworkError } = __nccwpck_require__(9051)
-const { kEnumerableProperty } = __nccwpck_require__(3440)
+const { cloneRequest } = __nccwpck_require__(9967)
+const { isValidHeaderValue, kEnumerableProperty } = __nccwpck_require__(3440)
 const { environmentSettingsObject } = __nccwpck_require__(3168)
 const { createPotentialCORSRequest } = __nccwpck_require__(4811)
+const { getGlobalDispatcher } = __nccwpck_require__(2581)
+const { isomorphicDecode } = __nccwpck_require__(8116)
+
+const textEncoder = new TextEncoder()
 
 let experimentalWarned = false
 
@@ -32462,6 +38010,14 @@ let experimentalWarned = false
  * @type {3000}
  */
 const defaultReconnectionTime = 3000
+
+/**
+ * The largest delay setTimeout supports. Larger values (including Infinity)
+ * make Node.js fire the timer after 1 ms instead, which would turn a large
+ * reconnection time into a reconnect storm.
+ * @type {number}
+ */
+const maxReconnectionTime = 2 ** 31 - 1
 
 /**
  * The readyState attribute represents the state of the connection.
@@ -32625,6 +38181,8 @@ class EventSource extends EventTarget {
    * @readonly
    */
   get readyState () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#readyState
   }
 
@@ -32634,6 +38192,8 @@ class EventSource extends EventTarget {
    * @returns {string}
    */
   get url () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#url
   }
 
@@ -32642,6 +38202,8 @@ class EventSource extends EventTarget {
    * instantiated with CORS credentials set (true), or not (false, the default).
    */
   get withCredentials () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#withCredentials
   }
 
@@ -32650,8 +38212,22 @@ class EventSource extends EventTarget {
 
     this.#readyState = CONNECTING
 
+    // Fetch a copy of the request so that every connection starts from the
+    // original request. Fetch mutates the request it is given (URL list,
+    // redirect count, response tainting and, on cross-origin redirects,
+    // headers), so reusing it makes reconnects go to the last redirect
+    // target and, after 20 redirects in total, fail forever.
+    // cloneRequest() shares the URL list, so copy it as well.
+    // 301/308 permanent redirects are handled the same as 302/307 temporary
+    // redirects. While the original EventSource spec required that permanent
+    // redirects be handled, WHATWG removed that requirement and has not
+    // yet opted to restore it... therefore all redirects gets handled the
+    // same.
+    const request = cloneRequest(this.#request)
+    request.urlList = [...this.#request.urlList]
+
     const fetchParams = {
-      request: this.#request,
+      request,
       dispatcher: this.#dispatcher
     }
 
@@ -32719,6 +38295,7 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
+        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -32778,13 +38355,17 @@ class EventSource extends EventTarget {
       //         string, encoded as UTF-8.
       //      2. Set (`Last-Event-ID`, lastEventIDValue) in request's header
       //         list.
+      this.#request.headersList.delete('last-event-id', true)
       if (this.#state.lastEventId.length) {
-        this.#request.headersList.set('last-event-id', this.#state.lastEventId, true)
+        const lastEventId = isomorphicDecode(textEncoder.encode(this.#state.lastEventId))
+        if (isValidHeaderValue(lastEventId)) {
+          this.#request.headersList.set('last-event-id', lastEventId, true)
+        }
       }
 
       //   4. Fetch request and process the response obtained in this fashion, if any, as described earlier in this section.
       this.#connect()
-    }, this.#state.reconnectionTime)?.unref()
+    }, Math.min(this.#state.reconnectionTime, maxReconnectionTime))?.unref()
   }
 
   /**
@@ -32792,7 +38373,7 @@ class EventSource extends EventTarget {
    * CLOSED.
    */
   close () {
-    webidl.brandCheck(this, EventSource)
+    webidl.brandCheck(this, webidl.is.EventSource)
 
     if (this.#readyState === CLOSED) return
     this.#readyState = CLOSED
@@ -32801,10 +38382,14 @@ class EventSource extends EventTarget {
   }
 
   get onopen () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#events.open
   }
 
   set onopen (fn) {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     if (this.#events.open) {
       this.removeEventListener('open', this.#events.open)
     }
@@ -32820,10 +38405,14 @@ class EventSource extends EventTarget {
   }
 
   get onmessage () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#events.message
   }
 
   set onmessage (fn) {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     if (this.#events.message) {
       this.removeEventListener('message', this.#events.message)
     }
@@ -32839,10 +38428,14 @@ class EventSource extends EventTarget {
   }
 
   get onerror () {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     return this.#events.error
   }
 
   set onerror (fn) {
+    webidl.brandCheck(this, webidl.is.EventSource)
+
     if (this.#events.error) {
       this.removeEventListener('error', this.#events.error)
     }
@@ -32854,6 +38447,12 @@ class EventSource extends EventTarget {
       this.#events.error = fn
     } else {
       this.#events.error = null
+    }
+  }
+
+  static {
+    webidl.is.EventSource = (arg) => {
+      return arg != null && typeof arg === 'object' && #events in arg
     }
   }
 }
@@ -32903,7 +38502,8 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any
+    converter: webidl.converters.any,
+    defaultValue: () => getGlobalDispatcher()
   },
   {
     key: 'node', // undici only
@@ -33004,7 +38604,6 @@ module.exports = {
 
 const util = __nccwpck_require__(3440)
 const {
-  ReadableStreamFrom,
   readableStreamClose,
   fullyReadBody,
   extractMimeType
@@ -33042,7 +38641,6 @@ const streamRegistry = new FinalizationRegistry((weakRef) => {
 function extractBody (object, keepalive = false) {
   // 1. Let stream be null.
   let stream = null
-  let controller = null
 
   // 2. If object is a ReadableStream object, then set stream to object.
   if (webidl.is.ReadableStream(object)) {
@@ -33055,11 +38653,44 @@ function extractBody (object, keepalive = false) {
     // 4. Otherwise, set stream to a new ReadableStream object, and set
     //    up stream with byte reading support.
     stream = new ReadableStream({
-      pull () {},
-      start (c) {
-        controller = c
+      start () {},
+      async pull (controller) {
+        // 19.1. Run action.
+        const result = action()
+
+        const iterator = result?.[Symbol.asyncIterator]?.()
+        if (iterator == null) {
+          // 19.2. Whenever one or more bytes are available and stream is not errored,
+          // enqueue the result of creating a Uint8Array from the available bytes into stream.
+          if (result?.length && !isErrored(stream)) {
+            controller.enqueue(typeof result === 'string' ? textEncoder.encode(result) : new Uint8Array(result))
+          }
+
+          // 19.3. When running action is done, close stream.
+          queueMicrotask(() => readableStreamClose(controller))
+          return
+        }
+
+        while (true) {
+          const { value, done } = await iterator.next()
+
+          // 19.3. When running action is done, close stream.
+          if (done) {
+            queueMicrotask(() => readableStreamClose(controller))
+            return
+          }
+
+          // 19.2. Whenever one or more bytes are available and stream is not errored,
+          // enqueue the result of creating a Uint8Array from the available bytes into stream.
+          if (value.length && !isErrored(stream)) {
+            controller.enqueue(new Uint8Array(value))
+            return
+          }
+        }
       },
-      cancel () {},
+      cancel (reason) {
+        return action()[Symbol.asyncIterator]?.().return(reason)
+      },
       type: 'bytes'
     })
   }
@@ -33158,7 +38789,7 @@ function extractBody (object, keepalive = false) {
     // Set source to object.
     source = object
 
-    action = async function * () {
+    const parts = (async function * () {
       for (const part of blobParts) {
         if (part.stream) {
           yield * part.stream()
@@ -33166,7 +38797,8 @@ function extractBody (object, keepalive = false) {
           yield part
         }
       }
-    }
+    })()
+    action = () => parts
 
     // Set type to `multipart/form-data; boundary=`,
     // followed by the multipart/form-data boundary string generated
@@ -33199,49 +38831,53 @@ function extractBody (object, keepalive = false) {
       )
     }
 
-    stream =
-      webidl.is.ReadableStream(object) ? object : ReadableStreamFrom(object)
-  }
-
-  // 11. If source is a byte sequence, then set action to a
-  // step that returns source and length to source’s length.
-  if (typeof source === 'string' || isUint8Array(source)) {
-    action = () => {
-      length = typeof source === 'string' ? Buffer.byteLength(source) : source.length
-      return source
+    if (webidl.is.ReadableStream(object)) {
+      stream = object
+    } else {
+      const reader = ReadableStream.from(object).getReader()
+      let cancelled = false
+      // Do not pull from the iterable until the body is read.
+      stream = new ReadableStream({
+        async pull (controller) {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (cancelled) {
+              return
+            }
+            if (done) {
+              controller.close()
+              return
+            }
+            const bytes = isUint8Array(value) ? value : Buffer.from(value)
+            if (bytes.byteLength) {
+              controller.enqueue(bytes)
+              return
+            }
+          }
+        },
+        cancel (reason) {
+          cancelled = true
+          return reader.cancel(reason)
+        }
+      }, { highWaterMark: 0 })
     }
   }
 
-  // 12. If action is non-null, then run these steps in parallel:
-  if (action != null) {
-    ;(async () => {
-      // 1. Run action.
-      const result = action()
-
-      // 2. Whenever one or more bytes are available and stream is not errored,
-      //    enqueue the result of creating a Uint8Array from the available bytes into stream.
-      const iterator = result?.[Symbol.asyncIterator]?.()
-      if (iterator) {
-        for await (const bytes of iterator) {
-          if (isErrored(stream)) break
-          if (bytes.length) {
-            controller.enqueue(new Uint8Array(bytes))
-          }
-        }
-      } else if (result?.length && !isErrored(stream)) {
-        controller.enqueue(typeof result === 'string' ? textEncoder.encode(result) : new Uint8Array(result))
-      }
-
-      // 3. When running action is done, close stream.
-      queueMicrotask(() => readableStreamClose(controller))
-    })()
+  // 18. If source is a byte sequence, then set action to a
+  // step that returns source and length to source’s length.
+  if (typeof source === 'string' || isUint8Array(source)) {
+    action = () => source
+    length = typeof source === 'string' ? Buffer.byteLength(source) : source.length
   }
 
-  // 13. Let body be a body whose stream is stream, source is source,
+  // 19. If action is non-null, then run these steps in parallel:
+  // Note: this is done in the pull method of the stream created above
+
+  // 20. Let body be a body whose stream is stream, source is source,
   // and length is length.
   const body = { stream, source, length }
 
-  // 14. Return (body, type).
+  // 21. Return (body, type).
   return [body, type]
 }
 
@@ -33295,7 +38931,7 @@ function cloneBody (body) {
   }
 }
 
-function bodyMixinMethods (instance, getInternalState) {
+function bodyMixinMethods (brandCheck, getInternalState) {
   const methods = {
     blob () {
       // The blob() method steps are to return the result of
@@ -33315,7 +38951,7 @@ function bodyMixinMethods (instance, getInternalState) {
         // Return a Blob whose contents are bytes and type attribute
         // is mimeType.
         return new Blob([bytes], { type: mimeType })
-      }, instance, getInternalState)
+      }, brandCheck, getInternalState)
     },
 
     arrayBuffer () {
@@ -33325,19 +38961,19 @@ function bodyMixinMethods (instance, getInternalState) {
       // whose contents are bytes.
       return consumeBody(this, (bytes) => {
         return new Uint8Array(bytes).buffer
-      }, instance, getInternalState)
+      }, brandCheck, getInternalState)
     },
 
     text () {
       // The text() method steps are to return the result of running
       // consume body with this and UTF-8 decode.
-      return consumeBody(this, utf8DecodeBytes, instance, getInternalState)
+      return consumeBody(this, utf8DecodeBytes, brandCheck, getInternalState)
     },
 
     json () {
       // The json() method steps are to return the result of running
       // consume body with this and parse JSON from bytes.
-      return consumeBody(this, parseJSONFromBytes, instance, getInternalState)
+      return consumeBody(this, parseJSONFromBytes, brandCheck, getInternalState)
     },
 
     formData () {
@@ -33385,7 +39021,7 @@ function bodyMixinMethods (instance, getInternalState) {
         throw new TypeError(
           'Content-Type was not one of "multipart/form-data" or "application/x-www-form-urlencoded".'
         )
-      }, instance, getInternalState)
+      }, brandCheck, getInternalState)
     },
 
     bytes () {
@@ -33394,7 +39030,7 @@ function bodyMixinMethods (instance, getInternalState) {
       // result of creating a Uint8Array from bytes in this’s relevant realm.
       return consumeBody(this, (bytes) => {
         return new Uint8Array(bytes)
-      }, instance, getInternalState)
+      }, brandCheck, getInternalState)
     },
 
     textStream () {
@@ -33444,20 +39080,20 @@ function bodyMixinMethods (instance, getInternalState) {
   return methods
 }
 
-function mixinBody (prototype, getInternalState) {
-  Object.assign(prototype.prototype, bodyMixinMethods(prototype, getInternalState))
+function mixinBody (prototype, getInternalState, brandCheck) {
+  Object.assign(prototype.prototype, bodyMixinMethods(brandCheck, getInternalState))
 }
 
 /**
  * @see https://fetch.spec.whatwg.org/#concept-body-consume-body
  * @param {any} object internal state
  * @param {(value: unknown) => unknown} convertBytesToJSValue
- * @param {any} instance
+ * @param {import('../../../types/webidl').WebidlIsFunction} brandCheck
  * @param {(target: any) => any} getInternalState
  */
-function consumeBody (object, convertBytesToJSValue, instance, getInternalState) {
+function consumeBody (object, convertBytesToJSValue, brandCheck, getInternalState) {
   try {
-    webidl.brandCheck(object, instance)
+    webidl.brandCheck(object, brandCheck)
   } catch (e) {
     return Promise.reject(e)
   }
@@ -33695,14 +39331,14 @@ module.exports = {
 
 
 const assert = __nccwpck_require__(4589)
-const { forgivingBase64, collectASequenceOfCodePoints, collectASequenceOfCodePointsFast, isomorphicDecode, removeASCIIWhitespace, removeChars } = __nccwpck_require__(8116)
+const { asciiLowercase, forgivingBase64, collectASequenceOfCodePoints, collectASequenceOfCodePointsFast, isomorphicDecode, removeASCIIWhitespace, removeChars } = __nccwpck_require__(8116)
 
 const encoder = new TextEncoder()
 
 /**
  * @see https://mimesniff.spec.whatwg.org/#http-token-code-point
  */
-const HTTP_TOKEN_CODEPOINTS = /^[-!#$%&'*+.^_|~A-Za-z0-9]+$/u
+const HTTP_TOKEN_CODEPOINTS = /^[-!#$%&'*+.^_`|~A-Za-z0-9]+$/u
 const HTTP_WHITESPACE_REGEX = /[\u000A\u000D\u0009\u0020]/u // eslint-disable-line
 
 /**
@@ -33763,7 +39399,7 @@ function dataURLProcessor (dataURL) {
   // 11. If mimeType ends with U+003B (;), followed by
   // zero or more U+0020 SPACE, followed by an ASCII
   // case-insensitive match for "base64", then:
-  if (/;(?:\u0020*)base64$/ui.test(mimeType)) {
+  if (/;\u0020*[Bb][Aa][Ss][Ee]64$/u.test(mimeType)) {
     // 1. Let stringBody be the isomorphic decode of body.
     const stringBody = isomorphicDecode(body)
 
@@ -33962,8 +39598,8 @@ function parseMIMEType (input) {
     return 'failure'
   }
 
-  const typeLowercase = type.toLowerCase()
-  const subtypeLowercase = subtype.toLowerCase()
+  const typeLowercase = asciiLowercase(type)
+  const subtypeLowercase = asciiLowercase(subtype)
 
   // 10. Let mimeType be a new MIME type record whose type
   // is type, in ASCII lowercase, and subtype is subtype,
@@ -34003,7 +39639,7 @@ function parseMIMEType (input) {
 
     // 4. Set parameterName to parameterName, in ASCII
     // lowercase.
-    parameterName = parameterName.toLowerCase()
+    parameterName = asciiLowercase(parameterName)
 
     // 5. If position is not past the end of input, then:
     if (position.position < input.length) {
@@ -34558,19 +40194,27 @@ function parseContentDispositionAttribute (input, position) {
       position
     )
 
-    // Check for utf-8'' prefix (case insensitive)
+    const charsetSeparator = headerValue.indexOf(0x27)
+    const languageSeparator = charsetSeparator === -1
+      ? -1
+      : headerValue.indexOf(0x27, charsetSeparator + 1)
+
+    if (charsetSeparator === -1 || languageSeparator === -1) {
+      throw parsingError('expected charset and language separators in extended value')
+    }
+
     if (
+      charsetSeparator !== 5 ||
       (headerValue[0] !== 0x75 && headerValue[0] !== 0x55) || // u or U
       (headerValue[1] !== 0x74 && headerValue[1] !== 0x54) || // t or T
       (headerValue[2] !== 0x66 && headerValue[2] !== 0x46) || // f or F
       headerValue[3] !== 0x2d || // -
       headerValue[4] !== 0x38 // 8
     ) {
-      throw parsingError('unknown encoding, expected utf-8\'\'')
+      throw parsingError('unknown charset, expected utf-8')
     }
 
-    // Skip utf-8'' and decode the rest
-    value = decodeURIComponent(decoder.decode(headerValue.subarray(7)))
+    value = decodeURIComponent(decoder.decode(headerValue.subarray(languageSeparator + 1)))
   } else if (input[position.position] === 0x22 /* " */) {
     // Quoted string
     position.position++ // skip opening quote
@@ -34900,6 +40544,8 @@ const random = runtimeFeatures.has('crypto')
   ? (__nccwpck_require__(7598).randomInt)
   : (max) => Math.floor(Math.random() * max)
 
+let getFormDataState, setFormDataState, getFormDataBoundary
+
 // https://xhr.spec.whatwg.org/#formdata
 class FormData {
   #state = []
@@ -34918,7 +40564,7 @@ class FormData {
   }
 
   append (name, value, filename = undefined) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.append'
     webidl.argumentLengthCheck(arguments, 2, prefix)
@@ -34946,7 +40592,7 @@ class FormData {
   }
 
   delete (name) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.delete'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -34959,7 +40605,7 @@ class FormData {
   }
 
   get (name) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.get'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -34979,7 +40625,7 @@ class FormData {
   }
 
   getAll (name) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.getAll'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -34996,7 +40642,7 @@ class FormData {
   }
 
   has (name) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.has'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -35009,7 +40655,7 @@ class FormData {
   }
 
   set (name, value, filename = undefined) {
-    webidl.brandCheck(this, FormData)
+    webidl.brandCheck(this, webidl.is.FormData)
 
     const prefix = 'FormData.set'
     webidl.argumentLengthCheck(arguments, 2, prefix)
@@ -35074,40 +40720,34 @@ class FormData {
     return `FormData ${output.slice(output.indexOf(']') + 2)}`
   }
 
-  /**
-   * @param {FormData} formData
-   */
-  static getFormDataState (formData) {
-    return formData.#state
-  }
+  static {
+    /** @param {FormData} formData  */
+    getFormDataState = (formData) => formData.#state
 
-  /**
-   * @param {FormData} formData
-   * @param {any[]} newState
-   */
-  static setFormDataState (formData, newState) {
-    formData.#state = newState
-  }
+    /**
+     * @param {FormData} formData
+     * @param {any[]} newState
+     */
+    setFormDataState = (formData, newState) => {
+      formData.#state = newState
+    }
 
-  /**
-   * @param {FormData} formData
-   * @returns {string | null}
-   */
-  static getFormDataBoundary (formData) {
-    const boundary = formData.#boundary
-    if (boundary != null) return boundary
+    /**
+     * @param {FormData} formData
+     * @returns {string | null}
+     */
+    getFormDataBoundary = (formData) => {
+      // eslint-disable-next-line no-return-assign
+      return formData.#boundary ??= `----formdata-undici-0${`${random(1e11)}`.padStart(11, '0')}`
+    }
 
-    // eslint-disable-next-line no-return-assign
-    return formData.#boundary = `----formdata-undici-0${`${random(1e11)}`.padStart(11, '0')}`
+    webidl.is.FormData = (arg) => {
+      return arg != null && typeof arg === 'object' && #state in arg
+    }
   }
 }
 
-const { getFormDataState, setFormDataState, getFormDataBoundary } = FormData
-Reflect.deleteProperty(FormData, 'getFormDataState')
-Reflect.deleteProperty(FormData, 'setFormDataState')
-Reflect.deleteProperty(FormData, 'getFormDataBoundary')
-
-iteratorMixin('FormData', FormData, getFormDataState, 'name', 'value')
+iteratorMixin('FormData', FormData, getFormDataState, 'name', 'value', webidl.is.FormData)
 
 Object.defineProperties(FormData.prototype, {
   append: kEnumerableProperty,
@@ -35162,8 +40802,6 @@ function makeEntry (name, value, filename) {
   // 4. Return an entry whose name is name and whose value is value.
   return { name, value }
 }
-
-webidl.is.FormData = webidl.util.MakeTypeAssertion(FormData)
 
 module.exports = { FormData, makeEntry, setFormDataState, getFormDataBoundary }
 
@@ -35225,7 +40863,7 @@ module.exports = {
 
 
 const { kConstruct } = __nccwpck_require__(6443)
-const { kEnumerableProperty } = __nccwpck_require__(3440)
+const { kEnumerableProperty, setHeader } = __nccwpck_require__(3440)
 const {
   iteratorMixin,
   isValidHeaderName,
@@ -35542,7 +41180,7 @@ class HeadersList {
 
     if (this.headersMap.size !== 0) {
       for (const { name, value } of this.headersMap.values()) {
-        headers[name] = value
+        setHeader(headers, name, value)
       }
     }
 
@@ -35645,6 +41283,8 @@ class HeadersList {
   }
 }
 
+let getHeadersGuard, setHeadersGuard, getHeadersList, setHeadersList
+
 // https://fetch.spec.whatwg.org/#headers-class
 class Headers {
   #guard
@@ -35680,7 +41320,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-append
   append (name, value) {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     webidl.argumentLengthCheck(arguments, 2, 'Headers.append')
 
@@ -35693,7 +41333,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-delete
   delete (name) {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     webidl.argumentLengthCheck(arguments, 1, 'Headers.delete')
 
@@ -35737,7 +41377,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-get
   get (name) {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     webidl.argumentLengthCheck(arguments, 1, 'Headers.get')
 
@@ -35760,7 +41400,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-has
   has (name) {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     webidl.argumentLengthCheck(arguments, 1, 'Headers.has')
 
@@ -35783,7 +41423,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-set
   set (name, value) {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     webidl.argumentLengthCheck(arguments, 2, 'Headers.set')
 
@@ -35831,7 +41471,7 @@ class Headers {
 
   // https://fetch.spec.whatwg.org/#dom-headers-getsetcookie
   getSetCookie () {
-    webidl.brandCheck(this, Headers)
+    webidl.brandCheck(this, webidl.is.Headers)
 
     // 1. If this’s header list does not contain `Set-Cookie`, then return « ».
     // 2. Return the values of all headers in this’s header list whose name is
@@ -35852,37 +41492,38 @@ class Headers {
     return `Headers ${util.formatWithOptions(options, this.#headersList.entries)}`
   }
 
-  static getHeadersGuard (o) {
-    return o.#guard
-  }
+  static {
+    /** @param {Headers} headers */
+    getHeadersGuard = (headers) => headers.#guard
 
-  static setHeadersGuard (o, guard) {
-    o.#guard = guard
-  }
+    /**
+     * @param {Headers} headers
+     * @param {string} guard
+     */
+    setHeadersGuard = (headers, guard) => {
+      headers.#guard = guard
+    }
 
-  /**
-   * @param {Headers} o
-   */
-  static getHeadersList (o) {
-    return o.#headersList
-  }
+    /**
+     * @param {Headers} headers
+     */
+    getHeadersList = (headers) => headers.#headersList
 
-  /**
-   * @param {Headers} target
-   * @param {HeadersList} list
-   */
-  static setHeadersList (target, list) {
-    target.#headersList = list
+    /**
+     * @param {Headers} target
+     * @param {HeadersList} list
+     */
+    setHeadersList = (target, list) => {
+      target.#headersList = list
+    }
+
+    webidl.is.Headers = (arg) => {
+      return arg != null && typeof arg === 'object' && #guard in arg
+    }
   }
 }
 
-const { getHeadersGuard, setHeadersGuard, getHeadersList, setHeadersList } = Headers
-Reflect.deleteProperty(Headers, 'getHeadersGuard')
-Reflect.deleteProperty(Headers, 'setHeadersGuard')
-Reflect.deleteProperty(Headers, 'getHeadersList')
-Reflect.deleteProperty(Headers, 'setHeadersList')
-
-iteratorMixin('Headers', Headers, headersListSortAndCombine, 0, 1)
+iteratorMixin('Headers', Headers, headersListSortAndCombine, 0, 1, webidl.is.Headers)
 
 Object.defineProperties(Headers.prototype, {
   append: kEnumerableProperty,
@@ -36007,6 +41648,7 @@ const {
 const EE = __nccwpck_require__(8474)
 const { Readable, pipeline, finished, isErrored, isReadable } = __nccwpck_require__(7075)
 const { addAbortListener, bufferToLowerCasedHeaderName } = __nccwpck_require__(3440)
+const { SocketError } = __nccwpck_require__(8707)
 const { dataURLProcessor, serializeAMimeType, minimizeSupportedMimeType } = __nccwpck_require__(1900)
 const { getGlobalDispatcher } = __nccwpck_require__(2581)
 const { webidl } = __nccwpck_require__(7879)
@@ -36237,10 +41879,7 @@ function fetch (input, init = undefined) {
       cleanupAbortListeners()
     },
     processResponse,
-    dispatcher: getRequestDispatcher(requestObject), // undici
-    // Keep requestObject alive to prevent its AbortController from being GC'd
-    // See https://github.com/nodejs/undici/issues/4627
-    requestObject
+    dispatcher: getRequestDispatcher(requestObject) // undici
   })
 
   // 14. Return p.
@@ -36359,8 +41998,7 @@ function fetching ({
   processResponseEndOfBody,
   processResponseConsumeBody,
   useParallelQueue = false,
-  dispatcher = getGlobalDispatcher(), // undici
-  requestObject = null // Keep alive to prevent AbortController GC, see #4627
+  dispatcher = getGlobalDispatcher() // undici
 }) {
   // Ensure that the dispatcher is set accordingly
   assert(dispatcher)
@@ -36414,9 +42052,7 @@ function fetching ({
     processResponseConsumeBody,
     processResponseEndOfBody,
     taskDestination,
-    crossOriginIsolatedCapability,
-    // Keep requestObject alive to prevent its AbortController from being GC'd
-    requestObject
+    crossOriginIsolatedCapability
   }
 
   // 7. If request’s body is a byte sequence, then set request’s body to
@@ -36759,11 +42395,8 @@ async function mainFetch (fetchParams, recursive) {
 // https://fetch.spec.whatwg.org/#concept-scheme-fetch
 // given a fetch params fetchParams
 function schemeFetch (fetchParams) {
-  // Note: since the connection is destroyed on redirect, which sets fetchParams to a
-  // cancelled state, we do not want this condition to trigger *unless* there have been
-  // no redirects. See https://github.com/nodejs/undici/issues/1776
   // 1. If fetchParams is canceled, then return the appropriate network error for fetchParams.
-  if (isCancelled(fetchParams) && fetchParams.request.redirectCount === 0) {
+  if (isCancelled(fetchParams)) {
     return Promise.resolve(makeAppropriateNetworkError(fetchParams))
   }
 
@@ -36977,18 +42610,18 @@ function fetchFinale (fetchParams, response) {
   //    `Server-Timing` from response’s internal response’s header list.
   // TODO
 
-  // 3. Let processResponseEndOfBody be the following steps:
+  // 3. If fetchParams’s request’s destination is "document", then set fetchParams’s controller’s
+  //    full timing info to fetchParams’s timing info.
+  if (fetchParams.request.destination === 'document') {
+    fetchParams.controller.fullTimingInfo = timingInfo
+  }
+
+  // 4. Let processResponseEndOfBody be the following steps:
   const processResponseEndOfBody = () => {
     // 1. Let unsafeEndTime be the unsafe shared current time.
     const unsafeEndTime = Date.now() // ?
 
-    // 2. If fetchParams’s request’s destination is "document", then set fetchParams’s controller’s
-    //    full timing info to fetchParams’s timing info.
-    if (fetchParams.request.destination === 'document') {
-      fetchParams.controller.fullTimingInfo = timingInfo
-    }
-
-    // 3. Set fetchParams’s controller’s report timing steps to the following steps given a global object global:
+    // 2. Set fetchParams’s controller’s report timing steps to the following steps given a global object global:
     fetchParams.controller.reportTimingSteps = () => {
       // 1. If fetchParams’s request’s URL’s scheme is not an HTTP(S) scheme, then return.
       if (!urlIsHttpHttpsScheme(fetchParams.request.url)) {
@@ -37037,7 +42670,7 @@ function fetchFinale (fetchParams, response) {
       }
     }
 
-    // 4. Let processResponseEndOfBodyTask be the following steps:
+    // 3. Let processResponseEndOfBodyTask be the following steps:
     const processResponseEndOfBodyTask = () => {
       // 1. Set fetchParams’s request’s done flag.
       fetchParams.request.done = true
@@ -37056,11 +42689,11 @@ function fetchFinale (fetchParams, response) {
       }
     }
 
-    // 5. Queue a fetch task to run processResponseEndOfBodyTask with fetchParams’s task destination
+    // 4. Queue a fetch task to run processResponseEndOfBodyTask with fetchParams’s task destination
     queueMicrotask(() => processResponseEndOfBodyTask())
   }
 
-  // 4. If fetchParams’s process response is non-null, then queue a fetch task to run fetchParams’s
+  // 5. If fetchParams’s process response is non-null, then queue a fetch task to run fetchParams’s
   //    process response given response, with fetchParams’s task destination.
   if (fetchParams.processResponse != null) {
     queueMicrotask(() => {
@@ -37069,11 +42702,14 @@ function fetchFinale (fetchParams, response) {
     })
   }
 
-  // 5. Let internalResponse be response, if response is a network error; otherwise response’s internal response.
+  // 6. Let internalResponse be response, if response is a network error; otherwise response’s internal response.
   const internalResponse = response.type === 'error' ? response : (response.internalResponse ?? response)
 
-  // 6. If internalResponse’s body is null, then run processResponseEndOfBody.
-  // 7. Otherwise:
+  // 7. If response is a network error, then run the WebDriver BiDi fetch error steps with request.
+  //    Otherwise, run the WebDriver BiDi response completed steps with request and response.
+
+  // 8. If internalResponse’s body is null, then run processResponseEndOfBody.
+  // 9. Otherwise:
   if (internalResponse.body == null) {
     processResponseEndOfBody()
   } else {
@@ -37090,6 +42726,27 @@ function fetchFinale (fetchParams, response) {
     finished(internalResponse.body.stream, () => {
       processResponseEndOfBody()
     })
+  }
+
+  // 10. If fetchParams’s process response consume body is non-null, then:
+  if (fetchParams.processResponseConsumeBody != null) {
+    // 1. Let processBody given nullOrBytes be this step: run fetchParams’s
+    //    process response consume body given response and nullOrBytes.
+    const processBody = (nullOrBytes) => fetchParams.processResponseConsumeBody(response, nullOrBytes)
+
+    // 2. Let processBodyError be this step: run fetchParams’s process
+    //    response consume body given response and failure.
+    const processBodyError = () => fetchParams.processResponseConsumeBody(response, 'failure')
+
+    // 3. If internalResponse’s body is null, then queue a fetch task to run
+    //    processBody given null, with fetchParams’s task destination.
+    if (internalResponse.body == null) {
+      queueMicrotask(() => processBody(null))
+    } else {
+      // 4. Otherwise, fully read internalResponse’s body given processBody,
+      //    processBodyError, and fetchParams’s task destination.
+      fullyReadBody(internalResponse.body, processBody, processBodyError)
+    }
   }
 }
 
@@ -37166,7 +42823,7 @@ async function httpFetch (fetchParams) {
     // encouraged to, transmit an RST_STREAM frame.
     // See, https://github.com/whatwg/fetch/issues/1288
     if (request.redirect !== 'manual') {
-      fetchParams.controller.connection.destroy(undefined, false)
+      fetchParams.controller.connection.destroy()
     }
 
     // 2. Switch on request’s redirect mode:
@@ -37775,12 +43432,10 @@ async function httpNetworkFetch (
   fetchParams.controller.connection = {
     abort: null,
     destroyed: false,
-    destroy (err, abort = true) {
+    destroy (err) {
       if (!this.destroyed) {
         this.destroyed = true
-        if (abort) {
-          this.abort?.(err ?? new DOMException('The operation was aborted.', 'AbortError'))
-        }
+        this.abort?.(err ?? new DOMException('The operation was aborted.', 'AbortError'))
       }
     }
   }
@@ -38208,8 +43863,6 @@ async function httpNetworkFetch (
             appendHeadersListFromResponseHeaders(headersList, headers, rawHeaders)
             const location = headersList.get('location', true)
 
-            this.body = new Readable({ read: () => controller.resume() })
-
             const willFollow = location && request.redirect === 'follow' &&
               redirectStatusSet.has(status)
 
@@ -38227,7 +43880,7 @@ async function httpNetworkFetch (
               // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
               const maxContentEncodings = 5
               if (codings.length > maxContentEncodings) {
-                reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+                controller.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
                 return
               }
 
@@ -38256,7 +43909,11 @@ async function httpNetworkFetch (
                 } else if (coding === 'zstd') {
                   decoders.push(zlib.createZstdDecompress({
                     flush: zlib.constants.ZSTD_e_continue,
-                    finishFlush: zlib.constants.ZSTD_e_end
+                    finishFlush: zlib.constants.ZSTD_e_end,
+                    params: {
+                      // https://www.rfc-editor.org/rfc/rfc9659.html#section-3
+                      [zlib.constants.ZSTD_d_windowLogMax]: 23
+                    }
                   }))
                 } else {
                   decoders.length = 0
@@ -38264,6 +43921,8 @@ async function httpNetworkFetch (
                 }
               }
             }
+
+            this.body = new Readable({ read: () => controller.resume() })
 
             const onError = (err) => this.onResponseError(controller, err)
 
@@ -38316,7 +43975,7 @@ async function httpNetworkFetch (
             this.body?.push(null)
           },
 
-          onResponseError (_controller, error) {
+          onResponseError (controller, error) {
             if (this.abort) {
               fetchParams.controller.off('terminated', this.abort)
             }
@@ -38335,7 +43994,9 @@ async function httpNetworkFetch (
 
             this.body?.destroy(error)
 
-            fetchParams.controller.terminate(error)
+            if (!controller?.aborted) {
+              fetchParams.controller.terminate(error)
+            }
 
             reject(error)
           },
@@ -38344,6 +44005,11 @@ async function httpNetworkFetch (
             // We need to support 200 for websocket over h2 as per RFC-8441
             // Absence of session means H1
             if ((socket.session != null && status !== 200) || (socket.session == null && status !== 101)) {
+              if (socket.session != null) {
+                // The server refused the extended CONNECT, and nothing further
+                // will settle this request. Fail the opening handshake here.
+                controller.abort(new SocketError('bad upgrade', null))
+              }
               return false
             }
 
@@ -38407,63 +44073,102 @@ const { webidl } = __nccwpck_require__(7879)
 const { URLSerializer } = __nccwpck_require__(1900)
 const { kConstruct } = __nccwpck_require__(6443)
 const assert = __nccwpck_require__(4589)
-const { getMaxListeners, setMaxListeners, defaultMaxListeners } = __nccwpck_require__(8474)
 
-const kAbortController = Symbol('abortController')
-
-const requestFinalizer = new FinalizationRegistry(({ signal, abort }) => {
-  signal.removeEventListener('abort', abort)
+const requestFinalizer = new FinalizationRegistry(({ signal, reference }) => {
+  removeSignalFollower(signal, reference)
 })
 
-const dependentControllerMap = new WeakMap()
+/**
+ * @typedef {object} RequestSignalState
+ * @property {AbortController} controller
+ * @property {AbortSignal} source
+ * @property {WeakRef<AbortController>} reference
+ */
 
-let abortSignalHasEventHandlerLeakWarning
+/** @type {WeakMap<AbortSignal, RequestSignalState>} */
+const requestSignals = new WeakMap()
 
-try {
-  abortSignalHasEventHandlerLeakWarning = getMaxListeners(new AbortController().signal) > 0
-} catch {
-  abortSignalHasEventHandlerLeakWarning = false
+/** @type {WeakMap<AbortSignal, WeakRef<AbortController> | Set<WeakRef<AbortController>>>} */
+const signalFollowers = new WeakMap()
+
+/**
+ * @param {AbortSignal} signal
+ * @param {WeakRef<AbortController>} reference
+ */
+function removeSignalFollower (signal, reference) {
+  const followers = signalFollowers.get(signal)
+  if (followers instanceof Set) {
+    followers.delete(reference)
+    if (followers.size !== 0) return
+  }
+
+  signal.removeEventListener('abort', abortSignalFollowers)
+  signalFollowers.delete(signal)
 }
 
-function buildAbort (acRef) {
-  return abort
-
-  function abort () {
-    const ac = acRef.deref()
-    if (ac !== undefined) {
-      // Currently, there is a problem with FinalizationRegistry.
-      // https://github.com/nodejs/node/issues/49344
-      // https://github.com/nodejs/node/issues/47748
-      // In the case of abort, the first step is to unregister from it.
-      // If the controller can refer to it, it is still registered.
-      // It will be removed in the future.
-      requestFinalizer.unregister(abort)
-
-      // Unsubscribe a listener.
-      // FinalizationRegistry will no longer be called, so this must be done.
-      this.removeEventListener('abort', abort)
-
-      ac.abort(this.reason)
-
-      const controllerList = dependentControllerMap.get(ac.signal)
-
-      if (controllerList !== undefined) {
-        if (controllerList.size !== 0) {
-          for (const ref of controllerList) {
-            const ctrl = ref.deref()
-            if (ctrl !== undefined) {
-              ctrl.abort(this.reason)
-            }
-          }
-          controllerList.clear()
-        }
-        dependentControllerMap.delete(ac.signal)
-      }
-    }
+/**
+ * @param {WeakRef<AbortController>} reference
+ * @param {unknown} reason
+ */
+function abortSignalFollower (reference, reason) {
+  requestFinalizer.unregister(reference)
+  const ac = reference.deref()
+  if (ac !== undefined) {
+    requestSignals.delete(ac.signal)
+    ac.abort(reason)
   }
 }
 
+/** @this {AbortSignal} */
+function abortSignalFollowers () {
+  this.removeEventListener('abort', abortSignalFollowers)
+  const followers = signalFollowers.get(this)
+  if (followers instanceof Set) {
+    for (const reference of followers) {
+      abortSignalFollower(reference, this.reason)
+    }
+    followers.clear()
+  } else {
+    abortSignalFollower(followers, this.reason)
+  }
+  signalFollowers.delete(this)
+}
+
+/**
+ * @param {AbortSignal | null | undefined} signal
+ */
+function createDependentSignal (signal) {
+  const ac = new AbortController()
+  if (signal == null) return ac.signal
+
+  if (signal.aborted) {
+    ac.abort(signal.reason)
+    return ac.signal
+  }
+
+  const reference = new WeakRef(ac)
+  const followers = signalFollowers.get(signal)
+  if (followers === undefined) {
+    util.addAbortListener(signal, abortSignalFollowers)
+    signalFollowers.set(signal, reference)
+  } else if (followers instanceof WeakRef) {
+    const controllers = new Set()
+    controllers.add(followers)
+    controllers.add(reference)
+    signalFollowers.set(signal, controllers)
+  } else {
+    followers.add(reference)
+  }
+
+  requestFinalizer.register(ac, { signal, reference }, reference)
+
+  // The signal must keep its controller alive even after its Request is collected.
+  requestSignals.set(ac.signal, { controller: ac, source: signal, reference })
+  return ac.signal
+}
+
 let patchMethodWarning = false
+let setRequestSignal, getRequestDispatcher, setRequestDispatcher, setRequestHeaders, getRequestState, setRequestState, removeRequestAbortListener
 
 // https://fetch.spec.whatwg.org/#request-class
 class Request {
@@ -38477,13 +44182,6 @@ class Request {
   #headers
 
   #state
-
-  /**
-   * Removes the `abort` listener that makes this request's signal follow the
-   * passed signal. `null` when no such listener was registered.
-   * @type {(() => void) | null}
-   */
-  #abortCleanup = null
 
   // https://fetch.spec.whatwg.org/#dom-request
   constructor (input, init = undefined) {
@@ -38798,51 +44496,8 @@ class Request {
     // 27. Set this’s request to request.
     this.#state = request
 
-    // 28. Set this’s signal to a new AbortSignal object with this’s relevant
-    // Realm.
-    // TODO: could this be simplified with AbortSignal.any
-    // (https://dom.spec.whatwg.org/#dom-abortsignal-any)
-    const ac = new AbortController()
-    this.#signal = ac.signal
-
-    // 29. If signal is not null, then make this’s signal follow signal.
-    if (signal != null) {
-      if (signal.aborted) {
-        ac.abort(signal.reason)
-      } else {
-        // Keep a strong ref to ac while request object
-        // is alive. This is needed to prevent AbortController
-        // from being prematurely garbage collected.
-        // See, https://github.com/nodejs/undici/issues/1926.
-        this[kAbortController] = ac
-
-        const acRef = new WeakRef(ac)
-        const abort = buildAbort(acRef)
-
-        // If the max amount of listeners is equal to the default, increase it
-        if (abortSignalHasEventHandlerLeakWarning && getMaxListeners(signal) === defaultMaxListeners) {
-          setMaxListeners(1500, signal)
-        }
-
-        const removeAbortListener = util.addAbortListener(signal, abort)
-        // The third argument must be a registry key to be unregistered.
-        // Without it, you cannot unregister.
-        // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/FinalizationRegistry
-        // abort is used as the unregister key. (because it is unique)
-        requestFinalizer.register(ac, { signal, abort }, abort)
-
-        // Allow the listener to be removed deterministically once the fetch
-        // that owns this request has settled, instead of relying solely on the
-        // FinalizationRegistry (i.e. garbage collection). Reusing a single
-        // signal across many requests would otherwise leak listeners.
-        // See https://github.com/nodejs/undici/issues/5285
-        this.#abortCleanup = () => {
-          requestFinalizer.unregister(abort)
-          removeAbortListener()
-          this.#abortCleanup = null
-        }
-      }
-    }
+    // 28-29. Create a signal that follows the supplied signal, if any.
+    this.#signal = createDependentSignal(signal)
 
     // 30. Set this’s headers to a new Headers object with this’s relevant
     // Realm, whose header list is request’s header list and guard is
@@ -38981,7 +44636,7 @@ class Request {
 
   // Returns request’s HTTP method, which is "GET" by default.
   get method () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The method getter steps are to return this’s request’s method.
     return this.#state.method
@@ -38989,7 +44644,7 @@ class Request {
 
   // Returns the URL of request as a string.
   get url () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The url getter steps are to return this’s request’s URL, serialized.
     return URLSerializer(this.#state.url)
@@ -38999,7 +44654,7 @@ class Request {
   // Note that headers added in the network layer by the user agent will not
   // be accounted for in this object, e.g., the "Host" header.
   get headers () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The headers getter steps are to return this’s headers.
     return this.#headers
@@ -39008,7 +44663,7 @@ class Request {
   // Returns the kind of resource requested by request, e.g., "document"
   // or "script".
   get destination () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The destination getter are to return this’s request’s destination.
     return this.#state.destination
@@ -39020,7 +44675,7 @@ class Request {
   // during fetching to determine the value of the `Referer` header of the
   // request being made.
   get referrer () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // 1. If this’s request’s referrer is "no-referrer", then return the
     // empty string.
@@ -39042,7 +44697,7 @@ class Request {
   // This is used during fetching to compute the value of the request’s
   // referrer.
   get referrerPolicy () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The referrerPolicy getter steps are to return this’s request’s referrer policy.
     return this.#state.referrerPolicy
@@ -39052,7 +44707,7 @@ class Request {
   // whether the request will use CORS, or will be restricted to same-origin
   // URLs.
   get mode () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The mode getter steps are to return this’s request’s mode.
     return this.#state.mode
@@ -39062,7 +44717,7 @@ class Request {
   // which is a string indicating whether credentials will be sent with the
   // request always, never, or only when sent to a same-origin URL.
   get credentials () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The credentials getter steps are to return this’s request’s credentials mode.
     return this.#state.credentials
@@ -39072,7 +44727,7 @@ class Request {
   // which is a string indicating how the request will
   // interact with the browser’s cache when fetching.
   get cache () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The cache getter steps are to return this’s request’s cache mode.
     return this.#state.cache
@@ -39083,7 +44738,7 @@ class Request {
   // request will be handled during fetching. A request
   // will follow redirects by default.
   get redirect () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The redirect getter steps are to return this’s request’s redirect mode.
     return this.#state.redirect
@@ -39093,7 +44748,7 @@ class Request {
   // cryptographic hash of the resource being fetched. Its value
   // consists of multiple hashes separated by whitespace. [SRI]
   get integrity () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The integrity getter steps are to return this’s request’s integrity
     // metadata.
@@ -39103,7 +44758,7 @@ class Request {
   // Returns a boolean indicating whether or not request can outlive the
   // global in which it was created.
   get keepalive () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The keepalive getter steps are to return this’s request’s keepalive.
     return this.#state.keepalive
@@ -39112,7 +44767,7 @@ class Request {
   // Returns a boolean indicating whether or not request is for a reload
   // navigation.
   get isReloadNavigation () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The isReloadNavigation getter steps are to return true if this’s
     // request’s reload-navigation flag is set; otherwise false.
@@ -39122,7 +44777,7 @@ class Request {
   // Returns a boolean indicating whether or not request is for a history
   // navigation (a.k.a. back-forward navigation).
   get isHistoryNavigation () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The isHistoryNavigation getter steps are to return true if this’s request’s
     // history-navigation flag is set; otherwise false.
@@ -39133,33 +44788,33 @@ class Request {
   // object indicating whether or not request has been aborted, and its
   // abort event handler.
   get signal () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // The signal getter steps are to return this’s signal.
     return this.#signal
   }
 
   get body () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     return this.#state.body ? this.#state.body.stream : null
   }
 
   get bodyUsed () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     return !!this.#state.body && util.isDisturbed(this.#state.body.stream)
   }
 
   get duplex () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     return 'half'
   }
 
   // Returns a clone of request.
   clone () {
-    webidl.brandCheck(this, Request)
+    webidl.brandCheck(this, webidl.is.Request)
 
     // 1. If this is unusable, then throw a TypeError.
     if (bodyUnusable(this.#state)) {
@@ -39172,25 +44827,10 @@ class Request {
     // 3. Let clonedRequestObject be the result of creating a Request object,
     // given clonedRequest, this’s headers’s guard, and this’s relevant Realm.
     // 4. Make clonedRequestObject’s signal follow this’s signal.
-    const ac = new AbortController()
-    if (this.signal.aborted) {
-      ac.abort(this.signal.reason)
-    } else {
-      let list = dependentControllerMap.get(this.signal)
-      if (list === undefined) {
-        list = new Set()
-        dependentControllerMap.set(this.signal, list)
-      }
-      const acRef = new WeakRef(ac)
-      list.add(acRef)
-      util.addAbortListener(
-        ac.signal,
-        buildAbort(acRef)
-      )
-    }
+    const signal = createDependentSignal(this.#signal)
 
     // 4. Return clonedRequestObject.
-    return fromInnerRequest(clonedRequest, this.#dispatcher, ac.signal, getHeadersGuard(this.#headers))
+    return fromInnerRequest(clonedRequest, this.#dispatcher, signal, getHeadersGuard(this.#headers))
   }
 
   [nodeUtil.inspect.custom] (depth, options) {
@@ -39221,73 +44861,74 @@ class Request {
     return `Request ${nodeUtil.formatWithOptions(options, properties)}`
   }
 
-  /**
-   * @param {Request} request
-   * @param {AbortSignal} newSignal
-   */
-  static setRequestSignal (request, newSignal) {
-    request.#signal = newSignal
-    return request
-  }
+  static {
+    /**
+     * @param {Request} request
+     * @param {AbortSignal} newSignal
+     */
+    setRequestSignal = (request, newSignal) => {
+      request.#signal = newSignal
+    }
 
-  /**
-   * @param {Request} request
-   */
-  static getRequestDispatcher (request) {
-    return request.#dispatcher
-  }
+    /**
+     * @param {Request} request
+     */
+    getRequestDispatcher = (request) => {
+      return request.#dispatcher
+    }
 
-  /**
-   * @param {Request} request
-   * @param {import('../../dispatcher/dispatcher')} newDispatcher
-   */
-  static setRequestDispatcher (request, newDispatcher) {
-    request.#dispatcher = newDispatcher
-  }
+    /**
+     * @param {Request} request
+     * @param {import('../../dispatcher/dispatcher')} newDispatcher
+     */
+    setRequestDispatcher = (request, newDispatcher) => {
+      request.#dispatcher = newDispatcher
+    }
 
-  /**
-   * @param {Request} request
-   * @param {Headers} newHeaders
-   */
-  static setRequestHeaders (request, newHeaders) {
-    request.#headers = newHeaders
-  }
+    /**
+     * @param {Request} request
+     * @param {Headers} newHeaders
+     */
+    setRequestHeaders = (request, newHeaders) => {
+      request.#headers = newHeaders
+    }
 
-  /**
-   * @param {Request} request
-   */
-  static getRequestState (request) {
-    return request.#state
-  }
+    /**
+     * @param {Request} request
+     */
+    getRequestState = (request) => {
+      return request.#state
+    }
 
-  /**
-   * @param {Request} request
-   * @param {any} newState
-   */
-  static setRequestState (request, newState) {
-    request.#state = newState
-  }
+    /**
+     * @param {Request} request
+     * @param {any} newState
+     */
+    setRequestState = (request, newState) => {
+      request.#state = newState
+    }
 
-  /**
-   * Removes the `abort` listener that makes this request's signal follow the
-   * signal passed to its constructor, if any. Idempotent.
-   * @param {Request} request
-   */
-  static removeRequestAbortListener (request) {
-    request.#abortCleanup?.()
+    /**
+     * Removes the `abort` listener that makes this request's signal follow the
+     * signal passed to its constructor, if any. Idempotent.
+     * @param {Request} request
+     */
+    removeRequestAbortListener = (request) => {
+      const state = requestSignals.get(request.#signal)
+      if (state !== undefined) {
+        requestSignals.delete(request.#signal)
+        requestFinalizer.unregister(state.reference)
+        removeSignalFollower(state.source, state.reference)
+      }
+    }
+
+    webidl.is.Request = (arg) => {
+      return arg != null && typeof arg === 'object' && #state in arg
+    }
   }
 }
 
-const { setRequestSignal, getRequestDispatcher, setRequestDispatcher, setRequestHeaders, getRequestState, setRequestState, removeRequestAbortListener } = Request
-Reflect.deleteProperty(Request, 'setRequestSignal')
-Reflect.deleteProperty(Request, 'getRequestDispatcher')
-Reflect.deleteProperty(Request, 'setRequestDispatcher')
-Reflect.deleteProperty(Request, 'setRequestHeaders')
-Reflect.deleteProperty(Request, 'getRequestState')
-Reflect.deleteProperty(Request, 'setRequestState')
-Reflect.deleteProperty(Request, 'removeRequestAbortListener')
-
-mixinBody(Request, getRequestState)
+mixinBody(Request, getRequestState, webidl.is.Request)
 
 // https://fetch.spec.whatwg.org/#requests
 function makeRequest (init) {
@@ -39304,7 +44945,7 @@ function makeRequest (init) {
     serviceWorkers: init.serviceWorkers ?? 'all',
     initiator: init.initiator ?? '',
     destination: init.destination ?? '',
-    priority: init.priority ?? null,
+    priority: init.priority ?? 'auto',
     origin: init.origin ?? 'client',
     policyContainer: init.policyContainer ?? 'client',
     referrer: init.referrer ?? 'client',
@@ -39401,8 +45042,6 @@ Object.defineProperties(Request.prototype, {
     configurable: true
   }
 })
-
-webidl.is.Request = webidl.util.MakeTypeAssertion(Request)
 
 /**
  * @param {*} V
@@ -39510,8 +45149,7 @@ webidl.converters.RequestInit = webidl.dictionaryConverter([
   {
     key: 'priority',
     converter: webidl.converters.DOMString,
-    allowedValues: ['high', 'low', 'auto'],
-    defaultValue: () => 'auto'
+    allowedValues: ['high', 'low', 'auto']
   }
 ])
 
@@ -39556,6 +45194,7 @@ const assert = __nccwpck_require__(4589)
 const { isomorphicEncode, serializeJavascriptValueToJSONString } = __nccwpck_require__(8116)
 
 const textEncoder = new TextEncoder('utf-8')
+let getResponseHeaders, setResponseHeaders, getResponseState, setResponseState
 
 // https://fetch.spec.whatwg.org/#response-class
 class Response {
@@ -39678,7 +45317,7 @@ class Response {
 
   // Returns response’s type, e.g., "cors".
   get type () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The type getter steps are to return this’s response’s type.
     return this.#state.type
@@ -39686,7 +45325,7 @@ class Response {
 
   // Returns response’s URL, if it has one; otherwise the empty string.
   get url () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     const urlList = this.#state.urlList
 
@@ -39704,7 +45343,7 @@ class Response {
 
   // Returns whether response was obtained through a redirect.
   get redirected () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The redirected getter steps are to return true if this’s response’s URL
     // list has more than one item; otherwise false.
@@ -39713,7 +45352,7 @@ class Response {
 
   // Returns response’s status.
   get status () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The status getter steps are to return this’s response’s status.
     return this.#state.status
@@ -39721,7 +45360,7 @@ class Response {
 
   // Returns whether response’s status is an ok status.
   get ok () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The ok getter steps are to return true if this’s response’s status is an
     // ok status; otherwise false.
@@ -39730,7 +45369,7 @@ class Response {
 
   // Returns response’s status message.
   get statusText () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The statusText getter steps are to return this’s response’s status
     // message.
@@ -39739,27 +45378,27 @@ class Response {
 
   // Returns response’s headers as Headers.
   get headers () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // The headers getter steps are to return this’s headers.
     return this.#headers
   }
 
   get body () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     return this.#state.body ? this.#state.body.stream : null
   }
 
   get bodyUsed () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     return !!this.#state.body && util.isDisturbed(this.#state.body.stream)
   }
 
   // Returns a clone of response.
   clone () {
-    webidl.brandCheck(this, Response)
+    webidl.brandCheck(this, webidl.is.Response)
 
     // 1. If this is unusable, then throw a TypeError.
     if (bodyUnusable(this.#state)) {
@@ -39805,44 +45444,44 @@ class Response {
     return `Response ${nodeUtil.formatWithOptions(options, properties)}`
   }
 
-  /**
-   * @param {Response} response
-   */
-  static getResponseHeaders (response) {
-    return response.#headers
-  }
+  static {
+    /**
+     * @param {Response} response
+     */
+    getResponseHeaders = (response) => {
+      return response.#headers
+    }
 
-  /**
-   * @param {Response} response
-   * @param {Headers} newHeaders
-   */
-  static setResponseHeaders (response, newHeaders) {
-    response.#headers = newHeaders
-  }
+    /**
+     * @param {Response} response
+     * @param {Headers} newHeaders
+     */
+    setResponseHeaders = (response, newHeaders) => {
+      response.#headers = newHeaders
+    }
 
-  /**
-   * @param {Response} response
-   */
-  static getResponseState (response) {
-    return response.#state
-  }
+    /**
+     * @param {Response} response
+     */
+    getResponseState = (response) => {
+      return response.#state
+    }
 
-  /**
-   * @param {Response} response
-   * @param {any} newState
-   */
-  static setResponseState (response, newState) {
-    response.#state = newState
+    /**
+     * @param {Response} response
+     * @param {any} newState
+     */
+    setResponseState = (response, newState) => {
+      response.#state = newState
+    }
+
+    webidl.is.Response = (arg) => {
+      return arg != null && typeof arg === 'object' && #state in arg
+    }
   }
 }
 
-const { getResponseHeaders, setResponseHeaders, getResponseState, setResponseState } = Response
-Reflect.deleteProperty(Response, 'getResponseHeaders')
-Reflect.deleteProperty(Response, 'setResponseHeaders')
-Reflect.deleteProperty(Response, 'getResponseState')
-Reflect.deleteProperty(Response, 'setResponseState')
-
-mixinBody(Response, getResponseState)
+mixinBody(Response, getResponseState, webidl.is.Response)
 
 Object.defineProperties(Response.prototype, {
   type: kEnumerableProperty,
@@ -40157,8 +45796,6 @@ webidl.converters.ResponseInit = webidl.dictionaryConverter([
   }
 ])
 
-webidl.is.Response = webidl.util.MakeTypeAssertion(Response)
-
 module.exports = {
   isNetworkError,
   makeNetworkError,
@@ -40185,7 +45822,7 @@ const { redirectStatusSet, referrerPolicyTokens, badPortsSet } = __nccwpck_requi
 const { getGlobalOrigin } = __nccwpck_require__(1059)
 const { collectAnHTTPQuotedString, parseMIMEType } = __nccwpck_require__(1900)
 const { performance } = __nccwpck_require__(643)
-const { ReadableStreamFrom, isValidHTTPToken, normalizedMethodRecordsBase } = __nccwpck_require__(3440)
+const { isValidHTTPToken, normalizedMethodRecordsBase } = __nccwpck_require__(3440)
 const assert = __nccwpck_require__(4589)
 const { isUint8Array } = __nccwpck_require__(3429)
 const { webidl } = __nccwpck_require__(7879)
@@ -40406,14 +46043,19 @@ function TAOCheck () {
   return 'success'
 }
 
+// https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-append-the-fetch-metadata-headers-for-a-request
 function appendFetchMetadata (httpRequest) {
+  //  1. If r’s url is not a potentially trustworthy URL, return.
+  if (!isURLPotentiallyTrustworthy(requestCurrentURL(httpRequest))) {
+    return
+  }
+
   //  https://w3c.github.io/webappsec-fetch-metadata/#sec-fetch-dest-header
   //  TODO
 
   //  https://w3c.github.io/webappsec-fetch-metadata/#sec-fetch-mode-header
 
   //  1. Assert: r’s url is a potentially trustworthy URL.
-  //  TODO
 
   //  2. Let header be a Structured Header whose value is a token.
   let header = null
@@ -41046,8 +46688,9 @@ function createIterator (name, kInternalIterator, keyIndex = 0, valueIndex = 1) 
  * @param {(target: any) => any} kInternalIterator
  * @param {string | number} [keyIndex]
  * @param {string | number} [valueIndex]
+ * @param {import('../../../types/webidl').WebidlIsFunction} brandCheck
  */
-function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueIndex = 1) {
+function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueIndex = 1, brandCheck) {
   const makeIterator = createIterator(name, kInternalIterator, keyIndex, valueIndex)
 
   const properties = {
@@ -41056,7 +46699,7 @@ function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueInde
       enumerable: true,
       configurable: true,
       value: function keys () {
-        webidl.brandCheck(this, object)
+        webidl.brandCheck(this, brandCheck)
         return makeIterator(this, 'key')
       }
     },
@@ -41065,7 +46708,7 @@ function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueInde
       enumerable: true,
       configurable: true,
       value: function values () {
-        webidl.brandCheck(this, object)
+        webidl.brandCheck(this, brandCheck)
         return makeIterator(this, 'value')
       }
     },
@@ -41074,7 +46717,7 @@ function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueInde
       enumerable: true,
       configurable: true,
       value: function entries () {
-        webidl.brandCheck(this, object)
+        webidl.brandCheck(this, brandCheck)
         return makeIterator(this, 'key+value')
       }
     },
@@ -41083,7 +46726,7 @@ function iteratorMixin (name, object, kInternalIterator, keyIndex = 0, valueInde
       enumerable: true,
       configurable: true,
       value: function forEach (callbackfn, thisArg = globalThis) {
-        webidl.brandCheck(this, object)
+        webidl.brandCheck(this, brandCheck)
         webidl.argumentLengthCheck(arguments, 1, `${name}.forEach`)
         if (typeof callbackfn !== 'function') {
           throw new TypeError(
@@ -41657,7 +47300,6 @@ module.exports = {
   isAborted,
   isCancelled,
   isValidEncodedURL,
-  ReadableStreamFrom,
   tryUpgradeRequestToAPotentiallyTrustworthyURL,
   clampAndCoarsenConnectionTimingInfo,
   coarsenedSharedCurrentTime,
@@ -41867,6 +47509,20 @@ function isomorphicEncode (input) {
   return input
 }
 
+const nonASCIIRegex = /[^\x00-\x7F]/ // eslint-disable-line no-control-regex
+
+/**
+ * @param {string} str
+ * @returns {string}
+ *
+ * @see https://infra.spec.whatwg.org/#ascii-lowercase
+ */
+function asciiLowercase (str) {
+  return nonASCIIRegex.test(str)
+    ? str.replace(/[A-Z]+/g, (upper) => upper.toLowerCase())
+    : str.toLowerCase()
+}
+
 /**
  * @see https://infra.spec.whatwg.org/#parse-json-bytes-to-a-javascript-value
  * @param {Uint8Array} bytes
@@ -41903,7 +47559,7 @@ function removeChars (str, leading, trailing, predicate) {
   }
 
   if (trailing) {
-    while (trail > 0 && predicate(str.charCodeAt(trail))) trail--
+    while (trail >= lead && predicate(str.charCodeAt(trail))) trail--
   }
 
   return lead === 0 && trail === str.length - 1 ? str : str.slice(lead, trail + 1)
@@ -41927,6 +47583,7 @@ function serializeJavascriptValueToJSONString (value) {
 }
 
 module.exports = {
+  asciiLowercase,
   collectASequenceOfCodePoints,
   collectASequenceOfCodePointsFast,
   forgivingBase64,
@@ -41949,6 +47606,7 @@ module.exports = {
 
 const assert = __nccwpck_require__(4589)
 const { runtimeFeatures } = __nccwpck_require__(313)
+const { asciiLowercase } = __nccwpck_require__(8116)
 
 /**
  * @typedef {object} Metadata
@@ -42013,14 +47671,12 @@ const getSRIHashAlgorithmIndex = /** @type {GetSRIHashAlgorithmIndex} */ (Map.pr
 
 /**
  * @typedef IsValidSRIHashAlgorithm
+ * @see https://w3c.github.io/webappsec-subresource-integrity/#valid-sri-hash-algorithm-token
  * @type {(algorithm: string) => algorithm is SRIHashAlgorithm}
  * @param {*} algorithm
  * @returns {algorithm is SRIHashAlgorithm}
  */
-
-const isValidSRIHashAlgorithm = /** @type {IsValidSRIHashAlgorithm} */ (
-  Map.prototype.has.bind(validSRIHashAlgorithmTokenSet)
-)
+const isValidSRIHashAlgorithm = (algorithm) => validSRIHashAlgorithmTokenSet.has(asciiLowercase(algorithm))
 
 /**
  * @param {Uint8Array} bytes
@@ -42145,8 +47801,8 @@ function parseMetadata (metadata) {
   /** @type {MetadataList} */
   const result = []
 
-  // 2. For each item returned by splitting metadata on spaces:
-  for (const item of metadata.split(' ')) {
+  // 2. For each item returned by splitting metadata on ASCII whitespace:
+  for (const item of metadata.split(/[\t\n\f\r ]+/)) {
     // 1. Let expression-and-options be the result of splitting item on U+003F (?).
     const expressionAndOptions = item.split('?', 1)
 
@@ -42176,7 +47832,8 @@ function parseMetadata (metadata) {
     // 8. Let metadata be the ordered map
     // «["alg" → algorithm, "val" → base64-value]».
     const metadata = {
-      alg: algorithm,
+      // Possible spec bug?
+      alg: asciiLowercase(algorithm),
       val: base64Value
     }
 
@@ -42287,9 +47944,9 @@ const webidl = {
 /**
  * @description Instantiate an error.
  *
- * @param {Object} opts
- * @param {string} opts.header
- * @param {string} opts.message
+ * @param {Object} message
+ * @param {string} message.header
+ * @param {string} message.message
  * @returns {TypeError}
  */
 webidl.errors.exception = function (message) {
@@ -42334,23 +47991,11 @@ webidl.errors.invalidArgument = function (context) {
 }
 
 // https://webidl.spec.whatwg.org/#implements
-webidl.brandCheck = function (V, I) {
-  if (!FunctionPrototypeSymbolHasInstance(I, V)) {
+webidl.brandCheck = function (V, is) {
+  if (!is(V)) {
     const err = new TypeError('Illegal invocation')
     err.code = 'ERR_INVALID_THIS' // node compat.
     throw err
-  }
-}
-
-webidl.brandCheckMultiple = function (List) {
-  const prototypes = List.map((c) => webidl.util.MakeTypeAssertion(c))
-
-  return (V) => {
-    if (prototypes.every(typeCheck => !typeCheck(V))) {
-      const err = new TypeError('Illegal invocation')
-      err.code = 'ERR_INVALID_THIS' // node compat.
-      throw err
-    }
   }
 }
 
@@ -43373,13 +49018,13 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
         // The presence of a session property on the socket indicates HTTP2
         // HTTP1
         if (response.socket?.session == null) {
-          failWebsocketConnection(handler, 1002, 'Received network error or non-101 status code.', response.error)
+          failHandshake(handler, response, 1002, 'Received network error or non-101 status code.', response.error)
           return
         }
 
         // HTTP2
         if (response.status !== 200) {
-          failWebsocketConnection(handler, 1002, 'Received network error or non-200 status code.', response.error)
+          failHandshake(handler, response, 1002, 'Received network error or non-200 status code.', response.error)
           return
         }
       }
@@ -43394,7 +49039,7 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
       //    header list results in null, failure, or the empty byte
       //    sequence, then fail the WebSocket connection.
       if (protocols.length !== 0 && !response.headersList.get('Sec-WebSocket-Protocol')) {
-        failWebsocketConnection(handler, 1002, 'Server did not respond with sent protocols.')
+        failHandshake(handler, response, 1002, 'Server did not respond with sent protocols.')
         return
       }
 
@@ -43410,7 +49055,7 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
       //    _Fail the WebSocket Connection_.
       //    For H2, no upgrade header is expected.
       if (response.socket.session == null && response.headersList.get('Upgrade')?.toLowerCase() !== 'websocket') {
-        failWebsocketConnection(handler, 1002, 'Server did not set Upgrade header to "websocket".')
+        failHandshake(handler, response, 1002, 'Server did not set Upgrade header to "websocket".')
         return
       }
 
@@ -43420,7 +49065,7 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
       //    MUST _Fail the WebSocket Connection_.
       //    For H2, no connection header is expected.
       if (response.socket.session == null && response.headersList.get('Connection')?.toLowerCase() !== 'upgrade') {
-        failWebsocketConnection(handler, 1002, 'Server did not set Connection header to "upgrade".')
+        failHandshake(handler, response, 1002, 'Server did not set Connection header to "upgrade".')
         return
       }
 
@@ -43431,11 +49076,15 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
       //    E914-47DA-95CA-C5AB0DC85B11" but ignoring any leading and
       //    trailing whitespace, the client MUST _Fail the WebSocket
       //    Connection_.
-      const secWSAccept = response.headersList.get('Sec-WebSocket-Accept')
-      const digest = crypto.hash('sha1', keyValue + uid, 'base64')
-      if (secWSAccept !== digest) {
-        failWebsocketConnection(handler, 1002, 'Incorrect hash received in Sec-WebSocket-Accept header.')
-        return
+      //    For H2, implementations "do not do the processing of the Sec-WebSocket-Key and
+      //    Sec-WebSocket-Accept header fields". https://datatracker.ietf.org/doc/html/rfc8441#section-5
+      if (response.socket.session == null) {
+        const secWSAccept = response.headersList.get('Sec-WebSocket-Accept')
+        const digest = crypto.hash('sha1', keyValue + uid, 'base64')
+        if (secWSAccept !== digest) {
+          failHandshake(handler, response, 1002, 'Incorrect hash received in Sec-WebSocket-Accept header.')
+          return
+        }
       }
 
       // 5. If the response includes a |Sec-WebSocket-Extensions| header
@@ -43452,7 +49101,7 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
         extensions = parseExtensions(secExtension)
 
         if (!extensions.has('permessage-deflate')) {
-          failWebsocketConnection(handler, 1002, 'Sec-WebSocket-Extensions header does not match.')
+          failHandshake(handler, response, 1002, 'Sec-WebSocket-Extensions header does not match.')
           return
         }
       }
@@ -43472,10 +49121,17 @@ function establishWebSocketConnection (url, protocols, client, handler, options)
         // is specified, the server needs to include the same field and one of
         // the selected subprotocol values in its response for the connection to
         // be established.
-        if (!requestProtocols.includes(secProtocol)) {
-          failWebsocketConnection(handler, 1002, 'Protocol was not set in the opening handshake.')
+        if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
+          failHandshake(handler, response, 1002, 'Protocol was not set in the opening handshake.')
           return
         }
+      }
+
+      // For H2, "Orderly TCP-level closures are represented as END_STREAM flags", so
+      // end our side of the stream when the server ends its side, as a TCP socket would.
+      // https://datatracker.ietf.org/doc/html/rfc8441#section-5
+      if (response.socket.session != null) {
+        response.socket.allowHalfOpen = false
       }
 
       response.socket.on('data', handler.onSocketData)
@@ -43566,6 +49222,16 @@ function closeWebSocketConnection (object, code, reason, validate = false) {
     // Set object’s ready state to CLOSING (2).
     object.readyState = states.CLOSING
   }
+}
+
+function failHandshake (handler, response, code, reason, cause) {
+  // The H2 upgrade request has already completed and handed off its stream.
+  // Aborting the request cannot close that stream after handshake validation fails.
+  if (response.socket?.session != null && !response.socket.destroyed) {
+    response.socket.destroy()
+  }
+
+  failWebsocketConnection(handler, code, reason, cause)
 }
 
 /**
@@ -43745,6 +49411,8 @@ const { webidl } = __nccwpck_require__(7879)
 const { kEnumerableProperty } = __nccwpck_require__(3440)
 const { kConstruct } = __nccwpck_require__(6443)
 
+let createFastMessageEvent
+
 /**
  * @see https://html.spec.whatwg.org/multipage/comms.html#messageevent
  */
@@ -43771,31 +49439,31 @@ class MessageEvent extends Event {
   }
 
   get data () {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     return this.#eventInit.data
   }
 
   get origin () {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     return this.#eventInit.origin
   }
 
   get lastEventId () {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     return this.#eventInit.lastEventId
   }
 
   get source () {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     return this.#eventInit.source
   }
 
   get ports () {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     if (!Object.isFrozen(this.#eventInit.ports)) {
       Object.freeze(this.#eventInit.ports)
@@ -43814,7 +49482,7 @@ class MessageEvent extends Event {
     source = null,
     ports = []
   ) {
-    webidl.brandCheck(this, MessageEvent)
+    webidl.brandCheck(this, webidl.is.MessageEvent)
 
     webidl.argumentLengthCheck(arguments, 1, 'MessageEvent.initMessageEvent')
 
@@ -43823,20 +49491,23 @@ class MessageEvent extends Event {
     })
   }
 
-  static createFastMessageEvent (type, init) {
-    const messageEvent = new MessageEvent(kConstruct, type, init)
-    messageEvent.#eventInit = init
-    messageEvent.#eventInit.data ??= null
-    messageEvent.#eventInit.origin ??= ''
-    messageEvent.#eventInit.lastEventId ??= ''
-    messageEvent.#eventInit.source ??= null
-    messageEvent.#eventInit.ports ??= []
-    return messageEvent
+  static {
+    createFastMessageEvent = (type, init) => {
+      const messageEvent = new MessageEvent(kConstruct, type, init)
+      messageEvent.#eventInit = init
+      messageEvent.#eventInit.data ??= null
+      messageEvent.#eventInit.origin ??= ''
+      messageEvent.#eventInit.lastEventId ??= ''
+      messageEvent.#eventInit.source ??= null
+      messageEvent.#eventInit.ports ??= []
+      return messageEvent
+    }
+
+    webidl.is.MessageEvent = (arg) => {
+      return arg != null && typeof arg === 'object' && #eventInit in arg
+    }
   }
 }
-
-const { createFastMessageEvent } = MessageEvent
-delete MessageEvent.createFastMessageEvent
 
 /**
  * @see https://websockets.spec.whatwg.org/#the-closeevent-interface
@@ -43858,21 +49529,27 @@ class CloseEvent extends Event {
   }
 
   get wasClean () {
-    webidl.brandCheck(this, CloseEvent)
+    webidl.brandCheck(this, webidl.is.CloseEvent)
 
     return this.#eventInit.wasClean
   }
 
   get code () {
-    webidl.brandCheck(this, CloseEvent)
+    webidl.brandCheck(this, webidl.is.CloseEvent)
 
     return this.#eventInit.code
   }
 
   get reason () {
-    webidl.brandCheck(this, CloseEvent)
+    webidl.brandCheck(this, webidl.is.CloseEvent)
 
     return this.#eventInit.reason
+  }
+
+  static {
+    webidl.is.CloseEvent = (arg) => {
+      return arg != null && typeof arg === 'object' && #eventInit in arg
+    }
   }
 }
 
@@ -43894,33 +49571,39 @@ class ErrorEvent extends Event {
   }
 
   get message () {
-    webidl.brandCheck(this, ErrorEvent)
+    webidl.brandCheck(this, webidl.is.ErrorEvent)
 
     return this.#eventInit.message
   }
 
   get filename () {
-    webidl.brandCheck(this, ErrorEvent)
+    webidl.brandCheck(this, webidl.is.ErrorEvent)
 
     return this.#eventInit.filename
   }
 
   get lineno () {
-    webidl.brandCheck(this, ErrorEvent)
+    webidl.brandCheck(this, webidl.is.ErrorEvent)
 
     return this.#eventInit.lineno
   }
 
   get colno () {
-    webidl.brandCheck(this, ErrorEvent)
+    webidl.brandCheck(this, webidl.is.ErrorEvent)
 
     return this.#eventInit.colno
   }
 
   get error () {
-    webidl.brandCheck(this, ErrorEvent)
+    webidl.brandCheck(this, webidl.is.ErrorEvent)
 
     return this.#eventInit.error
+  }
+
+  static {
+    webidl.is.ErrorEvent = (arg) => {
+      return arg != null && typeof arg === 'object' && #eventInit in arg
+    }
   }
 }
 
@@ -44276,7 +49959,12 @@ class PerMessageDeflate {
 
         if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
           callback(new MessageSizeExceededError())
+          // The inflater may still hold buffered input that can emit a late
+          // zlib error. Remove the data listener, then deterministically stop
+          // the stream so a subsequent 'error' cannot fire without a listener
+          // (which would terminate the process as an unhandled error event).
           this.#inflate.removeAllListeners()
+          this.#inflate.destroy()
           this.#inflate = null
           return
         }
@@ -44336,6 +50024,7 @@ const { failWebsocketConnection } = __nccwpck_require__(6897)
 const { WebsocketFrameSend } = __nccwpck_require__(3264)
 const { PerMessageDeflate } = __nccwpck_require__(9469)
 const { MessageSizeExceededError } = __nccwpck_require__(8707)
+const { defaultWebSocketMaxFragments, defaultWebSocketMaxPayloadSize } = __nccwpck_require__(735)
 
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -44368,18 +50057,25 @@ class ByteParser extends Writable {
   /**
    * @param {import('./websocket').Handler} handler
    * @param {Map<string, string>|null} extensions
-   * @param {{ maxPayloadSize?: number }} [options]
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
+   *   A missing value uses the default limit; `0` disables the limit.
    */
   constructor (handler, extensions, options = {}) {
     super()
 
     this.#handler = handler
     this.#extensions = extensions == null ? new Map() : extensions
-    this.#maxFragments = options.maxFragments ?? 0
-    this.#maxPayloadSize = options.maxPayloadSize ?? 0
+    // Options come from the dispatcher's `webSocketOptions`, which only
+    // DispatcherBase provides. Fall back to the defaults rather than to no
+    // limit, so RetryAgent, MockAgent or a custom dispatcher can't turn off
+    // the payload and decompression limits by accident.
+    this.#maxFragments = options.maxFragments ?? defaultWebSocketMaxFragments
+    this.#maxPayloadSize = options.maxPayloadSize ?? defaultWebSocketMaxPayloadSize
 
     if (this.#extensions.has('permessage-deflate')) {
-      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options))
+      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, {
+        maxPayloadSize: this.#maxPayloadSize
+      }))
     }
   }
 
@@ -44564,6 +50260,19 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
+
+          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+          // stop parsing and resume on drain so a PING flood cannot grow the
+          // outbound queue without bound.
+          if (this.#loop && this.#handler.socket.writableNeedDrain) {
+            this.#loop = false
+            this.#handler.socket.once('drain', () => {
+              if (this.destroyed) return
+              this.#loop = true
+              this.run(callback)
+            })
+            return
+          }
         } else {
           if (!this.#info.compressed) {
             if (!this.writeFragments(body)) {
@@ -44688,6 +50397,8 @@ class ByteParser extends Writable {
 
   consumeFragments () {
     const fragments = this.#fragments
+
+    this.#info.compressed = false
 
     if (fragments.length === 1) {
       // single fragment
@@ -44976,6 +50687,8 @@ function createInheritableDOMException () {
   })
 }
 
+let createUnvalidatedWebSocketError
+
 class WebSocketError extends createInheritableDOMException() {
   #closeCode
   #reason
@@ -45027,16 +50740,19 @@ class WebSocketError extends createInheritableDOMException() {
    * @param {number|null} code
    * @param {string} reason
    */
-  static createUnvalidatedWebSocketError (message, code, reason) {
-    const error = new WebSocketError(message, kConstruct)
-    error.#closeCode = code
-    error.#reason = reason
-    return error
+  static {
+    createUnvalidatedWebSocketError = (message, code, reason) => {
+      const error = new WebSocketError(message, kConstruct)
+      error.#closeCode = code
+      error.#reason = reason
+      return error
+    }
+
+    webidl.is.WebSocketError = (arg) => {
+      return arg != null && typeof arg === 'object' && #reason in arg
+    }
   }
 }
-
-const { createUnvalidatedWebSocketError } = WebSocketError
-delete WebSocketError.createUnvalidatedWebSocketError
 
 Object.defineProperties(WebSocketError.prototype, {
   closeCode: kEnumerableProperty,
@@ -45048,8 +50764,6 @@ Object.defineProperties(WebSocketError.prototype, {
     configurable: true
   }
 })
-
-webidl.is.WebSocketError = webidl.util.MakeTypeAssertion(WebSocketError)
 
 module.exports = { WebSocketError, createUnvalidatedWebSocketError }
 
@@ -45095,9 +50809,9 @@ class WebSocketStream {
   /** @type {ReadableStreamDefaultController} */
   #readableStreamController
 
-  // Each WebSocketStream object has an associated writable stream , which is a WritableStream .
-  /** @type {WritableStream} */
-  #writableStream
+  // Retain the controller so the writable stream can be errored while locked.
+  /** @type {WritableStreamDefaultController} */
+  #writableStreamController
 
   // Each WebSocketStream object has an associated boolean handshake aborted , which is initially false.
   #handshakeAborted = false
@@ -45123,7 +50837,9 @@ class WebSocketStream {
 
       this.#handler.socket.destroy()
     },
-    onSocketClose: () => this.#onSocketClose(),
+    // When the WebSocket connection is closed for a WebSocketStream stream, possibly cleanly, the user agent must
+    // queue a global task on the WebSocket task source given stream ’s relevant global object to run the following substeps:
+    onSocketClose: () => queueMicrotask(() => this.#onSocketClose()),
     onPing: () => {},
     onPong: () => {},
 
@@ -45307,11 +51023,15 @@ class WebSocketStream {
       const frame = new WebsocketFrameSend(data)
 
       this.#handler.socket.write(frame.createFrame(opcode), () => {
+        // 6.3. Queue a global task on the WebSocket task source given stream ’s relevant global object to resolve promise with undefined.
         promise.resolve(undefined)
       })
+    } else {
+      // 6.3. Queue a global task on the WebSocket task source given stream ’s relevant global object to resolve promise with undefined.
+      promise.resolve(undefined)
     }
 
-    // 6.3. Queue a global task on the WebSocket task source given stream ’s relevant global object to resolve promise with undefined.
+    // 7. Return promise.
     return promise.promise
   }
 
@@ -45339,7 +51059,7 @@ class WebSocketStream {
     // This is done in the opening handshake.
 
     // 3. Let extensions be the extensions in use .
-    const extensions = parsedExtensions ?? ''
+    const extensions = response.headersList.get('sec-websocket-extensions') ?? ''
 
     // 4. Let protocol be the subprotocol in use .
     const protocol = response.headersList.get('sec-websocket-protocol') ?? ''
@@ -45352,6 +51072,7 @@ class WebSocketStream {
       start: (controller) => {
         this.#readableStreamController = controller
       },
+      pull: () => this.#pull(),
       cancel: (reason) => this.#cancel(reason)
     })
 
@@ -45361,6 +51082,9 @@ class WebSocketStream {
     // 12. Let writable be a new WritableStream .
     // 13. Set up writable with writeAlgorithm , closeAlgorithm , and abortAlgorithm .
     const writable = new WritableStream({
+      start: (controller) => {
+        this.#writableStreamController = controller
+      },
       write: (chunk) => this.#write(chunk),
       close: () => closeWebSocketConnection(this.#handler, null, null),
       abort: (reason) => this.#closeUsingReason(reason)
@@ -45368,9 +51092,6 @@ class WebSocketStream {
 
     // Set stream ’s readable stream to readable .
     this.#readableStream = readable
-
-    // Set stream ’s writable stream to writable .
-    this.#writableStream = writable
 
     // Resolve stream ’s opened promise with WebSocketOpenInfo «[ " extensions " → extensions , " protocol " → protocol , " readable " → readable , " writable " → writable ]».
     this.#openedPromise.resolve({
@@ -45411,6 +51132,9 @@ class WebSocketStream {
     this.#readableStreamController.enqueue(chunk)
 
     // 4. Apply backpressure to the WebSocket.
+    if (this.#readableStreamController.desiredSize <= 0) {
+      this.#handler.socket.pause()
+    }
   }
 
   /** @type {import('../websocket').Handler['onSocketClose']} */
@@ -45444,7 +51168,7 @@ class WebSocketStream {
     // 1006.
     let code = result?.code ?? 1005
 
-    if (!this.#handler.closeState.has(sentCloseFrameState.SENT) && !this.#handler.closeState.has(sentCloseFrameState.RECEIVED)) {
+    if (!this.#handler.closeState.has(sentCloseFrameState.RECEIVED)) {
       code = 1006
     }
 
@@ -45457,9 +51181,7 @@ class WebSocketStream {
       readableStreamClose(this.#readableStreamController)
 
       // 6.2. Error stream ’s writable stream with an " InvalidStateError " DOMException indicating that a closed WebSocketStream cannot be written to.
-      if (!this.#writableStream.locked) {
-        this.#writableStream.abort(new DOMException('A closed WebSocketStream cannot be written to', 'InvalidStateError'))
-      }
+      this.#writableStreamController.error(new DOMException('A closed WebSocketStream cannot be written to', 'InvalidStateError'))
 
       // 6.3. Resolve stream ’s closed promise with WebSocketCloseInfo «[ " closeCode " → code , " reason " → reason ]».
       this.#closedPromise.resolve({
@@ -45476,7 +51198,7 @@ class WebSocketStream {
       this.#readableStreamController?.error(error)
 
       // 7.3. Error stream ’s writable stream with error .
-      this.#writableStream?.abort(error)
+      this.#writableStreamController?.error(error)
 
       // 7.4. Reject stream ’s closed promise with error .
       this.#closedPromise.reject(error)
@@ -45502,6 +51224,11 @@ class WebSocketStream {
     // 4. Close the WebSocket with stream , code , and reasonString . If this throws an exception,
     //    discard code and reasonString and close the WebSocket with stream .
     closeWebSocketConnection(this.#handler, code, reasonString)
+  }
+
+  // To pull bytes from a WebSocketStream stream , if stream is currently applying backpressure, release backpressure.
+  #pull () {
+    this.#handler.socket.resume()
   }
 
   //  To cancel a WebSocketStream stream given reason , close using reason giving stream and reason .
@@ -45948,6 +51675,8 @@ const { channels } = __nccwpck_require__(2414)
 const kRef = Symbol.for('nodejs.ref')
 const kUnref = Symbol.for('nodejs.unref')
 
+let ping
+
 function getSocketAddress (socket) {
   if (typeof socket?.address === 'function') {
     return socket.address()
@@ -46118,16 +51847,14 @@ class WebSocket extends EventTarget {
     this.#binaryType = 'blob'
   }
 
+  // TODO: remove this
   [kRef] () {
-    webidl.brandCheck(this, WebSocket)
-
     this.#refed = true
     this.#handler.socket?.ref?.()
   }
 
+  // TODO: remove this
   [kUnref] () {
-    webidl.brandCheck(this, WebSocket)
-
     this.#refed = false
     this.#handler.socket?.unref?.()
   }
@@ -46138,7 +51865,7 @@ class WebSocket extends EventTarget {
    * @param {string|undefined} reason
    */
   close (code = undefined, reason = undefined) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     const prefix = 'WebSocket.close'
 
@@ -46165,7 +51892,7 @@ class WebSocket extends EventTarget {
    * @param {NodeJS.TypedArray|ArrayBuffer|Blob|string} data
    */
   send (data) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     const prefix = 'WebSocket.send'
     webidl.argumentLengthCheck(arguments, 1, prefix)
@@ -46259,45 +51986,45 @@ class WebSocket extends EventTarget {
   }
 
   get readyState () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     // The readyState getter steps are to return this's ready state.
     return this.#handler.readyState
   }
 
   get bufferedAmount () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#bufferedAmount
   }
 
   get url () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     // The url getter steps are to return this's url, serialized.
     return URLSerializer(this.#url)
   }
 
   get extensions () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#extensions
   }
 
   get protocol () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#protocol
   }
 
   get onopen () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#events.open
   }
 
   set onopen (fn) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     if (this.#events.open) {
       this.removeEventListener('open', this.#events.open)
@@ -46314,13 +52041,13 @@ class WebSocket extends EventTarget {
   }
 
   get onerror () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#events.error
   }
 
   set onerror (fn) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     if (this.#events.error) {
       this.removeEventListener('error', this.#events.error)
@@ -46337,13 +52064,13 @@ class WebSocket extends EventTarget {
   }
 
   get onclose () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#events.close
   }
 
   set onclose (fn) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     if (this.#events.close) {
       this.removeEventListener('close', this.#events.close)
@@ -46360,13 +52087,13 @@ class WebSocket extends EventTarget {
   }
 
   get onmessage () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#events.message
   }
 
   set onmessage (fn) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     if (this.#events.message) {
       this.removeEventListener('message', this.#events.message)
@@ -46383,13 +52110,13 @@ class WebSocket extends EventTarget {
   }
 
   get binaryType () {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     return this.#binaryType
   }
 
   set binaryType (type) {
-    webidl.brandCheck(this, WebSocket)
+    webidl.brandCheck(this, webidl.is.WebSocket)
 
     if (type !== 'blob' && type !== 'arraybuffer') {
       this.#binaryType = 'blob'
@@ -46574,32 +52301,35 @@ class WebSocket extends EventTarget {
     }
   }
 
-  /**
-   * @param {WebSocket} ws
-   * @param {Buffer|undefined} buffer
-   */
-  static ping (ws, buffer) {
-    if (Buffer.isBuffer(buffer)) {
-      if (buffer.length > 125) {
-        throw new TypeError('A PING frame cannot have a body larger than 125 bytes.')
+  static {
+    /**
+     * @param {WebSocket} ws
+     * @param {Buffer|undefined} buffer
+     */
+    ping = (ws, buffer) => {
+      if (Buffer.isBuffer(buffer)) {
+        if (buffer.length > 125) {
+          throw new TypeError('A PING frame cannot have a body larger than 125 bytes.')
+        }
+      } else if (buffer !== undefined) {
+        throw new TypeError('Expected buffer payload')
       }
-    } else if (buffer !== undefined) {
-      throw new TypeError('Expected buffer payload')
+
+      // An endpoint MAY send a Ping frame any time after the connection is
+      // established and before the connection is closed.
+      const readyState = ws.#handler.readyState
+
+      if (isEstablished(readyState) && !isClosing(readyState) && !isClosed(readyState)) {
+        const frame = new WebsocketFrameSend(buffer)
+        ws.#handler.socket.write(frame.createFrame(opcodes.PING))
+      }
     }
 
-    // An endpoint MAY send a Ping frame any time after the connection is
-    // established and before the connection is closed.
-    const readyState = ws.#handler.readyState
-
-    if (isEstablished(readyState) && !isClosing(readyState) && !isClosed(readyState)) {
-      const frame = new WebsocketFrameSend(buffer)
-      ws.#handler.socket.write(frame.createFrame(opcodes.PING))
+    webidl.is.WebSocket = (arg) => {
+      return arg != null && typeof arg === 'object' && #handler in arg
     }
   }
 }
-
-const { ping } = WebSocket
-Reflect.deleteProperty(WebSocket, 'ping')
 
 // https://websockets.spec.whatwg.org/#dom-websocket-connecting
 WebSocket.CONNECTING = WebSocket.prototype.CONNECTING = states.CONNECTING
@@ -47084,22 +52814,30 @@ module.exports = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("util");
 
 
 
-const { normalizeIPv6, removeDotSegments, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, serializePathEncoding, normalizeQueryFragmentEncoding, encodeQuery, encodeFragment, reescapeHostDelimiters, isIPv4, nonSimpleDomain } = __nccwpck_require__(5077)
+const { normalizeIPv6, removeDotSegments, removeDotSegmentsRelative, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, serializePathEncoding, normalizeQueryFragmentEncoding, encodeQuery, encodeFragment, reescapeHostDelimiters, isIPv4, nonSimpleDomain } = __nccwpck_require__(5077)
 const { SCHEMES, getSchemeHandler } = __nccwpck_require__(5300)
 
 const VALID_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*$/u
 const MALFORMED_SCHEME_ERROR = 'URI scheme is malformed.'
+const MALFORMED_HOST_ERROR = 'URI host is malformed.'
+// ASCII characters outside the RFC 3986 reg-name set (unreserved, sub-delims
+// and "%" for pct-encoded): C0 controls, space, DEL, and "#/:<>?@[\]^`{|}.
+const FORBIDDEN_DOMAIN_HOST_CHARACTER = /[\0-\x20"#/:<>?@[\\\]^`{|}\x7F]/u
 
 /**
+ * RFC 3986 section 3.1 does not allow percent-encoding in a scheme, so the
+ * scheme is validated as-is and never decoded. Decoding would let inert input
+ * such as `%6Aavascript:` become a live `javascript:` scheme.
+ *
  * @param {string} scheme
  * @returns {string}
  */
-function decodeValidScheme (scheme) {
-  const decodedScheme = unescape(String(scheme))
-  if (!VALID_SCHEME.test(decodedScheme)) {
+function validateScheme (scheme) {
+  const stringScheme = String(scheme)
+  if (!VALID_SCHEME.test(stringScheme)) {
     throw new TypeError(MALFORMED_SCHEME_ERROR)
   }
-  return decodedScheme
+  return stringScheme
 }
 
 /**
@@ -47160,6 +52898,12 @@ function resolve (baseURI, relativeURI, options) {
   const resolvedHost = resolved.host
   const resolvedHostIsIP = resolvedHost !== undefined && resolvedHost !== '' &&
     (isIPv4(resolvedHost) || normalizeIPv6(resolvedHost).isIPV6)
+  // Inputs are parsed scheme-neutrally, so delimiters and controls in a domain
+  // host are only detected here, once the final scheme is known. They always
+  // fail closed, including in percent-encoded hosts.
+  if (hasForbiddenDomainHost(resolved, options || {}, resolvedSchemeHandler, resolvedHostIsIP)) {
+    throw new Error(MALFORMED_HOST_ERROR)
+  }
   canonicalizeHost(resolved, options || {}, resolvedSchemeHandler, resolvedHostIsIP)
   // Percent escapes in an ASCII reg-name are encoded data. The WHATWG hostname
   // parser can reject them even though fast-uri preserves them safely as RFC
@@ -47217,14 +52961,17 @@ function resolveComponent (base, relative, options, skipNormalization) {
         if (relative.path[0] === '/') {
           target.path = removeDotSegments(relative.path)
         } else {
-          if ((base.userinfo !== undefined || base.host !== undefined || base.port !== undefined) && !base.path) {
+          const baseHasAuthority = base.userinfo !== undefined || base.host !== undefined || base.port !== undefined
+          if (baseHasAuthority && !base.path) {
             target.path = '/' + relative.path
           } else if (!base.path) {
             target.path = relative.path
           } else {
             target.path = base.path.slice(0, base.path.lastIndexOf('/') + 1) + relative.path
           }
-          target.path = removeDotSegments(target.path)
+          target.path = base.scheme === undefined && !baseHasAuthority && target.path[0] !== '/'
+            ? removeDotSegmentsRelative(target.path)
+            : removeDotSegments(target.path)
         }
         target.query = relative.query
       }
@@ -47280,7 +53027,7 @@ function serialize (cmpts, opts) {
   const uriTokens = []
 
   if (component.scheme) {
-    component.scheme = decodeValidScheme(component.scheme)
+    component.scheme = validateScheme(component.scheme)
   }
 
   // find scheme handler
@@ -47290,7 +53037,11 @@ function serialize (cmpts, opts) {
   if (schemeHandler && schemeHandler.serialize) schemeHandler.serialize(component, options)
 
   const hasAuthority = component.userinfo !== undefined || component.host !== undefined || component.port !== undefined
-  const pathNoScheme = !options.skipEscape && component.scheme === undefined && !hasAuthority
+  // A reference with no emitted scheme is path-noscheme: a bare ':' in its
+  // first path segment would reparse as a scheme (RFC 3986 3.3/4.2). Enforced
+  // under skipEscape too (resolve()), so the reapply below gates on this flag.
+  const schemelessReference = (component.scheme === undefined || options.reference === 'suffix') && !hasAuthority
+  const pathNoScheme = !options.skipEscape && schemelessReference
 
   if (component.path !== undefined) {
     if (!options.skipEscape) {
@@ -47302,7 +53053,7 @@ function serialize (cmpts, opts) {
 
   if (options.reference !== 'suffix' && component.scheme) {
     // Scheme handlers may replace the scheme during serialization.
-    component.scheme = decodeValidScheme(component.scheme)
+    component.scheme = validateScheme(component.scheme)
     uriTokens.push(component.scheme, ':')
   }
 
@@ -47322,13 +53073,18 @@ function serialize (cmpts, opts) {
     let s = component.path
 
     if (!options.absolutePath && (!schemeHandler || !schemeHandler.absolutePath)) {
-      s = removeDotSegments(s)
+      // A relative-path reference keeps its unresolvable leading ".." segments
+      // and must never become root-relative (RFC 3986 section 5.2.4 applies to
+      // merged target paths, not to the reference itself).
+      s = schemelessReference && s[0] !== '/'
+        ? removeDotSegmentsRelative(s)
+        : removeDotSegments(s)
     }
 
     // Dot-segment removal can expose a colon that was not originally in the
     // first segment (for example, "./a:b"). Reapply path-noscheme encoding so
     // the serialized relative reference cannot be reparsed as a URI scheme.
-    if (pathNoScheme) {
+    if (schemelessReference) {
       s = serializePathEncoding(s, true)
     }
 
@@ -47409,6 +53165,18 @@ function hasMalformedPercentEncoding (component) {
 }
 
 /**
+ * Whether the host is a bracketed IP literal (RFC 3986 `IP-literal`).
+ * An unterminated `[` is not a literal, so it must still be validated as a
+ * reg-name instead of being waved through as an IP.
+ *
+ * @param {string} host
+ * @returns {boolean}
+ */
+function isIPLiteral (host) {
+  return host[0] === '[' && host[host.length - 1] === ']'
+}
+
+/**
  * @param {RegExpMatchArray} matches
  * @returns {boolean}
  */
@@ -47417,7 +53185,7 @@ function hasMalformedComponentPercentEncoding (matches) {
   // compatibility. Their parsing is intentionally left to normalizeIPv6.
   const host = matches[4]
   return hasMalformedPercentEncoding(matches[3]) ||
-    (host !== undefined && !(host[0] === '[' && host[host.length - 1] === ']') && hasMalformedPercentEncoding(host)) ||
+    (host !== undefined && !isIPLiteral(host) && hasMalformedPercentEncoding(host)) ||
     hasMalformedPercentEncoding(matches[6]) ||
     hasMalformedPercentEncoding(matches[7]) ||
     hasMalformedPercentEncoding(matches[8])
@@ -47431,23 +53199,74 @@ function hasMalformedComponentPercentEncoding (matches) {
  * @returns {boolean} whether host conversion failed
  */
 function canonicalizeHost (parsed, options, schemeHandler, isIP) {
+  if (hasForbiddenDomainHost(parsed, options, schemeHandler, isIP)) {
+    parsed.error = parsed.error || MALFORMED_HOST_ERROR
+    return true
+  }
+
   if (
     !options.unicodeSupport &&
     (!schemeHandler || !schemeHandler.unicodeSupport) &&
     parsed.host &&
-    parsed.host[0] !== '[' &&
+    !isIPLiteral(parsed.host) &&
     (options.domainHost || (schemeHandler && schemeHandler.domainHost)) &&
     isIP === false &&
     nonSimpleDomain(parsed.host)
   ) {
+    let url
     try {
-      parsed.host = new URL('http://' + parsed.host).hostname
+      url = new URL('http://' + parsed.host)
     } catch (e) {
       parsed.error = parsed.error || "Host's domain name can not be converted to ASCII: " + e
       return true
     }
+    // The WHATWG parser must have read the whole input as a host. Anything
+    // else means it found a delimiter fast-uri did not, so its hostname would
+    // describe a different authority.
+    if (!isHostOnlyURL(url)) {
+      parsed.error = parsed.error || MALFORMED_HOST_ERROR
+      return true
+    }
+    parsed.host = url.hostname
   }
   return false
+}
+
+/**
+ * Whether a domain host contains an ASCII character that RFC 3986 does not
+ * allow in a reg-name (unreserved, sub-delims, or pct-encoded). Such a host is
+ * rejected instead of being handed to the WHATWG URL parser, which would treat
+ * "@" as a userinfo delimiter (silently dropping the data before it) and strip
+ * TAB, LF, and CR. Non-ASCII characters remain allowed for IDNs.
+ *
+ * @param {import('./types/index').URIComponent} parsed
+ * @param {import('./types/index').Options} options
+ * @param {{ domainHost?: boolean }|undefined} schemeHandler
+ * @param {boolean} isIP
+ * @returns {boolean}
+ */
+function hasForbiddenDomainHost (parsed, options, schemeHandler, isIP) {
+  return Boolean(
+    parsed.host &&
+    isIP === false &&
+    !isIPLiteral(parsed.host) &&
+    (options.domainHost || (schemeHandler && schemeHandler.domainHost)) &&
+    FORBIDDEN_DOMAIN_HOST_CHARACTER.test(parsed.host)
+  )
+}
+
+/**
+ * @param {URL} url
+ * @returns {boolean}
+ */
+function isHostOnlyURL (url) {
+  return url.username === '' &&
+    url.password === '' &&
+    url.port === '' &&
+    url.pathname === '/' &&
+    url.search === '' &&
+    url.hash === '' &&
+    url.hostname !== ''
 }
 
 /**
@@ -47532,9 +53351,8 @@ function parseWithStatus (uri, opts) {
     parsed.fragment = matches[8]
 
     if (parsed.scheme !== undefined) {
-      const decodedScheme = unescape(parsed.scheme)
-      if (VALID_SCHEME.test(decodedScheme)) {
-        parsed.scheme = decodedScheme.toLowerCase()
+      if (VALID_SCHEME.test(parsed.scheme)) {
+        parsed.scheme = parsed.scheme.toLowerCase()
       } else {
         parsed.error = parsed.error || MALFORMED_SCHEME_ERROR
         malformedScheme = true
@@ -47560,14 +53378,15 @@ function parseWithStatus (uri, opts) {
     if (parsed.host) {
       const ipv4result = isIPv4(parsed.host)
       if (ipv4result === false) {
-        const bracketedIPLiteral = parsed.host[0] === '[' && parsed.host[parsed.host.length - 1] === ']'
+        const bracketedIPLiteral = isIPLiteral(parsed.host)
+        const hasIPLiteralBracket = parsed.host.indexOf('[') !== -1 || parsed.host.indexOf(']') !== -1
         const ipv6result = normalizeIPv6(parsed.host)
         isIP = ipv6result.isIPV6 || ipv6result.isIPVFuture === true
-        malformedIPLiteral = bracketedIPLiteral && ipv6result.error === true
+        malformedIPLiteral = hasIPLiteralBracket && (!bracketedIPLiteral || ipv6result.error === true)
         parsed.host = isIP ? ipv6result.host : ipv6result.host.toLowerCase()
 
         if (malformedIPLiteral) {
-          parsed.error = parsed.error || 'URI host is malformed.'
+          parsed.error = parsed.error || MALFORMED_HOST_ERROR
           malformedAuthorityOrPort = true
         }
       } else {
@@ -47593,15 +53412,25 @@ function parseWithStatus (uri, opts) {
     const schemeHandler = getSchemeHandler(options.scheme || parsed.scheme)
 
     // convert Unicode IDN -> ASCII IDN when the effective scheme uses domain hosts
-    malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP)
+    if (!malformedIPLiteral) {
+      malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP)
+    }
+
+    if (uri.indexOf('%') !== -1 && parsed.host !== undefined && !malformedIPLiteral) {
+      let host = isIP ? parsed.host : normalizePercentEncoding(parsed.host, true)
+      if (!isIP) {
+        // Fold reg-name case after decoding unreserved octets. The second
+        // pass only restores uppercase hex in escapes that remain encoded.
+        host = normalizePercentEncoding(host.toLowerCase())
+      }
+      // Resolution parses both inputs with the internal `null` scheme before
+      // the effective scheme is known. Keep raw host delimiters for that step
+      // so resolve() can reject them for domain-host schemes; the resolved
+      // authority is encoded when it is serialized.
+      parsed.host = isIP || options.scheme !== 'null' ? reescapeHostDelimiters(host, isIP) : host
+    }
 
     if (!schemeHandler || (schemeHandler && !schemeHandler.skipNormalize)) {
-      if (uri.indexOf('%') !== -1) {
-        if (parsed.host !== undefined && !malformedIPLiteral) {
-          const host = isIP ? parsed.host : normalizePercentEncoding(parsed.host, true)
-          parsed.host = reescapeHostDelimiters(host, isIP)
-        }
-      }
       if (parsed.path) {
         parsed.path = normalizePathEncoding(parsed.path)
       }
@@ -47989,6 +53818,9 @@ const isUUID = RegExp.prototype.test.bind(/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\d
 const isIPv4 = RegExp.prototype.test.bind(/^(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)$/u)
 
 /** @type {(value: string) => boolean} */
+const isPort = RegExp.prototype.test.bind(/^\d*$/u)
+
+/** @type {(value: string) => boolean} */
 const isHexPair = RegExp.prototype.test.bind(/^[\da-f]{2}$/iu)
 
 /** @type {(value: string) => boolean} */
@@ -48322,6 +54154,57 @@ function removeDotSegments (path) {
   }
 
   return output.join('')
+}
+
+/**
+ * Removes dot segments from the path of a relative reference (a path that does
+ * not start with "/") without changing what it resolves to against any base.
+ * Unlike `removeDotSegments`, leading ".." segments that cannot be collapsed
+ * are kept, the result never becomes root-relative, and a result that would be
+ * empty or start with an empty segment is prefixed with "." (an empty path
+ * means "same document" and a leading "//" would introduce an authority).
+ *
+ * @param {string} path
+ * @returns {string}
+ */
+function removeDotSegmentsRelative (path) {
+  if (path === '' || path[0] === '/') {
+    return removeDotSegments(path)
+  }
+
+  const segments = path.split('/')
+  const last = segments.length - 1
+  /** @type {string[]} */
+  const output = []
+  let trailingDirectory = false
+
+  for (let i = 0; i <= last; i++) {
+    const segment = segments[i]
+    if (segment === '.' || segment === '..') {
+      if (segment === '..') {
+        if (output.length !== 0 && output[output.length - 1] !== '..') {
+          output.pop()
+        } else {
+          output.push('..')
+        }
+      }
+      trailingDirectory = i === last
+    } else {
+      output.push(segment)
+    }
+  }
+
+  if (trailingDirectory && output[output.length - 1] !== '..') {
+    output.push('')
+  }
+  if (output.length === 0 || output[0] === '' || output[0].includes(':')) {
+    // An empty path, a leading empty segment ("//"), or a first segment
+    // containing ":" (which would be mistaken for a scheme, RFC 3986 section
+    // 4.2) must stay behind a "." segment so the reference keeps its meaning.
+    output.unshift('.')
+  }
+
+  return output.join('/')
 }
 
 /**
@@ -48695,8 +54578,12 @@ function recomposeAuthority (component) {
   }
 
   if (typeof component.port === 'number' || typeof component.port === 'string') {
+    const port = String(component.port)
+    if (!isPort(port)) {
+      throw new TypeError('URI port is malformed.')
+    }
     uriTokens.push(':')
-    uriTokens.push(String(component.port))
+    uriTokens.push(port)
   }
 
   return uriTokens.length ? uriTokens.join('') : undefined
@@ -48715,6 +54602,7 @@ module.exports = {
   encodeFragment,
   escapePreservingEscapes,
   removeDotSegments,
+  removeDotSegmentsRelative,
   isIPv4,
   isUUID,
   normalizeIPv6,
@@ -52074,18 +57962,23 @@ function jsonStringifyReplacer(_, value) {
         return value.toString();
     return value;
 }
+// the accessor lives on a shared prototype: an own accessor makes every box a dictionary-mode object (~360 B and a slow load per read against ~100 B and an inlined getter here)
+class Cached {
+    constructor(getter) {
+        this._getter = getter;
+        this._value = undefined;
+    }
+    get value() {
+        const getter = this._getter;
+        if (getter !== undefined) {
+            this._value = getter();
+            this._getter = undefined;
+        }
+        return this._value;
+    }
+}
 function cached(getter) {
-    const set = false;
-    return {
-        get value() {
-            if (!set) {
-                const value = getter();
-                Object.defineProperty(this, "value", { value });
-                return value;
-            }
-            throw new Error("cached value already set");
-        },
-    };
+    return new Cached(getter);
 }
 function nullish(input) {
     return input === null || input === undefined;
@@ -52139,6 +58032,71 @@ function util_assignProp(target, prop, value) {
         enumerable: true,
         configurable: true,
     });
+}
+/**
+ * Whichever object a def's `shape` currently answers from: the one the caller passed until the first read, the frozen copy after it.
+ *
+ * Its keys and descriptors read without invoking anything, which is what lets a discriminated union check its discriminator, and the cycle walk read a shape, without resolving a getter that references the schema being constructed. A def that answers `shape` from an accessor of its own has none.
+ */
+function rawShape(def) {
+    const desc = Object.getOwnPropertyDescriptor(def, "shape");
+    return desc?.get ? desc.get.raw : desc?.value;
+}
+// where a builder reads its source's keys and descriptors, resolving only a shape a def answers for itself. A shape resolves by object spread, so only its enumerable keys are ever part of it.
+function sourceShape(schema) {
+    return rawShape(schema._zod.def) ?? schema._zod.def.shape;
+}
+// a key whose value is not settled yet, self-caching so every read after the first gets the same one
+function deferProp(target, key, getter) {
+    Object.defineProperty(target, key, {
+        get() {
+            const value = getter();
+            util_assignProp(this, key, value);
+            return value;
+        },
+        enumerable: true,
+        configurable: true,
+    });
+}
+// Writes a settled key. A plain assignment is much cheaper than `defineProperty` and produces the same descriptor, but it runs whatever setter already answers to the key — an accessor this shape deferred, or an inherited one, which `__proto__` has on every object and prototype pollution can add for any name.
+function putProp(target, key, value) {
+    if (key in target)
+        util_assignProp(target, key, value);
+    else
+        target[key] = value;
+}
+/**
+ * Copies `keys` of `source`'s shape onto `target`, each value passed through `wrap`.
+ *
+ * A key the source has resolved is copied through now, so the derived shape states it outright and nothing has to resolve it to learn what it holds. A key the source still defers stays deferred, and reads back through the source's own `shape`, so it resolves once and both shapes get that one schema.
+ */
+function mirrorShape(target, source, keys, wrap) {
+    const raw = sourceShape(source);
+    for (const key of keys) {
+        const desc = Object.getOwnPropertyDescriptor(raw, key);
+        if (!desc.enumerable)
+            continue;
+        if (desc.get) {
+            deferProp(target, key, () => {
+                const value = source._zod.def.shape[key];
+                return wrap ? wrap(value, key) : value;
+            });
+        }
+        else
+            putProp(target, key, wrap ? wrap(desc.value, key) : desc.value);
+    }
+}
+// same, for a plain shape a caller passed rather than a schema's
+function mirrorProps(target, source) {
+    for (const key of Reflect.ownKeys(source)) {
+        const desc = Object.getOwnPropertyDescriptor(source, key);
+        if (!desc.enumerable)
+            continue;
+        if (desc.get)
+            deferProp(target, key, () => source[key]);
+        else
+            putProp(target, key, desc.value);
+    }
 }
 function mergeDefs(...defs) {
     const mergedDescriptors = {};
@@ -52391,24 +58349,23 @@ function pick(schema, mask) {
     if (hasChecks) {
         throw new Error(".pick() cannot be used on object schemas containing refinements");
     }
-    const def = mergeDefs(schema._zod.def, {
-        get shape() {
-            const newShape = {};
-            // `for...in` skips symbols, so a symbol in the mask would select nothing
-            for (const key of Reflect.ownKeys(mask)) {
-                if (!Object.prototype.hasOwnProperty.call(currDef.shape, key)) {
-                    throw new Error(`Unrecognized key: "${String(key)}"`);
-                }
-                if (!mask[key])
-                    continue;
-                util_assignProp(newShape, key, currDef.shape[key]);
-            }
-            util_assignProp(this, "shape", newShape); // self-caching
-            return newShape;
-        },
-        checks: [],
-    });
-    return clone(schema, def);
+    const newShape = {};
+    mirrorShape(newShape, schema, maskedKeys(schema, mask));
+    return clone(schema, mergeDefs(currDef, { shape: newShape, checks: [] }));
+}
+// the mask keys that select something, checked against the source's shape without resolving it
+function maskedKeys(schema, mask) {
+    const raw = sourceShape(schema);
+    const keys = [];
+    // `for...in` skips symbols, so a symbol in the mask would select nothing
+    for (const key of Reflect.ownKeys(mask)) {
+        if (!Object.getOwnPropertyDescriptor(raw, key)?.enumerable) {
+            throw new Error(`Unrecognized key: "${String(key)}"`);
+        }
+        if (mask[key])
+            keys.push(key);
+    }
+    return keys;
 }
 function omit(schema, mask) {
     const currDef = schema._zod.def;
@@ -52417,23 +58374,10 @@ function omit(schema, mask) {
     if (hasChecks) {
         throw new Error(".omit() cannot be used on object schemas containing refinements");
     }
-    const def = mergeDefs(schema._zod.def, {
-        get shape() {
-            const newShape = { ...schema._zod.def.shape };
-            for (const key of Reflect.ownKeys(mask)) {
-                if (!Object.prototype.hasOwnProperty.call(currDef.shape, key)) {
-                    throw new Error(`Unrecognized key: "${String(key)}"`);
-                }
-                if (!mask[key])
-                    continue;
-                delete newShape[key];
-            }
-            util_assignProp(this, "shape", newShape); // self-caching
-            return newShape;
-        },
-        checks: [],
-    });
-    return clone(schema, def);
+    const omitted = new Set(maskedKeys(schema, mask));
+    const newShape = {};
+    mirrorShape(newShape, schema, Reflect.ownKeys(sourceShape(schema)).filter((key) => !omitted.has(key)));
+    return clone(schema, mergeDefs(currDef, { shape: newShape, checks: [] }));
 }
 function extend(schema, shape) {
     if (!isPlainObject(shape)) {
@@ -52443,34 +58387,27 @@ function extend(schema, shape) {
     const hasChecks = checks && checks.length > 0;
     if (hasChecks) {
         // Only throw if new shape overlaps with existing shape. Use getOwnPropertyDescriptor to check key existence without accessing values
-        const existingShape = schema._zod.def.shape;
+        const existingShape = sourceShape(schema);
         for (const key of Reflect.ownKeys(shape)) {
             if (Object.getOwnPropertyDescriptor(existingShape, key) !== undefined) {
                 throw new Error("Cannot overwrite keys on object schemas containing refinements. Use `.safeExtend()` instead.");
             }
         }
     }
-    const def = mergeDefs(schema._zod.def, {
-        get shape() {
-            const _shape = { ...schema._zod.def.shape, ...shape };
-            util_assignProp(this, "shape", _shape); // self-caching
-            return _shape;
-        },
-    });
-    return clone(schema, def);
+    return clone(schema, mergeDefs(schema._zod.def, { shape: extended(schema, shape) }));
+}
+// the source's keys, then the caller's overlaid on top
+function extended(schema, shape) {
+    const newShape = {};
+    mirrorShape(newShape, schema, Reflect.ownKeys(sourceShape(schema)));
+    mirrorProps(newShape, shape);
+    return newShape;
 }
 function safeExtend(schema, shape) {
     if (!isPlainObject(shape)) {
         throw new Error("Invalid input to safeExtend: expected a plain object");
     }
-    const def = mergeDefs(schema._zod.def, {
-        get shape() {
-            const _shape = { ...schema._zod.def.shape, ...shape };
-            util_assignProp(this, "shape", _shape); // self-caching
-            return _shape;
-        },
-    });
-    return clone(schema, def);
+    return clone(schema, mergeDefs(schema._zod.def, { shape: extended(schema, shape) }));
 }
 function merge(a, b) {
     if (!b?._zod?.def) {
@@ -52479,12 +58416,11 @@ function merge(a, b) {
     if (a._zod.def.checks?.length) {
         throw new Error(".merge() cannot be used on object schemas containing refinements. Use .safeExtend() instead.");
     }
+    const newShape = {};
+    mirrorShape(newShape, a, Reflect.ownKeys(sourceShape(a)));
+    mirrorShape(newShape, b, Reflect.ownKeys(sourceShape(b)));
     const def = mergeDefs(a._zod.def, {
-        get shape() {
-            const _shape = { ...a._zod.def.shape, ...b._zod.def.shape };
-            util_assignProp(this, "shape", _shape); // self-caching
-            return _shape;
-        },
+        shape: newShape,
         get catchall() {
             return b._zod.def.catchall;
         },
@@ -52499,78 +58435,19 @@ function partial(Class, schema, mask, name = "partial") {
     if (hasChecks) {
         throw new Error(`.${name}() cannot be used on object schemas containing refinements`);
     }
-    const def = mergeDefs(schema._zod.def, {
-        get shape() {
-            const oldShape = schema._zod.def.shape;
-            const shape = { ...oldShape };
-            if (mask) {
-                for (const key of Reflect.ownKeys(mask)) {
-                    if (!Object.prototype.hasOwnProperty.call(oldShape, key)) {
-                        throw new Error(`Unrecognized key: "${String(key)}"`);
-                    }
-                    if (!mask[key])
-                        continue;
-                    // if (oldShape[key]!._zod.optin === "optional") continue;
-                    shape[key] = Class
-                        ? new Class({
-                            type: "optional",
-                            innerType: oldShape[key],
-                        })
-                        : oldShape[key];
-                }
-            }
-            else {
-                // the spread copies symbol keys; `for...in` would not reach them
-                for (const key of Reflect.ownKeys(oldShape)) {
-                    // if (oldShape[key]!._zod.optin === "optional") continue;
-                    shape[key] = Class
-                        ? new Class({
-                            type: "optional",
-                            innerType: oldShape[key],
-                        })
-                        : oldShape[key];
-                }
-            }
-            util_assignProp(this, "shape", shape); // self-caching
-            return shape;
-        },
-        checks: [],
-    });
-    return clone(schema, def);
+    const selected = mask ? new Set(maskedKeys(schema, mask)) : undefined;
+    const newShape = {};
+    mirrorShape(newShape, schema, Reflect.ownKeys(sourceShape(schema)), Class &&
+        ((value, key) => (selected && !selected.has(key) ? value : new Class({ type: "optional", innerType: value }))));
+    return clone(schema, mergeDefs(schema._zod.def, { shape: newShape, checks: [] }));
 }
 function required(Class, schema, mask) {
-    const def = mergeDefs(schema._zod.def, {
-        get shape() {
-            const oldShape = schema._zod.def.shape;
-            const shape = { ...oldShape };
-            if (mask) {
-                for (const key of Reflect.ownKeys(mask)) {
-                    if (!Object.prototype.hasOwnProperty.call(shape, key)) {
-                        throw new Error(`Unrecognized key: "${String(key)}"`);
-                    }
-                    if (!mask[key])
-                        continue;
-                    // overwrite with non-optional
-                    shape[key] = new Class({
-                        type: "nonoptional",
-                        innerType: oldShape[key],
-                    });
-                }
-            }
-            else {
-                for (const key of Reflect.ownKeys(oldShape)) {
-                    // overwrite with non-optional
-                    shape[key] = new Class({
-                        type: "nonoptional",
-                        innerType: oldShape[key],
-                    });
-                }
-            }
-            util_assignProp(this, "shape", shape); // self-caching
-            return shape;
-        },
-    });
-    return clone(schema, def);
+    const selected = mask ? new Set(maskedKeys(schema, mask)) : undefined;
+    const newShape = {};
+    mirrorShape(newShape, schema, Reflect.ownKeys(sourceShape(schema)), (value, key) => 
+    // overwrite with non-optional
+    selected && !selected.has(key) ? value : new Class({ type: "nonoptional", innerType: value }));
+    return clone(schema, mergeDefs(schema._zod.def, { shape: newShape }));
 }
 // invalid_type | too_big | too_small | invalid_format | not_multiple_of | unrecognized_keys | invalid_union | invalid_key | invalid_element | invalid_value | custom
 function aborted(x, startIndex = 0) {
@@ -52606,6 +58483,20 @@ function unwrapMessage(message) {
     return typeof message === "string" ? message : message?.message;
 }
 /* A check holds no link back to the schema it is attached to — the same check instance is shared by every clone of that schema — so the owner is stamped onto the issues a check just raised, at the only point where both are in scope. Runs on the failure path only; `start` is the issue count from before the check ran. */
+/** The leading size checks of `defChecks` that set an upper bound, each paired with it. */
+function sizeCaps(defChecks) {
+    const caps = [];
+    for (const ch of defChecks ?? []) {
+        const d = ch._zod.def;
+        // a later check may rewrite the value
+        if (!/_(length|size)$|_equals$/.test(d.check))
+            break;
+        const max = d.maximum ?? d.length ?? d.size;
+        if (max >= 0)
+            caps.push([max, ch]);
+    }
+    return caps;
+}
 function attachSchema(issues, start, inst) {
     var _a;
     for (let i = start; i < issues.length; i++) {
@@ -52632,13 +58523,19 @@ function finalizeIssue(iss, ctx, config) {
             unwrapMessage(config.customError?.(iss)) ??
             unwrapMessage(config.localeError?.(iss)) ??
             "Invalid input");
-    const { inst: _inst, schema: _schema, continue: _continue, input: _input, ...rest } = iss;
-    rest.path ?? (rest.path = []);
-    rest.message = message;
-    if (ctx?.reportInput) {
-        rest.input = _input;
+    // an explicit own-key copy beats object rest with excluded keys, which v8 routes through a generic runtime call; Object.keys rather than for-in so an issue pushed with a prototype does not leak inherited keys, and an own __proto__ key is dropped rather than assigned through the setter
+    const full = {};
+    for (const k of Object.keys(iss)) {
+        if (k === "inst" || k === "schema" || k === "continue" || k === "input" || k === "__proto__")
+            continue;
+        full[k] = iss[k];
     }
-    return rest;
+    full.path ?? (full.path = []);
+    full.message = message;
+    if (ctx?.reportInput) {
+        full.input = iss.input;
+    }
+    return full;
 }
 function getSizableOrigin(input) {
     if (input instanceof Set)
@@ -52784,6 +58681,24 @@ function own(inst, key, value, enumerable = true) {
 /** Like {@link own}, for a member that was never an own data property and has to stay out of `Object.keys`. */
 function hide(inst, key, value) {
     return own(inst, key, value, false);
+}
+/** Adds members a table derives from the instance: each builds on first read and shadows as own data, and assignment shadows the same way, as when these were own properties. */
+function derived(computes, table) {
+    for (const key in computes) {
+        const compute = computes[key];
+        // an object literal's accessor is configurable and enumerable, and `members` copies the descriptor as written
+        Object.defineProperty(table, key, {
+            configurable: true,
+            enumerable: true,
+            get() {
+                return own(this, key, compute(this));
+            },
+            set(value) {
+                own(this, key, value);
+            },
+        });
+    }
+    return table;
 }
 function defineBound(proto, key, fn) {
     Object.defineProperty(proto, key, {
@@ -52951,7 +58866,7 @@ proto, params) {
                 _zodDesc.value = undefined;
             }
         }
-        if (inst._zod.traits.has(name)) {
+        else if (inst._zod.traits.has(name)) {
             return;
         }
         inst._zod.traits.add(name);
@@ -53056,7 +58971,6 @@ const _messageDesc = {
     enumerable: true,
     configurable: true,
 };
-const errors_zodDesc = { value: undefined, enumerable: false };
 const _issuesDesc = { value: undefined, enumerable: false };
 /* Prototypes that already carry the lazy `toString`. Seeded with the
  * intrinsics so that `init` on a foreign object — it accepts any object —
@@ -53064,12 +58978,10 @@ const _issuesDesc = { value: undefined, enumerable: false };
 const _installedToString = /* @__PURE__ */ new WeakSet([Object.prototype, Error.prototype]);
 const initializer = (inst, def) => {
     inst.name = "$ZodError";
-    errors_zodDesc.value = inst._zod;
-    Object.defineProperty(inst, "_zod", errors_zodDesc);
+    // `_zod` is already non-enumerable: $constructor's init defined it with this same descriptor
     _issuesDesc.value = def;
     Object.defineProperty(inst, "issues", _issuesDesc);
-    // Clear the shared slots; a retained `value` pins the last error's issues.
-    errors_zodDesc.value = undefined;
+    // Clear the shared slot; a retained `value` pins the last error's issues.
     _issuesDesc.value = undefined;
     Object.defineProperty(inst, "message", _messageDesc);
     /* `toString` lives as a non-enumerable lazy getter on the shared
@@ -53352,39 +59264,58 @@ const _safeParse = (_Err) => (schema, value, _ctx) => {
     if (result instanceof Promise) {
         throw new $ZodAsyncError();
     }
-    return result.issues.length
-        ? {
-            success: false,
-            error: new (_Err ?? $ZodError)(result.issues.map((iss) => finalizeIssue(iss, ctx, config()))),
-        }
-        : { success: true, data: result.value };
+    return result.issues.length ? failure(_Err, result.issues, ctx) : { success: true, data: result.value };
 };
 const safeParse = /* @__PURE__*/ _safeParse($ZodRealError);
+// the error is built on the first read of `error`: finalizing the issues and constructing the instance is most of a failing parse, and a caller that only branches on `success` never pays it. a getter in the literal keeps this small; the alternative, one shared accessor descriptor plus a hidden state slot, reads ~15% faster but costs ~75 B gzipped in every bundle
+function failure(Err, issues, ctx) {
+    let error;
+    return {
+        success: false,
+        get error() {
+            if (!error) {
+                error = new Err(issues.map((iss) => finalizeIssue(iss, ctx, config())));
+                // finalizeIssue drops `input`, so the built error holds nothing; keeping the raw issues past this point pins the parsed value for the life of the result
+                issues = undefined;
+                ctx = undefined;
+            }
+            return error;
+        },
+        set error(e) {
+            error = e;
+            // a replacement makes the getter's branch unreachable, so the captures have to go here too
+            issues = undefined;
+            ctx = undefined;
+        },
+    };
+}
 const _safeParseAsync = (_Err) => async (schema, value, _ctx) => {
     const ctx = _ctx ? { ..._ctx, async: true } : { async: true };
     let result = schema._zod.run({ value, issues: [] }, ctx);
     if (result instanceof Promise)
         result = await result;
-    return result.issues.length
-        ? {
-            success: false,
-            error: new _Err(result.issues.map((iss) => finalizeIssue(iss, ctx, config()))),
-        }
-        : { success: true, data: result.value };
+    return result.issues.length ? failure(_Err, result.issues, ctx) : { success: true, data: result.value };
 };
 const safeParseAsync = /* @__PURE__*/ _safeParseAsync($ZodRealError);
 // registry mirrors of the compiler's sentinels, so this module never imports the compiler
-const COMPILE_INVALID = /* @__PURE__ */ (/* unused pure expression or super */ null && (Symbol.for("zod.compile.invalid")));
-const COMPILE_FALLBACK = /* @__PURE__ */ (/* unused pure expression or super */ null && (Symbol.for("zod.compile.fallback")));
+const COMPILE_INVALID = /* @__PURE__ */ Symbol.for("zod.compile.invalid");
+const COMPILE_FALLBACK = /* @__PURE__ */ Symbol.for("zod.compile.fallback");
 // Deliberately tiny, because v8 will not inline a body carrying the fallback's object literals and throw. Everything that is not the compiled happy path lives in validateFallback, and that split is worth ~35% on a compiled schema.
 const validate = ((schema, value, _ctx) => {
     const validator = schema._zod.bag.validator;
-    if (validator !== undefined && validator(value) !== COMPILE_INVALID)
-        return true;
+    if (validator !== undefined) {
+        if (validator(value) !== COMPILE_INVALID)
+            return true;
+        // a definite sentinel means the runtime would reject, so skip the re-parse; a ctx can still change the answer
+        if (validator.definite === true && _ctx === undefined)
+            return false;
+    }
     return validateFallback(schema, value, _ctx);
 });
 function validateFallback(schema, value, _ctx) {
-    const ctx = _ctx ? { ..._ctx, async: false } : { async: false };
+    const ctx = _ctx
+        ? { ..._ctx, async: false, abortEarly: true }
+        : { async: false, abortEarly: true };
     const fallbackRun = schema._zod.bag.fallbackRun;
     let result;
     if (fallbackRun) {
@@ -53396,13 +59327,15 @@ function validateFallback(schema, value, _ctx) {
         result = schema._zod.run({ value, issues: [] }, ctx);
     }
     if (result instanceof Promise) {
-        throw new core.$ZodAsyncError();
+        throw new $ZodAsyncError();
     }
     return result.issues.length === 0;
 }
 // no fast path: the compiler keeps async parses on the runtime, because a promise-returning callback that is not declared async compiles to a throw
 const validateAsync = async (schema, value, _ctx) => {
-    const ctx = _ctx ? { ..._ctx, async: true } : { async: true };
+    const ctx = _ctx
+        ? { ..._ctx, async: true, abortEarly: true }
+        : { async: true, abortEarly: true };
     let result = schema._zod.run({ value, issues: [] }, ctx);
     if (result instanceof Promise)
         result = await result;
@@ -53691,6 +59624,7 @@ function getLiteralValue(schema) {
 }
 //# sourceMappingURL=zod-compat.js.map
 ;// CONCATENATED MODULE: ./node_modules/zod/v4/core/memoizer.js
+
 class $ZodCyclicError extends Error {
     constructor() {
         super(`Cannot parse a reference cycle that closes through a transform`);
@@ -53700,32 +59634,62 @@ class $ZodCyclicError extends Error {
 /** Keyed off the context object every schema in one parse call already shares. */
 const STATE = "~memo";
 const NO_ISSUES = [];
+// a value a cycle can close through
+function isRef(value) {
+    return value !== null && typeof value === "object";
+}
 // Receivers prefix paths in place, so the cache and every hand-out need their own copies.
 function cloneIssues(issues) {
     return issues.map((iss) => (iss.path ? { ...iss, path: iss.path.slice() } : { ...iss }));
 }
 const recursive = /*@__PURE__*/ new WeakMap();
+/** What the walk established, in order of certainty: ordered so the strongest answer among children wins. */
+const NONE = 0;
+const ASSUMED = 1;
+const PROVEN = 2;
 /** Whether this schema's subtree contains a cycle, so one parse can re-enter it. */
-function isRecursive(inst, stack) {
+function isRecursive(inst, stack, resolve) {
     const cached = recursive.get(inst);
     if (cached !== undefined)
-        return cached;
+        return cached ? PROVEN : NONE;
     // Relative to the walk in progress, so not cached.
     if (stack.has(inst))
-        return true;
+        return PROVEN;
     stack.add(inst);
-    let result = false;
+    let result = NONE;
     const check = (child) => {
-        if (!result && child?._zod && isRecursive(child, stack))
-            result = true;
+        if (result !== PROVEN && child?._zod) {
+            const answer = isRecursive(child, stack, resolve);
+            if (answer > result)
+                result = answer;
+        }
+    };
+    // `Reflect.ownKeys` rather than `Object.keys`, so a cycle through a declared symbol key is still seen
+    const shape = (sh, spread) => {
+        let answer = NONE;
+        for (const key of Reflect.ownKeys(sh)) {
+            const desc = Object.getOwnPropertyDescriptor(sh, key);
+            // an object resolves its shape by spread, so a key it does not enumerate is never parsed; `z.properties` reads every own key and so keeps them all
+            if (spread && !desc.enumerable)
+                continue;
+            // resolving runs user code, and a factory mints a fresh subtree per read, so an edge the walk can't follow counts as a cycle
+            const child = desc.get ? ASSUMED : desc.value?._zod ? isRecursive(desc.value, stack, resolve) : NONE;
+            if (child > answer)
+                answer = child;
+        }
+        return answer;
+    };
+    const merge = (answer) => {
+        if (answer > result)
+            result = answer;
     };
     const def = inst._zod.def;
     const kind = def.type;
     switch (kind) {
         case "object": {
-            // `Reflect.ownKeys` rather than `Object.keys`, so a cycle through a declared symbol key is still seen
-            for (const key of Reflect.ownKeys(def.shape))
-                check(def.shape[key]);
+            const raw = rawShape(def);
+            // a def with no raw shape answers `shape` from an accessor of its own, and running that can mint a whole fresh subtree
+            merge(raw ? shape(raw, true) : ASSUMED);
             check(def.catchall);
             break;
         }
@@ -53772,10 +59736,13 @@ function isRecursive(inst, stack) {
             check(def.input);
             check(def.output);
             break;
-        // reading `_zod.innerType` resolves the getter once and caches it
-        case "lazy":
-            check(inst._zod.innerType);
+        // `$ZodLazy` caches its inner on the def, so a resolved edge is followed exactly
+        case "lazy": {
+            const inner = def._cachedInner ?? (resolve ? inst._zod.innerType : undefined);
+            // walked with resolution off: one hop sees past the deferral, and a lazy that yields only another unresolved lazy is generative, so it stops there
+            merge(inner ? isRecursive(inner, stack, false) : ASSUMED);
             break;
+        }
         // a leaf by choice: `parts` are regex fragments, not data positions
         case "template_literal":
         // leaves
@@ -53819,8 +59786,13 @@ function isRecursive(inst, stack) {
         }
     }
     stack.delete(inst);
-    recursive.set(inst, result);
-    return result;
+    return settle(inst, result);
+}
+/** An assumed answer must not outlive the resolution that settles it, so only a certain one is cached. */
+function settle(inst, answer) {
+    if (answer !== ASSUMED)
+        recursive.set(inst, answer === PROVEN);
+    return answer;
 }
 /**
  * Whether one parse can re-enter this schema, i.e. its subtree contains a cycle.
@@ -53829,12 +59801,13 @@ function isRecursive(inst, stack) {
  * generated fast path has no context to key on.
  */
 function isRecursiveSchema(inst) {
-    return isRecursive(inst, new Set());
+    // z.compile never parses, so nothing would ever resolve a lazy for it; it runs once and already treats a throw here as recursive
+    return isRecursive(inst, new Set(), true) !== NONE;
 }
 function bucketFor(state, inst) {
     let bucket = state.buckets.get(inst);
     if (!bucket) {
-        bucket = new Map();
+        bucket = new WeakMap();
         state.buckets.set(inst, bucket);
     }
     return bucket;
@@ -53873,7 +59846,8 @@ const memo = {
     attach(inst) {
         var _a;
         let isRecursiveInst;
-        // `bucket` memoized for one parse; a recursive schema is re-entered many times and its bucket never changes
+        let rechecked = false;
+        // a recursive schema is re-entered many times per parse and its bucket never changes
         let lastCtx;
         let lastBucket;
         // Wraps `parse` in a deferred so it sees the container's final parse. Core's own deferred copies `parse` into `run` when there are no checks, and it ran first, so `run` is patched to match; with checks, `run` reads `parse` dynamically.
@@ -53882,21 +59856,26 @@ const memo = {
             const base = inst._zod.parse;
             const wrapped = (payload, ctx) => {
                 if (isRecursiveInst === undefined) {
-                    isRecursiveInst = isRecursive(inst, new Set());
-                    if (!isRecursiveInst) {
+                    const walked = isRecursive(inst, new Set(), false);
+                    if (walked === NONE) {
                         // Nothing here can ever fire, so take it back out.
                         inst._zod.parse = base;
                         if (inst._zod.run === wrapped)
                             inst._zod.run = base;
                         return base(payload, ctx);
                     }
+                    // this parse resolves the deferred edges on its own path, so ask once more before latching
+                    if (walked === PROVEN || rechecked)
+                        isRecursiveInst = true;
+                    else
+                        rechecked = true;
                 }
                 const input = payload.value;
-                if (input === null || typeof input !== "object")
+                if (!isRef(input))
                     return base(payload, ctx);
                 let state = ctx[STATE];
                 if (!state) {
-                    state = { buckets: new Map(), backEdges: undefined };
+                    state = { buckets: new WeakMap(), backEdges: undefined };
                     ctx[STATE] = state;
                 }
                 let bucket;
@@ -53918,7 +59897,7 @@ const memo = {
                     else {
                         // Still being parsed: its own checks cover it, so skip them here.
                         payload.memo = true;
-                        state.backEdges ?? (state.backEdges = new Set());
+                        state.backEdges ?? (state.backEdges = new WeakSet());
                         state.backEdges.add(hit.value);
                     }
                     return payload;
@@ -53954,7 +59933,7 @@ function memoizer() {
 /** Whether this value is a node a back-edge resolved to before it finished. */
 function isBackEdge(ctx, value) {
     const backEdges = ctx[STATE]?.backEdges;
-    return backEdges !== undefined && value !== null && typeof value === "object" && backEdges.has(value);
+    return backEdges !== undefined && isRef(value) && backEdges.has(value);
 }
 
 ;// CONCATENATED MODULE: ./node_modules/zod/v4/core/regexes.js
@@ -53991,7 +59970,7 @@ const uuid4 = /*@__PURE__*/ (/* unused pure expression or super */ null && (uuid
 const uuid6 = /*@__PURE__*/ (/* unused pure expression or super */ null && (uuid(6)));
 const uuid7 = /*@__PURE__*/ (/* unused pure expression or super */ null && (uuid(7)));
 /** Practical email validation */
-const email = /^(?!\.)(?!.*\.\.)([A-Za-z0-9_'+\-\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$/;
+const email = /^(?:[A-Za-z0-9_'+\-]+\.)*[A-Za-z0-9_'+\-]*[A-Za-z0-9_+-]@(?:[A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$/;
 /** Equivalent to the HTML5 input[type=email] validation implemented by browsers. Source: https://developer.mozilla.org/en-US/docs/Web/HTML/Element/input/email */
 const html5Email = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
 /** The classic emailregex.com regex for RFC 5322-compliant emails */
@@ -54001,8 +59980,8 @@ const unicodeEmail = /^[^\s@"]{1,64}@[^\s@]{1,255}$/u;
 const idnEmail = (/* unused pure expression or super */ null && (unicodeEmail));
 const browserEmail = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
 // from https://thekevinscott.com/emojis-in-javascript/#writing-a-regular-expression
-// Single character class, not an alternation: the two properties overlap (U+1F9B0-U+1F9B3), so `(A|B)+` backtracks exponentially on a failed match.
-const _emoji = `^[\\p{Extended_Pictographic}\\p{Emoji_Component}]+$`;
+// Single character class, not an alternation: the two properties overlap (U+1F9B0-U+1F9B3), so `(A|B)+` backtracks exponentially on a failed match. The leading lookahead then demands one anchor — a pictograph, a regional indicator, or the enclosing keycap — because `\p{Emoji_Component}` on its own covers ASCII digits, `#`, `*`, ZWJ, variation selectors and skin tone modifiers, none of which is an emoji without a base.
+const _emoji = `^(?=[\\s\\S]*[\\p{Extended_Pictographic}\\p{Regional_Indicator}\\u20E3])[\\p{Extended_Pictographic}\\p{Emoji_Component}]+$`;
 function emoji() {
     return new RegExp(_emoji, "u");
 }
@@ -54016,7 +59995,7 @@ const cidrv4 = /^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(25[0-
 const cidrv6 = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))\/(12[0-8]|1[01][0-9]|[1-9]?[0-9])$/;
 // https://stackoverflow.com/questions/7860392/determine-if-string-is-in-base64-using-javascript
 const base64 = /^$|^(?:[0-9a-zA-Z+/]{4})*(?:(?:[0-9a-zA-Z+/]{2}==)|(?:[0-9a-zA-Z+/]{3}=))?$/;
-const base64url = /^[A-Za-z0-9_-]*$/;
+const base64url = /^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{2,3})?$/;
 // based on https://stackoverflow.com/questions/106179/regular-expression-to-match-dns-hostname-or-ip-address
 // export const hostname: RegExp = /^([a-zA-Z0-9-]+\.)*[a-zA-Z0-9-]+$/;
 const hostname = /^(?=.{1,253}\.?$)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[-0-9a-zA-Z]{0,61}[0-9a-zA-Z])?)*\.?$/;
@@ -54026,6 +60005,10 @@ const httpProtocol = /^https?$/;
 const e164 = /^\+[1-9]\d{6,14}$/;
 // Credit card shape: 12–19 digits, optionally separated by single spaces or single hyphens. ISO/IEC 7812 caps the PAN at 19 digits; 12 is the shortest issued length (Maestro).
 const creditCard = /^\d(?:[ -]?\d){11,18}$/;
+// ISO 4217 alpha codes from the SIX list, regenerated by scripts/update-iso-4217.ts
+const currencyCode = /^(?:AED|AFN|ALL|AMD|AOA|ARS|AUD|AWG|AZN|BAM|BBD|BDT|BHD|BIF|BMD|BND|BOB|BOV|BRL|BSD|BTN|BWP|BYN|BZD|CAD|CDF|CHE|CHF|CHW|CLF|CLP|CNY|COP|COU|CRC|CUP|CVE|CZK|DJF|DKK|DOP|DZD|EGP|ERN|ETB|EUR|FJD|FKP|GBP|GEL|GHS|GIP|GMD|GNF|GTQ|GYD|HKD|HNL|HTG|HUF|IDR|ILS|INR|IQD|IRR|ISK|JMD|JOD|JPY|KES|KGS|KHR|KMF|KPW|KRW|KWD|KYD|KZT|LAK|LBP|LKR|LRD|LSL|LYD|MAD|MDL|MGA|MKD|MMK|MNT|MOP|MRU|MUR|MVR|MWK|MXN|MXV|MYR|MZN|NAD|NGN|NIO|NOK|NPR|NZD|OMR|PAB|PEN|PGK|PHP|PKR|PLN|PYG|QAR|RON|RSD|RUB|RWF|SAR|SBD|SCR|SDG|SEK|SGD|SHP|SLE|SOS|SRD|SSP|STN|SVC|SYP|SZL|THB|TJS|TMT|TND|TOP|TRY|TTD|TWD|TZS|UAH|UGX|USD|USN|UYI|UYU|UYW|UZS|VED|VES|VND|VUV|WST|XAD|XAF|XAG|XAU|XBA|XBB|XBC|XBD|XCD|XCG|XDR|XOF|XPD|XPF|XPT|XSU|XTS|XUA|XXX|YER|ZAR|ZMW|ZWG)$/;
+// iban electronic format: 2-letter country, check digits 02-98 (the only values `98 - remainder` can produce), 11-30 bban characters
+const iban = /^[A-Z]{2}(?!00|01|99)\d{2}[A-Z0-9]{11,30}$/;
 const dateSource = `(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))`;
 /** Anchors a pattern source. The interpolation lives here rather than at the call site because
  * esbuild will not drop a `@__PURE__` call whose own argument interpolates a variable, but it
@@ -54061,6 +60044,8 @@ function datetime(args) {
     const timeRegex = args.local ? `${qualified}|${timeSource({ precision: args.precision })}` : qualified;
     return new RegExp(`^${dateSource}T(?:${timeRegex})$`);
 }
+// the unbounded form of `string()` as a literal, so every plain string shares one instance instead of building its own
+const anyString = /^[\s\S]{0,}$/;
 const string = (params) => {
     const regex = params ? `[\\s\\S]{${params?.minimum ?? 0},${params?.maximum ?? ""}}` : `[\\s\\S]*`;
     return new RegExp(`^${regex}$`);
@@ -54138,16 +60123,6 @@ const numericOriginMap = {
 const $ZodCheckLessThan = /*@__PURE__*/ $constructor("$ZodCheckLessThan", (inst, def) => {
     $ZodCheck.init(inst, def);
     const origin = numericOriginMap[typeof def.value];
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        const curr = (def.inclusive ? bag.maximum : bag.exclusiveMaximum) ?? Number.POSITIVE_INFINITY;
-        if (def.value < curr) {
-            if (def.inclusive)
-                bag.maximum = def.value;
-            else
-                bag.exclusiveMaximum = def.value;
-        }
-    });
     inst._zod.check = (payload) => {
         if (def.inclusive ? payload.value <= def.value : payload.value < def.value) {
             return;
@@ -54166,16 +60141,6 @@ const $ZodCheckLessThan = /*@__PURE__*/ $constructor("$ZodCheckLessThan", (inst,
 const $ZodCheckGreaterThan = /*@__PURE__*/ $constructor("$ZodCheckGreaterThan", (inst, def) => {
     $ZodCheck.init(inst, def);
     const origin = numericOriginMap[typeof def.value];
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        const curr = (def.inclusive ? bag.minimum : bag.exclusiveMinimum) ?? Number.NEGATIVE_INFINITY;
-        if (def.value > curr) {
-            if (def.inclusive)
-                bag.minimum = def.value;
-            else
-                bag.exclusiveMinimum = def.value;
-        }
-    });
     inst._zod.check = (payload) => {
         if (def.inclusive ? payload.value >= def.value : payload.value > def.value) {
             return;
@@ -54194,10 +60159,6 @@ const $ZodCheckGreaterThan = /*@__PURE__*/ $constructor("$ZodCheckGreaterThan", 
 const $ZodCheckMultipleOf = 
 /*@__PURE__*/ $constructor("$ZodCheckMultipleOf", (inst, def) => {
     $ZodCheck.init(inst, def);
-    inst._zod.onattach.push((inst) => {
-        var _a;
-        (_a = inst._zod.bag).multipleOf ?? (_a.multipleOf = def.value);
-    });
     inst._zod.check = (payload) => {
         if (typeof payload.value !== typeof def.value)
             throw new Error("Cannot mix number and bigint in multiple_of check.");
@@ -54223,14 +60184,6 @@ const $ZodCheckNumberFormat = /*@__PURE__*/ $constructor("$ZodCheckNumberFormat"
     const isInt = def.format?.includes("int");
     const origin = isInt ? "int" : "number";
     const [minimum, maximum] = NUMBER_FORMAT_RANGES[def.format];
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        bag.format = def.format;
-        bag.minimum = minimum;
-        bag.maximum = maximum;
-        if (isInt)
-            bag.pattern = integer;
-    });
     inst._zod.check = (payload) => {
         const input = payload.value;
         if (isInt) {
@@ -54319,12 +60272,6 @@ const $ZodCheckNumberFormat = /*@__PURE__*/ $constructor("$ZodCheckNumberFormat"
 const $ZodCheckBigIntFormat = /*@__PURE__*/ (/* unused pure expression or super */ null && (core.$constructor("$ZodCheckBigIntFormat", (inst, def) => {
     $ZodCheck.init(inst, def); // no format checks
     const [minimum, maximum] = util.BIGINT_FORMAT_RANGES[def.format];
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        bag.format = def.format;
-        bag.minimum = minimum;
-        bag.maximum = maximum;
-    });
     inst._zod.check = (payload) => {
         const input = payload.value;
         if (input < minimum) {
@@ -54355,11 +60302,6 @@ const $ZodCheckMaxSize = /*@__PURE__*/ (/* unused pure expression or super */ nu
     var _a;
     $ZodCheck.init(inst, def);
     (_a = inst._zod.def).when ?? (_a.when = _whenHasSize);
-    inst._zod.onattach.push((inst) => {
-        const curr = (inst._zod.bag.maximum ?? Number.POSITIVE_INFINITY);
-        if (def.maximum < curr)
-            inst._zod.bag.maximum = def.maximum;
-    });
     inst._zod.check = (payload) => {
         const input = payload.value;
         const size = input.size;
@@ -54380,11 +60322,6 @@ const $ZodCheckMinSize = /*@__PURE__*/ (/* unused pure expression or super */ nu
     var _a;
     $ZodCheck.init(inst, def);
     (_a = inst._zod.def).when ?? (_a.when = _whenHasSize);
-    inst._zod.onattach.push((inst) => {
-        const curr = (inst._zod.bag.minimum ?? Number.NEGATIVE_INFINITY);
-        if (def.minimum > curr)
-            inst._zod.bag.minimum = def.minimum;
-    });
     inst._zod.check = (payload) => {
         const input = payload.value;
         const size = input.size;
@@ -54405,12 +60342,6 @@ const $ZodCheckSizeEquals = /*@__PURE__*/ (/* unused pure expression or super */
     var _a;
     $ZodCheck.init(inst, def);
     (_a = inst._zod.def).when ?? (_a.when = _whenHasSize);
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        bag.minimum = def.size;
-        bag.maximum = def.size;
-        bag.size = def.size;
-    });
     inst._zod.check = (payload) => {
         const input = payload.value;
         const size = input.size;
@@ -54432,11 +60363,6 @@ const $ZodCheckMaxLength = /*@__PURE__*/ $constructor("$ZodCheckMaxLength", (ins
     var _a;
     $ZodCheck.init(inst, def);
     (_a = inst._zod.def).when ?? (_a.when = _whenHasLength);
-    inst._zod.onattach.push((inst) => {
-        const curr = (inst._zod.bag.maximum ?? Number.POSITIVE_INFINITY);
-        if (def.maximum < curr)
-            inst._zod.bag.maximum = def.maximum;
-    });
     inst._zod.check = (payload) => {
         const input = payload.value;
         const units = input.length;
@@ -54460,11 +60386,6 @@ const $ZodCheckMinLength = /*@__PURE__*/ $constructor("$ZodCheckMinLength", (ins
     var _a;
     $ZodCheck.init(inst, def);
     (_a = inst._zod.def).when ?? (_a.when = _whenHasLength);
-    inst._zod.onattach.push((inst) => {
-        const curr = (inst._zod.bag.minimum ?? Number.NEGATIVE_INFINITY);
-        if (def.minimum > curr)
-            inst._zod.bag.minimum = def.minimum;
-    });
     inst._zod.check = (payload) => {
         const input = payload.value;
         const units = input.length;
@@ -54490,12 +60411,6 @@ const $ZodCheckLengthEquals = /*@__PURE__*/ $constructor("$ZodCheckLengthEquals"
     var _a;
     $ZodCheck.init(inst, def);
     (_a = inst._zod.def).when ?? (_a.when = _whenHasLength);
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        bag.minimum = def.length;
-        bag.maximum = def.length;
-        bag.length = def.length;
-    });
     inst._zod.check = (payload) => {
         const input = payload.value;
         const units = input.length;
@@ -54521,14 +60436,6 @@ const $ZodCheckLengthEquals = /*@__PURE__*/ $constructor("$ZodCheckLengthEquals"
 const $ZodCheckStringFormat = /*@__PURE__*/ $constructor("$ZodCheckStringFormat", (inst, def) => {
     var _a, _b;
     $ZodCheck.init(inst, def);
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        bag.format = def.format;
-        if (def.pattern) {
-            bag.patterns ?? (bag.patterns = new Set());
-            bag.patterns.add(def.pattern);
-        }
-    });
     if (def.pattern)
         (_a = inst._zod).check ?? (_a.check = (payload) => {
             def.pattern.lastIndex = 0;
@@ -54580,11 +60487,6 @@ const $ZodCheckIncludes = /*@__PURE__*/ $constructor("$ZodCheckIncludes", (inst,
     // (`{N,}`), not exactly `position` chars (`{N}`).
     const pattern = new RegExp(typeof def.position === "number" ? `^.{${def.position},}${escapedRegex}` : escapedRegex);
     def.pattern = pattern;
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        bag.patterns ?? (bag.patterns = new Set());
-        bag.patterns.add(pattern);
-    });
     inst._zod.check = (payload) => {
         if (payload.value.includes(def.includes, def.position))
             return;
@@ -54603,11 +60505,6 @@ const $ZodCheckStartsWith = /*@__PURE__*/ $constructor("$ZodCheckStartsWith", (i
     $ZodCheck.init(inst, def);
     const pattern = new RegExp(`^${escapeRegex(def.prefix)}.*`);
     def.pattern ?? (def.pattern = pattern);
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        bag.patterns ?? (bag.patterns = new Set());
-        bag.patterns.add(pattern);
-    });
     inst._zod.check = (payload) => {
         if (payload.value.startsWith(def.prefix))
             return;
@@ -54626,11 +60523,6 @@ const $ZodCheckEndsWith = /*@__PURE__*/ $constructor("$ZodCheckEndsWith", (inst,
     $ZodCheck.init(inst, def);
     const pattern = new RegExp(`.*${escapeRegex(def.suffix)}$`);
     def.pattern ?? (def.pattern = pattern);
-    inst._zod.onattach.push((inst) => {
-        const bag = inst._zod.bag;
-        bag.patterns ?? (bag.patterns = new Set());
-        bag.patterns.add(pattern);
-    });
     inst._zod.check = (payload) => {
         if (payload.value.endsWith(def.suffix))
             return;
@@ -54650,7 +60542,7 @@ const $ZodCheckEndsWith = /*@__PURE__*/ $constructor("$ZodCheckEndsWith", (inst,
 ///////////////////////////////////
 function handleCheckPropertyResult(result, payload, property) {
     if (result.issues.length) {
-        payload.issues.push(...util.prefixIssues(property, result.issues));
+        payload.issues.push(...prefixIssues(property, result.issues));
     }
 }
 const $ZodCheckProperty = /*@__PURE__*/ (/* unused pure expression or super */ null && (core.$constructor("$ZodCheckProperty", (inst, def) => {
@@ -54667,12 +60559,40 @@ const $ZodCheckProperty = /*@__PURE__*/ (/* unused pure expression or super */ n
         return;
     };
 })));
+const $ZodCheckProperties = /*@__PURE__*/ $constructor("$ZodCheckProperties", (inst, def) => {
+    $ZodCheck.init(inst, def);
+    hide(inst, Symbol.iterator, function* () {
+        yield inst;
+    });
+    // key and schema snapshotted together: reading one live and the other cached lets a later mutation of the caller's shape object pair a stale key with a missing schema
+    let entries;
+    inst._zod.check = (payload) => {
+        // the base schema already typed the value, so only a nullish one is rejected here: the properties read on a primitive too, matching z.property() on a string's length
+        if (payload.value == null) {
+            payload.issues.push({ expected: "object", code: "invalid_type", input: payload.value, inst });
+            return undefined;
+        }
+        entries ?? (entries = Reflect.ownKeys(def.shape).map((key) => [key, def.shape[key]]));
+        const input = payload.value;
+        let proms;
+        for (const [key, schema] of entries) {
+            const result = schema._zod.run({ value: input[key], issues: [] }, {});
+            if (result instanceof Promise) {
+                proms ?? (proms = []);
+                proms.push(result.then((result) => handleCheckPropertyResult(result, payload, key)));
+            }
+            else {
+                handleCheckPropertyResult(result, payload, key);
+            }
+        }
+        if (proms)
+            return Promise.all(proms).then(() => undefined);
+        return undefined;
+    };
+});
 const $ZodCheckMimeType = /*@__PURE__*/ (/* unused pure expression or super */ null && (core.$constructor("$ZodCheckMimeType", (inst, def) => {
     $ZodCheck.init(inst, def);
     const mimeSet = new Set(def.mime);
-    inst._zod.onattach.push((inst) => {
-        inst._zod.bag.mime = def.mime;
-    });
     inst._zod.check = (payload) => {
         if (mimeSet.has(payload.value.type))
             return;
@@ -54700,10 +60620,15 @@ class Doc {
         this.args = args;
         this.closed = closed;
     }
+    // the compiler catches a child's throw and keeps writing into this doc, so the indent has to unwind with it
     indented(fn) {
         this.indent += 1;
-        fn(this);
-        this.indent -= 1;
+        try {
+            fn(this);
+        }
+        finally {
+            this.indent -= 1;
+        }
     }
     write(arg) {
         if (typeof arg === "function") {
@@ -54730,8 +60655,8 @@ class Doc {
 ;// CONCATENATED MODULE: ./node_modules/zod/v4/core/versions.js
 const version = {
     major: 4,
-    minor: 5,
-    patch: 4,
+    minor: 6,
+    patch: 7,
 };
 
 ;// CONCATENATED MODULE: ./node_modules/zod/v4/core/schemas.js
@@ -54865,16 +60790,24 @@ const $ZodType = /*@__PURE__*/ $constructor("$ZodType", (inst, def) => {
     },
 });
 /** The Standard Schema surface for `inst`. Shared so wrappers can extend it without forcing it. */
-const toStandardResult = (r) => r.success ? { value: r.data } : { issues: r.error?.issues };
+// a Standard Schema result only reports issues, so a failure finalizes them straight off the raw payload: no ZodError, and no lazy result to read through
+const toStandardResult = (r, ctx) => r.issues.length ? { issues: r.issues.map((iss) => finalizeIssue(iss, ctx, config())) } : { value: r.value };
+async function schemas_validateAsync(inst, value) {
+    const ctx = { async: true };
+    return toStandardResult((await inst._zod.run({ value, issues: [] }, ctx)), ctx);
+}
 function standardProps(inst) {
     return {
         validate: (value) => {
+            const ctx = { async: false };
             try {
-                return toStandardResult(safeParse(inst, value));
+                const r = inst._zod.run({ value, issues: [] }, ctx);
+                if (!(r instanceof Promise))
+                    return toStandardResult(r, ctx);
             }
-            catch (_) {
-                return safeParseAsync(inst, value).then(toStandardResult);
-            }
+            catch (_) { }
+            // async function so a synchronously throwing check rejects instead of escaping validate
+            return schemas_validateAsync(inst, value);
         },
         vendor: "zod",
         version: 1,
@@ -54883,7 +60816,8 @@ function standardProps(inst) {
 
 const $ZodString = /*@__PURE__*/ $constructor("$ZodString", (inst, def) => {
     $ZodType.init(inst, def);
-    inst._zod.pattern = [...(inst?._zod.bag?.patterns ?? [])].pop() ?? string(inst._zod.bag);
+    // a format's own pattern, else unbounded; a template literal derives the check-aware form itself
+    inst._zod.pattern = def.pattern ?? anyString;
     inst._zod.parse = (payload, _) => {
         if (def.coerce)
             try {
@@ -54937,15 +60871,37 @@ const $ZodEmail = /*@__PURE__*/ $constructor("$ZodEmail", (inst, def) => {
 });
 /** The `://` guard rejected the input before the URL constructor saw it. */
 const URL_BAD_FORMAT = 1;
-/** The URL constructor rejected the input. */
+/** The URL parser rejected the input. */
 const URL_UNPARSEABLE = 2;
-/** Parses a URL for `$ZodURL`, applying the one guard the URL constructor cannot express. Returns the parsed URL, or a code naming the stage that rejected it — the runtime needs that distinction to pick an issue note, and compiled code only needs to know it is not a URL. */
+function canParseURL(input) {
+    try {
+        if (typeof URL !== "undefined" && typeof URL.canParse === "function")
+            return URL.canParse(input);
+        new URL(input);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+function validateURL(trimmed, def) {
+    if (!("normalize" in def) && !("hostname" in def) && !("protocol" in def)) {
+        return canParseURL(trimmed) || URL_UNPARSEABLE;
+    }
+    return parseURLObject(trimmed, def);
+}
+/** Parses a URL while preserving the non-normalizing HTTP guard. */
 function parseURLObject(trimmed, def) {
     // When normalize is off, require :// for http/https URLs. This prevents strings like "http:example.com" or "https:/path" from being silently accepted
     if (!def.normalize && def.protocol?.source === httpProtocol.source && !/^https?:\/\//i.test(trimmed)) {
         return URL_BAD_FORMAT;
     }
     try {
+        if (typeof URL !== "undefined") {
+            const URLStatic = URL;
+            if (typeof URLStatic.parse === "function")
+                return URLStatic.parse(trimmed) ?? URL_UNPARSEABLE;
+        }
         // @ts-ignore
         return new URL(trimmed);
     }
@@ -54972,7 +60928,7 @@ const $ZodURL = /*@__PURE__*/ $constructor("$ZodURL", (inst, def) => {
         try {
             // Trim whitespace from input
             const trimmed = payload.value.trim();
-            const url = parseURLObject(trimmed, def);
+            const url = validateURL(trimmed, def);
             if (url === URL_BAD_FORMAT) {
                 payload.issues.push({
                     code: "invalid_format",
@@ -54992,6 +60948,10 @@ const $ZodURL = /*@__PURE__*/ $constructor("$ZodURL", (inst, def) => {
                     inst,
                     continue: !def.abort,
                 });
+                return;
+            }
+            if (url === true) {
+                payload.value = stripTabAndNewline(trimmed);
                 return;
             }
             if (def.hostname && !urlHostnameOk(url, def.hostname)) {
@@ -55069,13 +61029,6 @@ const $ZodKSUID = /*@__PURE__*/ $constructor("$ZodKSUID", (inst, def) => {
 const $ZodISODateTime = /*@__PURE__*/ $constructor("$ZodISODateTime", (inst, def) => {
     def.pattern ?? (def.pattern = datetime(def));
     $ZodStringFormat.init(inst, def);
-    // these two drop the offset or seconds `date-time` requires — on the bag not the def, since `z.string().check(...)` lands the format on a different schema
-    if (def.local || def.precision === -1) {
-        inst._zod.bag.laxFormat = true;
-        inst._zod.onattach.push((s) => {
-            s._zod.bag.laxFormat = true;
-        });
-    }
 });
 const $ZodISODate = /*@__PURE__*/ $constructor("$ZodISODate", (inst, def) => {
     def.pattern ?? (def.pattern = date);
@@ -55092,26 +61045,17 @@ const $ZodISODuration = /*@__PURE__*/ $constructor("$ZodISODuration", (inst, def
 const $ZodIPv4 = /*@__PURE__*/ $constructor("$ZodIPv4", (inst, def) => {
     def.pattern ?? (def.pattern = ipv4);
     $ZodStringFormat.init(inst, def);
-    inst._zod.bag.format = `ipv4`;
 });
 /** An IPv6 address is written with hex digits, colons and dots, and nothing else. The guard is what makes the check below an IPv6 check: `new URL("http://[...]")` parses an authority, not an address, so `@` and `\` re-delimit it and `"::@1\\"` validates against the host `0.0.0.1`. The URL parser also deletes ASCII tab, LF and CR rather than failing, which is how `"::1\n"` validated as `::1`. */
 const ipv6Alphabet = /^[0-9a-fA-F:.]+$/;
 function isValidIPv6(value) {
     if (!ipv6Alphabet.test(value))
         return false;
-    try {
-        // @ts-ignore
-        new URL(`http://[${value}]`);
-        return true;
-    }
-    catch {
-        return false;
-    }
+    return canParseURL(`http://[${value}]`);
 }
 const $ZodIPv6 = /*@__PURE__*/ $constructor("$ZodIPv6", (inst, def) => {
     def.pattern ?? (def.pattern = ipv6);
     $ZodStringFormat.init(inst, def);
-    inst._zod.bag.format = `ipv6`;
     inst._zod.check = (payload) => {
         if (!isValidIPv6(payload.value)) {
             payload.issues.push({
@@ -55127,7 +61071,6 @@ const $ZodIPv6 = /*@__PURE__*/ $constructor("$ZodIPv6", (inst, def) => {
 const $ZodMAC = /*@__PURE__*/ (/* unused pure expression or super */ null && (core.$constructor("$ZodMAC", (inst, def) => {
     def.pattern ?? (def.pattern = regexes.mac(def.delimiter));
     $ZodStringFormat.init(inst, def);
-    inst._zod.bag.format = `mac`;
 })));
 const $ZodCIDRv4 = /*@__PURE__*/ $constructor("$ZodCIDRv4", (inst, def) => {
     def.pattern ?? (def.pattern = cidrv4);
@@ -55180,10 +61123,11 @@ function isValidBase64(data) {
         return false;
     }
 }
+// lax on purpose: the quantified regexes.base64 overflows the regex stack on multi-MB input and its leading ^$| alternation leaks through template-literal composition; isValidBase64 enforces length and padding
+const base64Charset = /^[0-9a-zA-Z+/]*={0,2}$/;
 const $ZodBase64 = /*@__PURE__*/ $constructor("$ZodBase64", (inst, def) => {
-    def.pattern ?? (def.pattern = base64);
+    def.pattern ?? (def.pattern = base64Charset);
     $ZodStringFormat.init(inst, def);
-    inst._zod.bag.contentEncoding = "base64";
     inst._zod.check = (payload) => {
         if (isValidBase64(payload.value))
             return;
@@ -55196,18 +61140,19 @@ const $ZodBase64 = /*@__PURE__*/ $constructor("$ZodBase64", (inst, def) => {
         });
     };
 });
-//////////////////////////////   ZodBase64   //////////////////////////////
+//////////////////////////////   ZodBase64URL   //////////////////////////////
+// lax on purpose: the quantified regexes.base64url overflows the regex stack on multi-MB input; isValidBase64 enforces length on the padded string
+const base64urlCharset = /^[A-Za-z0-9_-]*$/;
 function isValidBase64URL(data) {
-    if (!base64url.test(data))
+    if (!base64urlCharset.test(data))
         return false;
     const base64 = data.replace(/[-_]/g, (c) => (c === "-" ? "+" : "/"));
     const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
     return isValidBase64(padded);
 }
 const $ZodBase64URL = /*@__PURE__*/ $constructor("$ZodBase64URL", (inst, def) => {
-    def.pattern ?? (def.pattern = base64url);
+    def.pattern ?? (def.pattern = base64urlCharset);
     $ZodStringFormat.init(inst, def);
-    inst._zod.bag.contentEncoding = "base64url";
     inst._zod.check = (payload) => {
         if (isValidBase64URL(payload.value))
             return;
@@ -55232,7 +61177,7 @@ function isLuhnAlgo(digits) {
     let bit = 1;
     let sum = 0;
     while (length) {
-        const value = +digits[--length];
+        const value = digits.charCodeAt(--length) - 48;
         bit ^= 1;
         sum += bit ? [0, 2, 4, 6, 8, 1, 3, 5, 7, 9][value] : value;
     }
@@ -55253,6 +61198,42 @@ const $ZodCreditCard = /*@__PURE__*/ (/* unused pure expression or super */ null
         payload.issues.push({
             code: "invalid_format",
             format: "credit_card",
+            input: payload.value,
+            inst,
+            continue: !def.abort,
+        });
+    };
+})));
+//////////////////////////////   ZodIBAN   //////////////////////////////
+// iso 7064 mod 97-10 checksum without BigInt
+function isIso7064Mod97(iban) {
+    let remainder = 0;
+    const len = iban.length;
+    for (let i = 4; i < len; i++) {
+        const code = iban.charCodeAt(i);
+        remainder = (code >= 65 ? remainder * 100 + (code - 55) : remainder * 10 + (code - 48)) % 97;
+    }
+    for (let i = 0; i < 4; i++) {
+        const code = iban.charCodeAt(i);
+        remainder = (code >= 65 ? remainder * 100 + (code - 55) : remainder * 10 + (code - 48)) % 97;
+    }
+    return remainder === 1;
+}
+function isValidIBAN(input) {
+    if (!regexes.iban.test(input))
+        return false;
+    return isIso7064Mod97(input);
+}
+const $ZodIBAN = /*@__PURE__*/ (/* unused pure expression or super */ null && (core.$constructor("$ZodIBAN", (inst, def) => {
+    // shape only — checksum is not expressible as a pattern
+    def.pattern ?? (def.pattern = regexes.iban);
+    $ZodStringFormat.init(inst, def);
+    inst._zod.check = (payload) => {
+        if (isValidIBAN(payload.value))
+            return;
+        payload.issues.push({
+            code: "invalid_format",
+            format: "iban",
             input: payload.value,
             inst,
             continue: !def.abort,
@@ -55312,7 +61293,7 @@ const $ZodCustomStringFormat = /*@__PURE__*/ (/* unused pure expression or super
 })));
 const $ZodNumber = /*@__PURE__*/ $constructor("$ZodNumber", (inst, def) => {
     $ZodType.init(inst, def);
-    inst._zod.pattern = inst._zod.bag.pattern ?? number;
+    inst._zod.pattern = number;
     inst._zod.parse = (payload, _ctx) => {
         if (def.coerce)
             try {
@@ -55473,7 +61454,7 @@ const $ZodVoid = /*@__PURE__*/ (/* unused pure expression or super */ null && (c
         return payload;
     };
 })));
-const $ZodDate = /*@__PURE__*/ (/* unused pure expression or super */ null && (core.$constructor("$ZodDate", (inst, def) => {
+const $ZodDate = /*@__PURE__*/ $constructor("$ZodDate", (inst, def) => {
     $ZodType.init(inst, def);
     inst._zod.parse = (payload, _ctx) => {
         if (def.coerce) {
@@ -55496,7 +61477,34 @@ const $ZodDate = /*@__PURE__*/ (/* unused pure expression or super */ null && (c
         });
         return payload;
     };
-})));
+});
+// an oversized container fails its leading size checks before any element is parsed
+function capSize(inst, size) {
+    const caps = sizeCaps(inst._zod.def.checks);
+    if (!caps.length)
+        return;
+    const cap = Math.min(...caps.map((c) => c[0]));
+    const parse = inst._zod.parse;
+    inst._zod.parse = (payload, ctx) => {
+        const n = size(payload.value);
+        if (n > cap && !ctx?.skipChecks && ctx?.direction !== "backward") {
+            for (const [max, ch] of sizeCaps(inst._zod.def.checks)) {
+                if (n > max && ch._zod.def.when(payload)) {
+                    const start = payload.issues.length;
+                    ch._zod.check(payload);
+                    // the value is still the raw input, so no later check may read it
+                    payload.issues[start].continue = false;
+                    attachSchema(payload.issues, start, inst);
+                    return payload;
+                }
+            }
+        }
+        return parse(payload, ctx);
+    };
+}
+const arraySize = (input) => (Array.isArray(input) ? input.length : -1);
+const mapSize = (input) => (input instanceof Map ? input.size : -1);
+const setSize = (input) => (input instanceof Set ? input.size : -1);
 function handleArrayResult(result, final, index) {
     if (result.issues.length) {
         final.issues.push(...prefixIssues(index, result.issues));
@@ -55520,6 +61528,7 @@ const $ZodArray = /*@__PURE__*/ $constructor("$ZodArray", (inst, def) => {
         }
         payload.value = memo ? memo.alloc(inst, payload, Array(input.length), ctx) : Array(input.length);
         const proms = [];
+        const abortEarly = ctx?.abortEarly;
         for (let i = 0; i < input.length; i++) {
             const item = input[i];
             const result = def.element._zod.run({
@@ -55531,6 +61540,9 @@ const $ZodArray = /*@__PURE__*/ $constructor("$ZodArray", (inst, def) => {
             }
             else {
                 handleArrayResult(result, payload, i);
+                // the element's payload is authoritative here, since handleArrayResult forwards every issue; an object's is not, because it drops a failed absent optional
+                if (abortEarly && result.issues.length !== 0 && aborted(result))
+                    break;
             }
         }
         if (proms.length) {
@@ -55538,6 +61550,7 @@ const $ZodArray = /*@__PURE__*/ $constructor("$ZodArray", (inst, def) => {
         }
         return payload; //handleArrayResultsAsync(parseResults, final);
     };
+    capSize(inst, arraySize);
 });
 function handlePropertyResult(result, final, key, input, optin, optout) {
     const isPresent = key in input;
@@ -55565,7 +61578,7 @@ function handlePropertyResult(result, final, key, input, optin, optout) {
         return;
     }
     if (result.value === undefined) {
-        if (isPresent) {
+        if (isPresent || (optin === "defaulted" && !isOptionalOut)) {
             final.value[key] = undefined;
         }
     }
@@ -55597,14 +61610,21 @@ function normalizeDef(def) {
         optionalKeys: new Set(okeys),
     };
 }
-function handleCatchall(proms, input, payload, ctx, def, inst) {
+function handleCatchall(proms, input, payload, ctx, def, inst, abortEarly) {
     const unrecognized = [];
     const keySet = def.keySet;
     const _catchall = def.catchall._zod;
     const t = _catchall.def.type;
     const optin = _catchall.optin;
     const optout = _catchall.optout;
+    // starts at 0, not the current length: the shape phase already ran and may have aborted
+    let seen = 0;
     for (const key in input) {
+        if (abortEarly && payload.issues.length !== seen) {
+            if (aborted(payload, seen))
+                break;
+            seen = payload.issues.length;
+        }
         // Must precede the __proto__ branch: a declared key is not unrecognized, even though the shape loop deliberately strips __proto__ from the parsed output.
         if (keySet.has(key))
             continue;
@@ -55642,26 +61662,22 @@ function handleCatchall(proms, input, payload, ctx, def, inst) {
         return payload;
     });
 }
-// Whichever object a def's `shape` currently answers from: the one the caller passed until the first read, the frozen copy after it. Keyed by def, so a def rebuilt by a builder is simply absent rather than inheriting the source's. Read its keys with `Object.keys`, which does not invoke them — that is what lets a discriminated union check its discriminator without resolving an option whose getters reference the union being constructed.
-const propShapes = new WeakMap();
 const $ZodObject = /*@__PURE__*/ $constructor("$ZodObject", (inst, def) => {
     // requires cast because technically $ZodObject doesn't extend
     $ZodType.init(inst, def);
-    // const sh = def.shape;
     const desc = Object.getOwnPropertyDescriptor(def, "shape");
-    if (!desc?.get) {
-        const sh = def.shape;
-        propShapes.set(def, sh);
-        Object.defineProperty(def, "shape", {
-            get: () => {
-                const newSh = { ...sh };
-                Object.defineProperty(def, "shape", {
-                    value: newSh,
-                });
-                propShapes.set(def, newSh);
-                return newSh;
-            },
-        });
+    // a cloned def carries its source's accessor, which knows the shape it answers from; adopting that keeps the clone's keys readable without running it
+    const sh = desc?.get ? desc.get.raw : (def.shape ?? {});
+    if (sh) {
+        // Freezes the shape on first read, so its getters resolve once and every later read sees the same schemas.
+        const get = () => {
+            const newSh = { ...sh };
+            Object.defineProperty(def, "shape", { value: newSh });
+            get.raw = newSh;
+            return newSh;
+        };
+        get.raw = sh;
+        Object.defineProperty(def, "shape", { get });
     }
     const _normalized = cached(() => normalizeDef(def));
     defineLazyInternal(inst, "propValues", (zod) => {
@@ -55702,7 +61718,14 @@ const $ZodObject = /*@__PURE__*/ $constructor("$ZodObject", (inst, def) => {
         payload.value = memo ? memo.alloc(inst, payload, {}, ctx) : {};
         const proms = [];
         const shape = value.shape;
+        const abortEarly = ctx?.abortEarly;
+        let seen = payload.issues.length;
         for (const key of value.allKeys) {
+            if (abortEarly && payload.issues.length !== seen) {
+                if (aborted(payload, seen))
+                    break;
+                seen = payload.issues.length;
+            }
             if (key === "__proto__")
                 continue;
             const el = shape[key];
@@ -55719,7 +61742,7 @@ const $ZodObject = /*@__PURE__*/ $constructor("$ZodObject", (inst, def) => {
         if (!catchall) {
             return proms.length ? Promise.all(proms).then(() => payload) : payload;
         }
-        return handleCatchall(proms, input, payload, ctx, _normalized.value, inst);
+        return handleCatchall(proms, input, payload, ctx, _normalized.value, inst, abortEarly === true);
     };
 });
 const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) => {
@@ -55734,12 +61757,18 @@ const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) =>
         // a symbol has no source literal, so it is read as `syms[i]` off the closed-over scope
         const doc = new Doc(["payload", "ctx"], { shape, inst, memo, syms });
         const parseStr = (k) => `shape[${k}]._zod.run({ value: input[${k}], issues: [] }, ctx)`;
-        // Prefixes in place, like util.prefixIssues does for every interpreted path.
+        // prefixes in place, like util.prefixIssues. newResult must land before the early return: a catchall runs after this and would otherwise write onto the caller's input
         const prefixStr = (id, k) => `
+          let ${id}_ab = false;
           for (let i = 0; i < ${id}.issues.length; i++) {
             const iss = ${id}.issues[i];
             iss.path = iss.path ? [${k}, ...iss.path] : [${k}];
             payload.issues.push(iss);
+            if (iss.continue !== true) ${id}_ab = true;
+          }
+          if (${id}_ab && ctx && ctx.abortEarly) {
+            payload.value = newResult;
+            return payload;
           }`;
         doc.write(`const input = payload.value;`);
         const ids = Object.create(null);
@@ -55788,6 +61817,10 @@ const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) =>
             input: undefined,
             path: [${k}]
           });
+          if (ctx && ctx.abortEarly) {
+            payload.value = newResult;
+            return payload;
+          }
         }
 
         if (${id}_present) {
@@ -55800,16 +61833,17 @@ const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) =>
                 doc.write(`
         if (${id}.issues.length) {${prefixStr(id, k)}
         }
-        
-        if (${id}.value === undefined) {
-          if (${isPresent}) {
-            newResult[${k}] = undefined;
-          }
-        } else {
+      `);
+                if (optin === "defaulted") {
+                    doc.write(`newResult[${k}] = ${id}.value;`);
+                }
+                else {
+                    doc.write(`
+        if (${id}.value !== undefined || ${isPresent}) {
           newResult[${k}] = ${id}.value;
         }
-
       `);
+                }
             }
         }
         doc.write(`payload.value = newResult;`);
@@ -55843,7 +61877,7 @@ const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) =>
             payload = fastpass(payload, ctx);
             if (!catchall)
                 return payload;
-            return handleCatchall([], input, payload, ctx, value, inst);
+            return handleCatchall([], input, payload, ctx, value, inst, ctx?.abortEarly === true);
         }
         return superParse(payload, ctx);
     };
@@ -55980,22 +62014,38 @@ const $ZodXor = /*@__PURE__*/ (/* unused pure expression or super */ null && (co
         });
     };
 })));
-/** Returns the option of `union` whose discriminator claims `value`. */
+/** Returns the option whose discriminator claims `value`, or throws if ambiguous. */
 function getDiscriminatedOption(union, value) {
     const internals = union._zod;
     let map = internals.bag.optionsMap;
     if (!map) {
-        map = new Map();
-        const { options, discriminator } = internals.def;
-        for (const option of options) {
-            // First declaration wins, matching the order the parse path resolves a duplicate in.
-            for (const v of option._zod.propValues?.[discriminator] ?? [])
-                if (!map.has(v))
-                    map.set(v, option);
-        }
+        map = discriminatorMap(internals.def);
         internals.bag.optionsMap = map;
     }
-    return map.get(value);
+    const option = map.get(value);
+    if (option === null)
+        throw new Error(`Ambiguous discriminator value "${String(value)}"`);
+    return option;
+}
+function discriminatorMap(def) {
+    const map = new Map();
+    for (const option of def.options) {
+        const values = option._zod.propValues?.[def.discriminator];
+        if (!values || values.size === 0)
+            throw new Error(`Invalid discriminated union option at index "${def.options.indexOf(option)}"`);
+        for (const value of values) {
+            if (map.has(value)) {
+                if (value !== undefined)
+                    throw new Error(`Duplicate discriminator value "${String(value)}"`);
+                // keep the collision marked so a later member cannot reclaim it
+                map.set(value, null);
+            }
+            else {
+                map.set(value, option);
+            }
+        }
+    }
+    return map;
 }
 const $ZodDiscriminatedUnion = 
 /*@__PURE__*/
@@ -56005,10 +62055,13 @@ $constructor("$ZodDiscriminatedUnion", (inst, def) => {
     const _super = inst._zod.parse;
     defineLazyInternal(inst, "propValues", (zod) => {
         const propValues = {};
+        let undefinedCount = 0;
         for (const option of zod.def.options) {
             const pv = option._zod.propValues;
             if (!pv || Object.keys(pv).length === 0)
                 throw new Error(`Invalid discriminated union option at index "${zod.def.options.indexOf(option)}"`);
+            if (pv[zod.def.discriminator]?.has(undefined))
+                undefinedCount++;
             for (const [k, v] of Object.entries(pv)) {
                 if (!Object.prototype.hasOwnProperty.call(propValues, k)) {
                     util_assignProp(propValues, k, new Set());
@@ -56018,31 +62071,18 @@ $constructor("$ZodDiscriminatedUnion", (inst, def) => {
                 }
             }
         }
+        if (!zod.def.unionFallback && undefinedCount > 1)
+            propValues[zod.def.discriminator]?.delete(undefined);
         return propValues;
     });
-    // Checked now rather than in the lookup map below, so an option that lacks the discriminator fails at the `discriminatedUnion` call instead of on the first object parsed. Options whose shape cannot be enumerated without resolving it — pipes, lazies, and objects rebuilt by a builder such as `.extend()` — are left to the map.
+    // Checked now rather than in the lookup map below, so an option that lacks the discriminator fails at the `discriminatedUnion` call instead of on the first object parsed. Options whose shape cannot be enumerated without resolving it — pipes and lazies — are left to the map.
     def.options.forEach((option, i) => {
-        const propShape = propShapes.get(option._zod.def);
+        const propShape = rawShape(option._zod.def);
         if (propShape && !Object.prototype.hasOwnProperty.call(propShape, def.discriminator)) {
             throw new Error(`Invalid discriminated union option at index "${i}"`);
         }
     });
-    const disc = cached(() => {
-        const opts = def.options;
-        const map = new Map();
-        for (const o of opts) {
-            const values = o._zod.propValues?.[def.discriminator];
-            if (!values || values.size === 0)
-                throw new Error(`Invalid discriminated union option at index "${def.options.indexOf(o)}"`);
-            for (const v of values) {
-                if (map.has(v)) {
-                    throw new Error(`Duplicate discriminator value "${String(v)}"`);
-                }
-                map.set(v, o);
-            }
-        }
-        return map;
-    });
+    const disc = cached(() => discriminatorMap(def));
     inst._zod.parse = (payload, ctx) => {
         const input = payload.value;
         if (!util_isObject(input)) {
@@ -56054,8 +62094,10 @@ $constructor("$ZodDiscriminatedUnion", (inst, def) => {
             });
             return payload;
         }
-        const opt = disc.value.get(input?.[def.discriminator]);
-        if (opt) {
+        const value = input?.[def.discriminator];
+        const opt = disc.value.get(value);
+        // forward metadata cannot choose an encoder for an absent tag
+        if (opt && (value !== undefined || ctx.direction !== "backward")) {
             return opt._zod.run(payload, ctx);
         }
         // Fall back to union matching when the fast discriminator path fails:
@@ -56070,7 +62112,7 @@ $constructor("$ZodDiscriminatedUnion", (inst, def) => {
             errors: [],
             note: "No matching discriminator",
             discriminator: def.discriminator,
-            options: Array.from(disc.value.keys()),
+            options: Array.from(disc.value.keys()).filter((value) => disc.value.get(value) !== null),
             input,
             path: [def.discriminator],
             inst,
@@ -56243,6 +62285,9 @@ const $ZodTuple = /*@__PURE__*/ $constructor("$ZodTuple", (inst, def) => {
         }
         // Run every item in parallel, collecting results into an indexed array. The post-processing in `handleTupleResults` walks them in order so it can decide whether an absent optional-output error can truncate the tail or must be reported to preserve required output.
         const itemResults = new Array(items.length);
+        // only tracked when there is a rest loop to skip
+        const abortEarly = def.rest ? ctx?.abortEarly : undefined;
+        let itemAborted = false;
         for (let i = 0; i < items.length; i++) {
             const r = items[i]._zod.run({ value: input[i], issues: [] }, ctx);
             if (r instanceof Promise) {
@@ -56252,12 +62297,21 @@ const $ZodTuple = /*@__PURE__*/ $constructor("$ZodTuple", (inst, def) => {
             }
             else {
                 itemResults[i] = r;
+                if (abortEarly && !itemAborted && r.issues.length)
+                    itemAborted = aborted(r);
             }
         }
-        if (def.rest) {
+        // sound because rest is non-empty exactly when every fixed index is present, the one case handleTupleResults cannot discard an item's issues
+        if (def.rest && !itemAborted) {
             let i = items.length - 1;
             const rest = input.slice(items.length);
+            let seen = payload.issues.length;
             for (const el of rest) {
+                if (abortEarly && payload.issues.length !== seen) {
+                    if (aborted(payload, seen))
+                        break;
+                    seen = payload.issues.length;
+                }
                 i++;
                 const result = def.rest._zod.run({ value: el, issues: [] }, ctx);
                 if (result instanceof Promise) {
@@ -56339,6 +62393,7 @@ const $ZodRecord = /*@__PURE__*/ $constructor("$ZodRecord", (inst, def) => {
             });
             return payload;
         }
+        // no guard in either loop below: a record's invalid_key aborts but an enclosing intersection can reconcile it, so a stopped loop hides keys the sibling does not own and the intersection then rejects nothing
         const proms = [];
         const values = def.keyType._zod.values;
         if (values && !def.partial) {
@@ -56510,7 +62565,14 @@ const $ZodMap = /*@__PURE__*/ (/* unused pure expression or super */ null && (co
         }
         const proms = [];
         payload.value = memo ? memo.alloc(inst, payload, new Map(), ctx) : new Map();
+        const abortEarly = ctx?.abortEarly;
+        let seen = payload.issues.length;
         for (const [key, value] of input) {
+            if (abortEarly && payload.issues.length !== seen) {
+                if (util.aborted(payload, seen))
+                    break;
+                seen = payload.issues.length;
+            }
             const keyResult = def.keyType._zod.run({ value: key, issues: [] }, ctx);
             const valueResult = def.valueType._zod.run({ value: value, issues: [] }, ctx);
             if (keyResult instanceof Promise || valueResult instanceof Promise) {
@@ -56526,6 +62588,7 @@ const $ZodMap = /*@__PURE__*/ (/* unused pure expression or super */ null && (co
             return Promise.all(proms).then(() => payload);
         return payload;
     };
+    capSize(inst, mapSize);
 })));
 function handleMapResult(keyResult, valueResult, final, key, input, inst, ctx) {
     if (keyResult.issues.length) {
@@ -56576,7 +62639,14 @@ const $ZodSet = /*@__PURE__*/ (/* unused pure expression or super */ null && (co
         }
         const proms = [];
         payload.value = memo ? memo.alloc(inst, payload, new Set(), ctx) : new Set();
+        const abortEarly = ctx?.abortEarly;
+        let seen = payload.issues.length;
         for (const item of input) {
+            if (abortEarly && payload.issues.length !== seen) {
+                if (util.aborted(payload, seen))
+                    break;
+                seen = payload.issues.length;
+            }
             const result = def.valueType._zod.run({ value: item, issues: [] }, ctx);
             if (result instanceof Promise) {
                 proms.push(result.then((result) => handleSetResult(result, payload)));
@@ -56588,6 +62658,7 @@ const $ZodSet = /*@__PURE__*/ (/* unused pure expression or super */ null && (co
             return Promise.all(proms).then(() => payload);
         return payload;
     };
+    capSize(inst, setSize);
 })));
 function handleSetResult(result, final) {
     if (result.issues.length) {
@@ -56600,9 +62671,11 @@ const $ZodEnum = /*@__PURE__*/ $constructor("$ZodEnum", (inst, def) => {
     const values = getEnumValues(def.entries);
     const valuesSet = new Set(values);
     inst._zod.values = valuesSet;
-    const patternValues = values.filter((k) => propertyKeyTypes.has(typeof k));
-    // unmatchable fallback, RE2-safe: an empty alternation would compile to /^()$/, which matches ""
-    inst._zod.pattern = new RegExp(patternValues.length ? `^(${patternValues.map((o) => escapeRegex(o.toString())).join("|")})$` : "^[^\\s\\S]$");
+    defineLazyInternal(inst, "pattern", (zod) => {
+        const patternValues = getEnumValues(zod.def.entries).filter((k) => propertyKeyTypes.has(typeof k));
+        // unmatchable fallback, RE2-safe: an empty alternation would compile to /^()$/, which matches ""
+        return new RegExp(patternValues.length ? `^(${patternValues.map((o) => escapeRegex(o.toString())).join("|")})$` : "^[^\\s\\S]$");
+    });
     inst._zod.parse = (payload, _ctx) => {
         const input = payload.value;
         if (valuesSet.has(input)) {
@@ -56621,12 +62694,15 @@ const $ZodLiteral = /*@__PURE__*/ $constructor("$ZodLiteral", (inst, def) => {
     $ZodType.init(inst, def);
     const values = new Set(def.values);
     inst._zod.values = values;
-    // unmatchable fallback, RE2-safe: an empty alternation would compile to /^()$/, which matches ""
-    inst._zod.pattern = new RegExp(def.values.length
-        ? `^(${def.values
-            .map((o) => (typeof o === "string" ? escapeRegex(o) : o ? escapeRegex(o.toString()) : String(o)))
-            .join("|")})$`
-        : "^[^\\s\\S]$");
+    defineLazyInternal(inst, "pattern", (zod) => {
+        const vals = zod.def.values;
+        // unmatchable fallback, RE2-safe: an empty alternation would compile to /^()$/, which matches ""
+        return new RegExp(vals.length
+            ? `^(${vals
+                .map((o) => typeof o === "string" ? escapeRegex(o) : o ? escapeRegex(o.toString()) : String(o))
+                .join("|")})$`
+            : "^[^\\s\\S]$");
+    });
     inst._zod.parse = (payload, _ctx) => {
         const input = payload.value;
         if (values.has(input)) {
@@ -56990,22 +63066,67 @@ function handleReadonlyResult(payload) {
         payload.value = Object.freeze(payload.value);
     return payload;
 }
+// a leaf's pattern source with its own checks folded in: the last pattern-carrying check wins, else length bounds narrow the catch-all, else an integer format narrows the number form. the fold lives here instead of on `_zod.pattern` so a bundle without template literals never pays for it
+function leafPattern(schema) {
+    const def = schema._zod.def;
+    let pattern = def.pattern;
+    let isInt = !!def.format?.includes("int");
+    let minimum;
+    let maximum;
+    for (const ch of def.checks ?? []) {
+        const d = ch._zod.def;
+        if (d.pattern)
+            pattern = d.pattern;
+        isInt || (isInt = !!d.format?.includes("int"));
+        const lo = d.minimum ?? d.length;
+        const hi = d.maximum ?? d.length;
+        if (lo !== undefined && (minimum === undefined || lo > minimum))
+            minimum = lo;
+        if (hi !== undefined && (maximum === undefined || hi < maximum))
+            maximum = hi;
+    }
+    if (pattern)
+        return pattern.source;
+    // an empty range matches nothing at runtime, and `{8,5}` is not a legal quantifier
+    if (minimum !== undefined && maximum !== undefined && minimum > maximum)
+        return "(?!)";
+    if (minimum !== undefined || maximum !== undefined)
+        return regexes.string({ minimum, maximum }).source;
+    const own = schema._zod.pattern;
+    return (isInt && own === regexes.number ? regexes.integer : own)?.source;
+}
+// a part's pattern source. a wrapper's pattern embeds its inner pattern's source verbatim, so the folded form is substituted in place without knowing the wrapper's own composition; a union's options are joined the way the union builds its own pattern
+function partPattern(schema) {
+    const def = schema._zod.def;
+    const own = schema._zod.pattern?.source;
+    // lazy resolves its inner on the internals, not the def
+    const inner = def.innerType ?? schema._zod.innerType;
+    if (inner) {
+        const before = inner._zod.pattern?.source;
+        const after = partPattern(inner);
+        if (own && before && after && after !== before) {
+            return own.replace(util.cleanRegex(before), () => util.cleanRegex(after));
+        }
+        return own;
+    }
+    if (def.options) {
+        const sources = def.options.map(partPattern);
+        if (sources.every(Boolean))
+            return `^(${sources.map((s) => util.cleanRegex(s)).join("|")})$`;
+    }
+    return leafPattern(schema);
+}
 const $ZodTemplateLiteral = /*@__PURE__*/ (/* unused pure expression or super */ null && (core.$constructor("$ZodTemplateLiteral", (inst, def) => {
     $ZodType.init(inst, def);
     const regexParts = [];
     for (const part of def.parts) {
         if (typeof part === "object" && part !== null) {
             // is Zod schema
-            if (!part._zod.pattern) {
-                // if (!source)
+            const source = partPattern(part);
+            if (!source) {
                 throw new Error(`Invalid template literal part, no pattern found: ${[...part._zod.traits].shift()}`);
             }
-            const source = part._zod.pattern instanceof RegExp ? part._zod.pattern.source : part._zod.pattern;
-            if (!source)
-                throw new Error(`Invalid template literal part: ${part._zod.traits}`);
-            const start = source.startsWith("^") ? 1 : 0;
-            const end = source.endsWith("$") ? source.length - 1 : source.length;
-            regexParts.push(source.slice(start, end));
+            regexParts.push(util.cleanRegex(source));
         }
         else if (part === null || util.primitiveTypes.has(typeof part)) {
             regexParts.push(util.escapeRegex(`${part}`));
@@ -57234,20 +63355,18 @@ const globalRegistry = globalThis.__zod_globalRegistry;
 
 
 
+function snapshotChecks(def) {
+    if (def.checks)
+        def.checks = [...def.checks];
+    return def;
+}
 // @__NO_SIDE_EFFECTS__
 function _string(Class, params) {
-    return new Class({
-        type: "string",
-        ...normalizeParams(params),
-    });
+    return new Class(snapshotChecks({ type: "string", ...normalizeParams(params) }));
 }
 // @__NO_SIDE_EFFECTS__
 function _coercedString(Class, params) {
-    return new Class({
-        type: "string",
-        coerce: true,
-        ...util.normalizeParams(params),
-    });
+    return new Class(snapshotChecks({ type: "string", coerce: true, ...util.normalizeParams(params) }));
 }
 // @__NO_SIDE_EFFECTS__
 function _email(Class, params) {
@@ -57488,6 +63607,16 @@ function _creditCard(Class, params) {
     });
 }
 // @__NO_SIDE_EFFECTS__
+function _iban(Class, params) {
+    return new Class({
+        type: "string",
+        format: "iban",
+        check: "string_format",
+        abort: false,
+        ...util.normalizeParams(params),
+    });
+}
+// @__NO_SIDE_EFFECTS__
 function _jwt(Class, params) {
     return new Class({
         type: "string",
@@ -57546,20 +63675,11 @@ function _isoDuration(Class, params) {
 }
 // @__NO_SIDE_EFFECTS__
 function _number(Class, params) {
-    return new Class({
-        type: "number",
-        checks: [],
-        ...normalizeParams(params),
-    });
+    return new Class(snapshotChecks({ type: "number", checks: [], ...normalizeParams(params) }));
 }
 // @__NO_SIDE_EFFECTS__
 function _coercedNumber(Class, params) {
-    return new Class({
-        type: "number",
-        coerce: true,
-        checks: [],
-        ...normalizeParams(params),
-    });
+    return new Class(snapshotChecks({ type: "number", coerce: true, checks: [], ...normalizeParams(params) }));
 }
 // @__NO_SIDE_EFFECTS__
 function _int(Class, params) {
@@ -57906,8 +64026,12 @@ function _property(property, schema, params) {
     });
 }
 // @__NO_SIDE_EFFECTS__
-function _properties(shape) {
-    return Object.entries(shape).map(([property, schema]) => new checks.$ZodCheckProperty({ check: "property", property, schema }));
+function _properties(shape, params) {
+    return new $ZodCheckProperties({
+        check: "properties",
+        shape,
+        ...normalizeParams(params),
+    });
 }
 // @__NO_SIDE_EFFECTS__
 function _mime(types, params) {
@@ -58393,7 +64517,8 @@ function handleUnrepresentable(schema, ctx, json, params, message) {
     Object.assign(json, result);
     return true;
 }
-function to_json_schema_process(schema, ctx, _params = { path: [], schemaPath: [] }) {
+// never rename this back to `process`: bundler polyfills inject a top-level `const process` that a lexical declaration of the same name collides with (#6397)
+function to_json_schema_processSchema(schema, ctx, _params = { path: [], schemaPath: [] }) {
     var _a;
     const def = schema._zod.def;
     // check for schema in seens
@@ -58439,7 +64564,7 @@ function to_json_schema_process(schema, ctx, _params = { path: [], schemaPath: [
             // Also set ref if processor didn't (for inheritance)
             if (!result.ref)
                 result.ref = parent;
-            to_json_schema_process(parent, ctx, params);
+            to_json_schema_processSchema(parent, ctx, params);
             ctx.seen.get(parent).isParent = true;
         }
     }
@@ -58460,6 +64585,8 @@ function to_json_schema_process(schema, ctx, _params = { path: [], schemaPath: [
     const _result = ctx.seen.get(schema);
     return _result.schema;
 }
+/** @deprecated Renamed to `processSchema`. An export alias declares no binding, so it is safe to keep. */
+
 // Escape a reference token for use in a JSON Pointer fragment (RFC 6901): `~` becomes `~0` and `/` becomes `~1`. The `~` replacement must run first.
 function encodeJSONPointerSegment(segment) {
     return segment.replace(/~/g, "~0").replace(/\//g, "~1");
@@ -58576,8 +64703,6 @@ function to_json_schema_extractDefs(ctx, schema
         if (seen.count > 1) {
             if (ctx.reused === "ref") {
                 extractToDef(entry);
-                // biome-ignore lint:
-                continue;
             }
         }
     }
@@ -58971,14 +65096,14 @@ function isTransforming(_schema, _ctx) {
  */
 const createToJSONSchemaMethod = (schema, processors = {}) => (params) => {
     const ctx = to_json_schema_initializeContext({ ...params, processors });
-    to_json_schema_process(schema, ctx);
+    to_json_schema_processSchema(schema, ctx);
     to_json_schema_extractDefs(ctx, schema);
     return to_json_schema_finalize(ctx, schema);
 };
 const createStandardJSONSchemaMethod = (schema, io, processors = {}) => (params) => {
     const { libraryOptions, target } = params ?? {};
     const ctx = to_json_schema_initializeContext({ ...(libraryOptions ?? {}), target, io, processors });
-    to_json_schema_process(schema, ctx);
+    to_json_schema_processSchema(schema, ctx);
     to_json_schema_extractDefs(ctx, schema);
     return to_json_schema_finalize(ctx, schema);
 };
@@ -58987,6 +65112,100 @@ const createStandardJSONSchemaMethod = (schema, io, processors = {}) => (params)
 
 
 
+
+const narrowMin = (agg, key, value) => {
+    if (agg[key] === undefined || value > agg[key])
+        agg[key] = value;
+};
+const narrowMax = (agg, key, value) => {
+    if (agg[key] === undefined || value < agg[key])
+        agg[key] = value;
+};
+const narrowBoth = (agg, value) => {
+    narrowMin(agg, "minimum", value);
+    narrowMax(agg, "maximum", value);
+};
+const addDivisor = (agg, value) => {
+    agg.multipleOf ?? (agg.multipleOf = []);
+    if (!agg.multipleOf.includes(value))
+        agg.multipleOf.push(value);
+};
+const addPattern = (agg, pattern) => {
+    agg.patterns ?? (agg.patterns = new Set());
+    agg.patterns.add(pattern);
+};
+const intersectMime = (agg, mime) => {
+    agg.mime = agg.mime ? agg.mime.filter((m) => mime.includes(m)) : [...mime];
+};
+// last-wins, matching the bag's historical write order; the flag keeps an integer format from being lost to a later float one
+const setFormat = (agg, format) => {
+    agg.format = format;
+    if (format.includes("int"))
+        agg.isInt = true;
+};
+const minContributor = (agg, def) => narrowMin(agg, "minimum", def.minimum);
+const maxContributor = (agg, def) => narrowMax(agg, "maximum", def.maximum);
+const formatContributor = (ranges) => (agg, def) => {
+    setFormat(agg, def.format);
+    const [minimum, maximum] = ranges[def.format];
+    narrowMin(agg, "minimum", minimum);
+    narrowMax(agg, "maximum", maximum);
+};
+const contributors = {
+    greater_than: (agg, def) => narrowMin(agg, def.inclusive ? "minimum" : "exclusiveMinimum", def.value),
+    less_than: (agg, def) => narrowMax(agg, def.inclusive ? "maximum" : "exclusiveMaximum", def.value),
+    multiple_of: (agg, def) => addDivisor(agg, def.value),
+    number_format: formatContributor(NUMBER_FORMAT_RANGES),
+    bigint_format: formatContributor(BIGINT_FORMAT_RANGES),
+    min_length: minContributor,
+    max_length: maxContributor,
+    length_equals: (agg, def) => narrowBoth(agg, def.length),
+    min_size: minContributor,
+    max_size: maxContributor,
+    size_equals: (agg, def) => narrowBoth(agg, def.size),
+    string_format: (agg, def) => {
+        setFormat(agg, def.format);
+        if (def.pattern)
+            addPattern(agg, def.pattern);
+        if (def.format === "base64" || def.format === "base64url")
+            agg.contentEncoding = def.format;
+        if (def.local || def.precision === -1)
+            agg.laxFormat = true;
+    },
+    mime_type: (agg, def) => intersectMime(agg, def.mime),
+};
+function aggregateChecks(schema) {
+    const agg = {};
+    const def = schema._zod.def;
+    // a format schema is its own first check, same rule as $ZodType init
+    const list = schema._zod.traits.has("$ZodCheck")
+        ? [schema, ...(def.checks ?? [])]
+        : (def.checks ?? []);
+    for (const ch of list)
+        contributors[ch._zod.def.check]?.(agg, ch._zod.def);
+    // reconcile with the bag so third-party onattach contributions still land; first-party residue is never tighter than the fold, so merging it back is idempotent for one and additive for the other
+    const bag = schema._zod.bag;
+    if (bag.minimum !== undefined)
+        narrowMin(agg, "minimum", bag.minimum);
+    if (bag.exclusiveMinimum !== undefined)
+        narrowMin(agg, "exclusiveMinimum", bag.exclusiveMinimum);
+    if (bag.maximum !== undefined)
+        narrowMax(agg, "maximum", bag.maximum);
+    if (bag.exclusiveMaximum !== undefined)
+        narrowMax(agg, "exclusiveMaximum", bag.exclusiveMaximum);
+    if (bag.multipleOf !== undefined)
+        addDivisor(agg, bag.multipleOf);
+    if (bag.format !== undefined) {
+        agg.format ?? (agg.format = bag.format);
+        if (bag.format.includes("int"))
+            agg.isInt = true;
+    }
+    if (bag.mime)
+        intersectMime(agg, bag.mime);
+    for (const pattern of bag.patterns ?? [])
+        addPattern(agg, pattern);
+    return agg;
+}
 const formatMap = {
     guid: "uuid",
     url: "uri",
@@ -58995,11 +65214,16 @@ const formatMap = {
     regex: "", // do not set
 };
 // ==================== SIMPLE TYPE PROCESSORS ====================
+// the runtime patterns are lax so parse paths never overflow the regex stack; the emitted schema swaps in the exact block forms, which zod itself never executes
+const exactPatterns = new Map([
+    [base64Charset, base64],
+    [base64urlCharset, base64url],
+]);
+const exactPattern = (p) => exactPatterns.get(p) ?? p;
 const stringProcessor = (schema, ctx, _json, _params) => {
     const json = _json;
     json.type = "string";
-    const { minimum, maximum, format, patterns, contentEncoding, laxFormat } = schema._zod
-        .bag;
+    const { minimum, maximum, format, patterns, contentEncoding, laxFormat } = aggregateChecks(schema);
     if (typeof minimum === "number")
         json.minLength = minimum;
     if (typeof maximum === "number")
@@ -59017,7 +65241,7 @@ const stringProcessor = (schema, ctx, _json, _params) => {
     if (contentEncoding)
         json.contentEncoding = contentEncoding;
     if (patterns && patterns.size > 0) {
-        const patternList = [...patterns];
+        const patternList = [...patterns].map(exactPattern);
         if (patternList.length === 1)
             json.pattern = patternList[0].source;
         else if (patternList.length > 1) {
@@ -59034,11 +65258,8 @@ const stringProcessor = (schema, ctx, _json, _params) => {
 };
 const numberProcessor = (schema, ctx, _json, params) => {
     const json = _json;
-    const { minimum, maximum, format, multipleOf, exclusiveMaximum, exclusiveMinimum } = schema._zod.bag;
-    if (typeof format === "string" && format.includes("int"))
-        json.type = "integer";
-    else
-        json.type = "number";
+    const { minimum, maximum, multipleOf, exclusiveMaximum, exclusiveMinimum, isInt } = aggregateChecks(schema);
+    json.type = isInt ? "integer" : "number";
     // when both minimum and exclusiveMinimum exist, pick the more restrictive one
     const exMin = typeof exclusiveMinimum === "number" && exclusiveMinimum >= (minimum ?? Number.NEGATIVE_INFINITY);
     const exMax = typeof exclusiveMaximum === "number" && exclusiveMaximum <= (maximum ?? Number.POSITIVE_INFINITY);
@@ -59067,12 +65288,21 @@ const numberProcessor = (schema, ctx, _json, params) => {
     else if (typeof maximum === "number") {
         json.maximum = maximum;
     }
-    if (typeof multipleOf === "number") {
+    if (multipleOf) {
         // JSON Schema requires a divisor strictly greater than zero, and a non-finite one does not survive JSON at all. A negative divisor accepts exactly what its absolute value accepts, so it still maps; zero, NaN and Infinity have no keyword form.
-        if (Number.isFinite(multipleOf) && multipleOf !== 0)
-            json.multipleOf = Math.abs(multipleOf);
-        else
-            handleUnrepresentable(schema, ctx, json, params, `A multipleOf divisor of ${multipleOf} cannot be represented in JSON Schema`);
+        const divisors = new Set();
+        for (const divisor of multipleOf) {
+            if (Number.isFinite(divisor) && divisor !== 0)
+                divisors.add(Math.abs(divisor));
+            else
+                handleUnrepresentable(schema, ctx, json, params, `A multipleOf divisor of ${divisor} cannot be represented in JSON Schema`);
+        }
+        // chained divisors are a conjunction the keyword cannot carry alone, so extras ride an allOf, same as stacked patterns
+        const [first, ...rest] = divisors;
+        if (first !== undefined)
+            json.multipleOf = first;
+        if (rest.length)
+            json.allOf = [...(json.allOf ?? []), ...rest.map((m) => ({ multipleOf: m }))];
     }
 };
 const booleanProcessor = (_schema, _ctx, json, _params) => {
@@ -59189,29 +65419,24 @@ const templateLiteralProcessor = (schema, _ctx, json, _params) => {
 };
 const fileProcessor = (schema, _ctx, json, _params) => {
     const _json = json;
-    const file = {
-        type: "string",
-        format: "binary",
-        contentEncoding: "binary",
-    };
-    const { minimum, maximum, mime } = schema._zod.bag;
+    _json.type = "string";
+    _json.format = "binary";
+    _json.contentEncoding = "binary";
+    const { minimum, maximum, mime } = aggregateChecks(schema);
     if (minimum !== undefined)
-        file.minLength = minimum;
+        _json.minLength = minimum;
     if (maximum !== undefined)
-        file.maxLength = maximum;
-    if (mime) {
-        if (mime.length === 1) {
-            file.contentMediaType = mime[0];
-            Object.assign(_json, file);
-        }
-        else {
-            Object.assign(_json, file); // shared props at root
-            _json.anyOf = mime.map((m) => ({ contentMediaType: m })); // only contentMediaType differs
-        }
-    }
-    else {
-        Object.assign(_json, file);
-    }
+        _json.maxLength = maximum;
+    if (!mime)
+        return;
+    // an empty intersection means the mime checks share no value, so nothing passes at runtime; `anyOf` must be non-empty, so the false schema is `not: {}`
+    if (mime.length === 0)
+        _json.not = {};
+    else if (mime.length === 1)
+        _json.contentMediaType = mime[0];
+    // only contentMediaType differs, so the shared props stay at the root
+    else
+        _json.anyOf = mime.map((m) => ({ contentMediaType: m }));
 };
 const successProcessor = (_schema, _ctx, json, _params) => {
     json.type = "boolean";
@@ -59235,13 +65460,13 @@ const setProcessor = (schema, ctx, json, params) => {
 const arrayProcessor = (schema, ctx, _json, params) => {
     const json = _json;
     const def = schema._zod.def;
-    const { minimum, maximum } = schema._zod.bag;
+    const { minimum, maximum } = aggregateChecks(schema);
     if (typeof minimum === "number")
         json.minItems = minimum;
     if (typeof maximum === "number")
         json.maxItems = maximum;
     json.type = "array";
-    json.items = to_json_schema_process(def.element, ctx, {
+    json.items = to_json_schema_processSchema(def.element, ctx, {
         ...params,
         path: [...params.path, "items"],
     });
@@ -59275,24 +65500,21 @@ const objectProcessor = (schema, ctx, _json, params) => {
     json.properties = {};
     for (const key in shape) {
         // assignProp so a __proto__ key becomes an own property instead of hitting the inherited setter on the plain {} we build into
-        util_assignProp(json.properties, key, to_json_schema_process(shape[key], ctx, {
+        util_assignProp(json.properties, key, to_json_schema_processSchema(shape[key], ctx, {
             ...params,
             path: [...params.path, "properties", key],
         }));
     }
     // required keys
-    const allKeys = new Set(Object.keys(shape));
-    const requiredKeys = new Set([...allKeys].filter((key) => {
+    const requiredKeys = [];
+    for (const key of Object.keys(shape)) {
         const field = def.shape[key];
-        if (ctx.io === "input") {
-            return inputOptin(field) === undefined;
+        if (ctx.io === "input" ? inputOptin(field) === undefined : field._zod.optout === undefined) {
+            requiredKeys.push(key);
         }
-        else {
-            return field._zod.optout === undefined;
-        }
-    }));
-    if (requiredKeys.size > 0) {
-        json.required = Array.from(requiredKeys);
+    }
+    if (requiredKeys.length > 0) {
+        json.required = requiredKeys;
     }
     // catchall
     if (def.catchall?._zod.def.type === "never") {
@@ -59305,7 +65527,7 @@ const objectProcessor = (schema, ctx, _json, params) => {
             json.additionalProperties = false;
     }
     else if (def.catchall) {
-        json.additionalProperties = to_json_schema_process(def.catchall, ctx, {
+        json.additionalProperties = to_json_schema_processSchema(def.catchall, ctx, {
             ...params,
             path: [...params.path, "additionalProperties"],
         });
@@ -59315,7 +65537,7 @@ const unionProcessor = (schema, ctx, json, params) => {
     const def = schema._zod.def;
     // Exclusive unions (inclusive === false) use oneOf (exactly one match) instead of anyOf (one or more matches). This includes both z.xor() and discriminated unions
     const isExclusive = def.inclusive === false;
-    const options = def.options.map((x, i) => to_json_schema_process(x, ctx, {
+    const options = def.options.map((x, i) => to_json_schema_processSchema(x, ctx, {
         ...params,
         path: [...params.path, isExclusive ? "oneOf" : "anyOf", i],
     }));
@@ -59328,11 +65550,11 @@ const unionProcessor = (schema, ctx, json, params) => {
 };
 const intersectionProcessor = (schema, ctx, json, params) => {
     const def = schema._zod.def;
-    const a = to_json_schema_process(def.left, ctx, {
+    const a = to_json_schema_processSchema(def.left, ctx, {
         ...params,
         path: [...params.path, "allOf", 0],
     });
-    const b = to_json_schema_process(def.right, ctx, {
+    const b = to_json_schema_processSchema(def.right, ctx, {
         ...params,
         path: [...params.path, "allOf", 1],
     });
@@ -59351,12 +65573,12 @@ const tupleProcessor = (schema, ctx, _json, params) => {
     json.type = "array";
     const prefixPath = ctx.target === "draft-2020-12" ? "prefixItems" : "items";
     const restPath = ctx.target === "draft-2020-12" ? "items" : ctx.target === "openapi-3.0" ? "items" : "additionalItems";
-    const prefixItems = def.items.map((x, i) => to_json_schema_process(x, ctx, {
+    const prefixItems = def.items.map((x, i) => to_json_schema_processSchema(x, ctx, {
         ...params,
         path: [...params.path, prefixPath, i],
     }));
     const rest = def.rest
-        ? to_json_schema_process(def.rest, ctx, {
+        ? to_json_schema_processSchema(def.rest, ctx, {
             ...params,
             path: [...params.path, restPath, ...(ctx.target === "openapi-3.0" ? [def.items.length] : [])],
         })
@@ -59410,7 +65632,7 @@ const tupleProcessor = (schema, ctx, _json, params) => {
             json.maxItems = maxItems;
     }
     // explicit user-defined length checks take precedence
-    const { minimum, maximum } = schema._zod.bag;
+    const { minimum, maximum } = aggregateChecks(schema);
     if (typeof minimum === "number")
         json.minItems = minimum;
     if (typeof maximum === "number")
@@ -59503,23 +65725,22 @@ const recordProcessor = (schema, ctx, _json, params) => {
     json.type = "object";
     // For looseRecord with regex patterns, use patternProperties. This correctly represents "only validate keys matching the pattern" semantics and composes well with allOf (intersections)
     const keyType = def.keyType;
-    const keyBag = keyType._zod.bag;
-    const patterns = keyBag?.patterns;
+    const patterns = aggregateChecks(keyType).patterns;
     if (def.mode === "loose" && patterns && patterns.size > 0) {
         // Use patternProperties for looseRecord with regex patterns
-        const valueSchema = to_json_schema_process(def.valueType, ctx, {
+        const valueSchema = to_json_schema_processSchema(def.valueType, ctx, {
             ...params,
             path: [...params.path, "patternProperties", "*"],
         });
         json.patternProperties = {};
         for (const pattern of patterns) {
-            util_assignProp(json.patternProperties, pattern.source, valueSchema);
+            util_assignProp(json.patternProperties, exactPattern(pattern).source, valueSchema);
         }
     }
     else {
         // Default behavior: use propertyNames + additionalProperties
         if (ctx.target === "draft-07" || ctx.target === "draft-2020-12") {
-            json.propertyNames = to_json_schema_process(def.keyType, ctx, {
+            json.propertyNames = to_json_schema_processSchema(def.keyType, ctx, {
                 ...params,
                 path: [...params.path, "propertyNames"],
             });
@@ -59531,7 +65752,7 @@ const recordProcessor = (schema, ctx, _json, params) => {
             }
             pending.push(schema);
         }
-        json.additionalProperties = to_json_schema_process(def.valueType, ctx, {
+        json.additionalProperties = to_json_schema_processSchema(def.valueType, ctx, {
             ...params,
             path: [...params.path, "additionalProperties"],
         });
@@ -59549,7 +65770,7 @@ const recordProcessor = (schema, ctx, _json, params) => {
 };
 const nullableProcessor = (schema, ctx, json, params) => {
     const def = schema._zod.def;
-    const inner = to_json_schema_process(def.innerType, ctx, params);
+    const inner = to_json_schema_processSchema(def.innerType, ctx, params);
     const seen = ctx.seen.get(schema);
     if (ctx.target === "openapi-3.0") {
         seen.ref = def.innerType;
@@ -59561,7 +65782,7 @@ const nullableProcessor = (schema, ctx, json, params) => {
 };
 const nonoptionalProcessor = (schema, ctx, _json, params) => {
     const def = schema._zod.def;
-    to_json_schema_process(def.innerType, ctx, params);
+    to_json_schema_processSchema(def.innerType, ctx, params);
     const seen = ctx.seen.get(schema);
     seen.ref = def.innerType;
 };
@@ -59584,7 +65805,7 @@ function serializeDefaultValue(value, schema, ctx, json, params) {
 }
 const defaultProcessor = (schema, ctx, json, params) => {
     const def = schema._zod.def;
-    to_json_schema_process(def.innerType, ctx, params);
+    to_json_schema_processSchema(def.innerType, ctx, params);
     const seen = ctx.seen.get(schema);
     seen.ref = def.innerType;
     const value = serializeDefaultValue(def.defaultValue, schema, ctx, json, params);
@@ -59593,7 +65814,7 @@ const defaultProcessor = (schema, ctx, json, params) => {
 };
 const prefaultProcessor = (schema, ctx, json, params) => {
     const def = schema._zod.def;
-    to_json_schema_process(def.innerType, ctx, params);
+    to_json_schema_processSchema(def.innerType, ctx, params);
     const seen = ctx.seen.get(schema);
     seen.ref = def.innerType;
     if (ctx.io !== "input")
@@ -59604,7 +65825,7 @@ const prefaultProcessor = (schema, ctx, json, params) => {
 };
 const catchProcessor = (schema, ctx, json, params) => {
     const def = schema._zod.def;
-    to_json_schema_process(def.innerType, ctx, params);
+    to_json_schema_processSchema(def.innerType, ctx, params);
     const seen = ctx.seen.get(schema);
     seen.ref = def.innerType;
     let catchValue;
@@ -59621,32 +65842,32 @@ const pipeProcessor = (schema, ctx, _json, params) => {
     const def = schema._zod.def;
     const inIsTransform = def.in._zod.traits.has("$ZodTransform");
     const innerType = ctx.io === "input" ? (inIsTransform ? def.out : def.in) : def.out;
-    to_json_schema_process(innerType, ctx, params);
+    to_json_schema_processSchema(innerType, ctx, params);
     const seen = ctx.seen.get(schema);
     seen.ref = innerType;
 };
 const readonlyProcessor = (schema, ctx, json, params) => {
     const def = schema._zod.def;
-    to_json_schema_process(def.innerType, ctx, params);
+    to_json_schema_processSchema(def.innerType, ctx, params);
     const seen = ctx.seen.get(schema);
     seen.ref = def.innerType;
     json.readOnly = true;
 };
 const promiseProcessor = (schema, ctx, _json, params) => {
     const def = schema._zod.def;
-    to_json_schema_process(def.innerType, ctx, params);
+    to_json_schema_processSchema(def.innerType, ctx, params);
     const seen = ctx.seen.get(schema);
     seen.ref = def.innerType;
 };
 const optionalProcessor = (schema, ctx, _json, params) => {
     const def = schema._zod.def;
-    to_json_schema_process(def.innerType, ctx, params);
+    to_json_schema_processSchema(def.innerType, ctx, params);
     const seen = ctx.seen.get(schema);
     seen.ref = def.innerType;
 };
 const lazyProcessor = (schema, ctx, _json, params) => {
     const innerType = schema._zod.innerType;
-    to_json_schema_process(innerType, ctx, params);
+    to_json_schema_processSchema(innerType, ctx, params);
     const seen = ctx.seen.get(schema);
     seen.ref = innerType;
 };
@@ -59701,7 +65922,7 @@ function toJSONSchema(input, params) {
         // First pass: process all schemas to build the seen map
         for (const entry of registry._idmap.entries()) {
             const [_, schema] = entry;
-            process(schema, ctx);
+            processSchema(schema, ctx);
         }
         const schemas = {};
         const external = {
@@ -59727,7 +65948,7 @@ function toJSONSchema(input, params) {
     }
     // Single schema case
     const ctx = initializeContext({ ...params, processors: allProcessors });
-    process(input, ctx);
+    processSchema(input, ctx);
     extractDefs(ctx, input);
     return finalize(ctx, input);
 }
@@ -59773,7 +65994,9 @@ const error = () => {
         base64url: "base64url-encoded string",
         json_string: "JSON string",
         e164: "E.164 number",
+        currency_code: "currency code",
         credit_card: "credit card number",
+        iban: "IBAN",
         jwt: "JWT",
         template_literal: "input",
     };
@@ -59942,6 +66165,7 @@ const parse_safeDecodeAsync = /* @__PURE__ */ _safeDecodeAsync(ZodRealError);
 
 
 
+
 // Register English as the default locale on first ZodType construction. Hooked into the `ZodType` `$constructor` (rather than a top-level `config(en())` in `external.ts`) so bundlers honoring `sideEffects: false` can't tree-shake it out — see #5953, #5725. An explicit `z.config(z.locales.xx())` call wins regardless of order, since this only sets the default when none is present.
 function _ensureDefaultLocale() {
     if (!globalConfig.localeError)
@@ -60086,6 +66310,12 @@ const ZodType = /*@__PURE__*/ $constructor("ZodType", (inst, def) => {
     set spa(value) {
         own(this, "spa", value);
     },
+    validate(data, params) {
+        return validate(this, data, params);
+    },
+    validateAsync(data, params) {
+        return validateAsync(this, data, params);
+    },
     encode: function _encode(data, params) {
         return parse_encode(this, data, params, { callee: _encode });
     },
@@ -60127,10 +66357,11 @@ const _ZodString = /*@__PURE__*/ $constructor("_ZodString", (inst, def) => {
     $ZodString.init(inst, def);
     ZodType.init(inst, def);
     inst._zod.processJSONSchema = (ctx, json, params) => stringProcessor(inst, ctx, json, params);
-    const bag = inst._zod.bag;
-    inst.format = bag.format ?? null;
-    inst.minLength = bag.minimum ?? null;
-    inst.maxLength = bag.maximum ?? null;
+}, 
+/*@__PURE__*/ derived({
+    format: (inst) => aggregateChecks(inst).format ?? null,
+    minLength: (inst) => aggregateChecks(inst).minimum ?? null,
+    maxLength: (inst) => aggregateChecks(inst).maximum ?? null,
 }, {
     regex(...args) {
         return this.check(_regex(...args));
@@ -60177,7 +66408,7 @@ const _ZodString = /*@__PURE__*/ $constructor("_ZodString", (inst, def) => {
     slugify() {
         return this.check(_slugify());
     },
-});
+}));
 const ZodString = /*@__PURE__*/ $constructor("ZodString", (inst, def) => {
     $ZodString.init(inst, def);
     _ZodString.init(inst, def);
@@ -60329,8 +66560,8 @@ function url(params) {
 }
 function httpUrl(params) {
     return core._url(ZodURL, {
-        protocol: core.regexes.httpProtocol,
-        hostname: core.regexes.domain,
+        protocol: regexes.httpProtocol,
+        hostname: regexes.domain,
         ...util.normalizeParams(params),
     });
 }
@@ -60471,6 +66702,13 @@ const ZodCreditCard = /*@__PURE__*/ (/* unused pure expression or super */ null 
 function schemas_creditCard(params) {
     return core._creditCard(ZodCreditCard, params);
 }
+const ZodIBAN = /*@__PURE__*/ (/* unused pure expression or super */ null && (core.$constructor("ZodIBAN", (inst, def) => {
+    core.$ZodIBAN.init(inst, def);
+    ZodStringFormat.init(inst, def);
+})));
+function schemas_iban(params) {
+    return core._iban(ZodIBAN, params);
+}
 const ZodJWT = /*@__PURE__*/ $constructor("ZodJWT", (inst, def) => {
     // ZodStringFormat.init(inst, def);
     $ZodJWT.init(inst, def);
@@ -60488,10 +66726,13 @@ function stringFormat(format, fnOrRegex, _params = {}) {
     return core._stringFormat(ZodCustomStringFormat, format, fnOrRegex, _params);
 }
 function schemas_hostname(_params) {
-    return core._stringFormat(ZodCustomStringFormat, "hostname", core.regexes.hostname, _params);
+    return core._stringFormat(ZodCustomStringFormat, "hostname", regexes.hostname, _params);
 }
 function schemas_hex(_params) {
-    return core._stringFormat(ZodCustomStringFormat, "hex", core.regexes.hex, _params);
+    return core._stringFormat(ZodCustomStringFormat, "hex", regexes.hex, _params);
+}
+function schemas_currencyCode(_params) {
+    return core._stringFormat(ZodCustomStringFormat, "currency_code", regexes.currencyCode, _params);
 }
 function hash(alg, params) {
     const enc = params?.enc ?? "hex";
@@ -60505,14 +66746,22 @@ const ZodNumber = /*@__PURE__*/ $constructor("ZodNumber", (inst, def) => {
     $ZodNumber.init(inst, def);
     ZodType.init(inst, def);
     inst._zod.processJSONSchema = (ctx, json, params) => numberProcessor(inst, ctx, json, params);
-    const bag = inst._zod.bag;
-    inst.minValue =
-        Math.max(bag.minimum ?? Number.NEGATIVE_INFINITY, bag.exclusiveMinimum ?? Number.NEGATIVE_INFINITY) ?? null;
-    inst.maxValue =
-        Math.min(bag.maximum ?? Number.POSITIVE_INFINITY, bag.exclusiveMaximum ?? Number.POSITIVE_INFINITY) ?? null;
-    inst.isInt = (bag.format ?? "").includes("int") || Number.isSafeInteger(bag.multipleOf ?? 0.5);
     inst.isFinite = true;
-    inst.format = bag.format ?? null;
+}, 
+/*@__PURE__*/ derived({
+    minValue: (inst) => {
+        const { minimum, exclusiveMinimum } = aggregateChecks(inst);
+        return Math.max(minimum ?? Number.NEGATIVE_INFINITY, exclusiveMinimum ?? Number.NEGATIVE_INFINITY);
+    },
+    maxValue: (inst) => {
+        const { maximum, exclusiveMaximum } = aggregateChecks(inst);
+        return Math.min(maximum ?? Number.POSITIVE_INFINITY, exclusiveMaximum ?? Number.POSITIVE_INFINITY);
+    },
+    isInt: (inst) => {
+        const { isInt, multipleOf } = aggregateChecks(inst);
+        return !!isInt || !!multipleOf?.some(Number.isSafeInteger);
+    },
+    format: (inst) => aggregateChecks(inst).format ?? null,
 }, {
     gt(value, params) {
         return this.check(_gt(value, params));
@@ -60559,7 +66808,7 @@ const ZodNumber = /*@__PURE__*/ $constructor("ZodNumber", (inst, def) => {
     finite() {
         return this;
     },
-});
+}));
 function schemas_number(params) {
     return _number(ZodNumber, params);
 }
@@ -60594,10 +66843,11 @@ const ZodBigInt = /*@__PURE__*/ $constructor("ZodBigInt", (inst, def) => {
     $ZodBigInt.init(inst, def);
     ZodType.init(inst, def);
     inst._zod.processJSONSchema = (ctx, json, params) => bigintProcessor(inst, ctx, json, params);
-    const bag = inst._zod.bag;
-    inst.minValue = bag.minimum ?? null;
-    inst.maxValue = bag.maximum ?? null;
-    inst.format = bag.format ?? null;
+}, 
+/*@__PURE__*/ derived({
+    minValue: (inst) => aggregateChecks(inst).minimum ?? null,
+    maxValue: (inst) => aggregateChecks(inst).maximum ?? null,
+    format: (inst) => aggregateChecks(inst).format ?? null,
 }, {
     gte(value, params) {
         return this.check(_gte(value, params));
@@ -60632,7 +66882,7 @@ const ZodBigInt = /*@__PURE__*/ $constructor("ZodBigInt", (inst, def) => {
     multipleOf(value, params) {
         return this.check(_multipleOf(value, params));
     },
-});
+}));
 function schemas_bigint(params) {
     return core._bigint(ZodBigInt, params);
 }
@@ -60705,16 +66955,23 @@ function schemas_void(params) {
     return core._void(ZodVoid, params);
 }
 
-const ZodDate = /*@__PURE__*/ (/* unused pure expression or super */ null && (core.$constructor("ZodDate", (inst, def) => {
-    core.$ZodDate.init(inst, def);
+const ZodDate = /*@__PURE__*/ $constructor("ZodDate", (inst, def) => {
+    $ZodDate.init(inst, def);
     ZodType.init(inst, def);
-    inst._zod.processJSONSchema = (ctx, json, params) => processors.dateProcessor(inst, ctx, json, params);
-    inst.min = (value, params) => inst.check(checks.gte(value, params));
-    inst.max = (value, params) => inst.check(checks.lte(value, params));
-    const c = inst._zod.bag;
-    inst.minDate = c.minimum ? new Date(c.minimum) : null;
-    inst.maxDate = c.maximum ? new Date(c.maximum) : null;
-})));
+    inst._zod.processJSONSchema = (ctx, json, params) => dateProcessor(inst, ctx, json, params);
+    inst.min = (value, params) => inst.check(_gte(value, params));
+    inst.max = (value, params) => inst.check(_lte(value, params));
+}, 
+/*@__PURE__*/ derived({
+    minDate: (inst) => {
+        const { minimum } = aggregateChecks(inst);
+        return minimum ? new Date(minimum) : null;
+    },
+    maxDate: (inst) => {
+        const { maximum } = aggregateChecks(inst);
+        return maximum ? new Date(maximum) : null;
+    },
+}, {}));
 function schemas_date(params) {
     return core._date(ZodDate, params);
 }
@@ -60760,19 +67017,20 @@ const ZodObject = /*@__PURE__*/ $constructor("ZodObject", (inst, def) => {
         return schemas_enum(Object.keys(this._zod.def.shape));
     },
     catchall(catchall) {
-        return this.clone({ ...this._zod.def, catchall: catchall });
+        // `mergeDefs` rather than a spread: spreading reads `shape`, and resolving it can mint a whole fresh subtree
+        return this.clone(mergeDefs(this._zod.def, { catchall: catchall }));
     },
     passthrough() {
-        return this.clone({ ...this._zod.def, catchall: unknown() });
+        return this.clone(mergeDefs(this._zod.def, { catchall: unknown() }));
     },
     loose() {
-        return this.clone({ ...this._zod.def, catchall: unknown() });
+        return this.clone(mergeDefs(this._zod.def, { catchall: unknown() }));
     },
     strict() {
-        return this.clone({ ...this._zod.def, catchall: never() });
+        return this.clone(mergeDefs(this._zod.def, { catchall: never() }));
     },
     strip() {
-        return this.clone({ ...this._zod.def, catchall: undefined });
+        return this.clone(mergeDefs(this._zod.def, { catchall: undefined }));
     },
     extend(incoming) {
         return extend(this, incoming);
@@ -61000,7 +67258,8 @@ const ZodEnum = /*@__PURE__*/ $constructor("ZodEnum", (inst, def) => {
     ZodType.init(inst, def);
     inst._zod.processJSONSchema = (ctx, json, params) => enumProcessor(inst, ctx, json, params);
     inst.enum = def.entries;
-    inst.options = Object.values(def.entries);
+    // reuse the parsed value set so a numeric TS enum's reverse-mapping keys stay out
+    inst.options = [...inst._zod.values];
     const keys = new Set(Object.keys(def.entries));
     inst.extract = (values, params) => {
         const newEntries = {};
@@ -61382,8 +67641,16 @@ function superRefine(fn, params) {
 // Re-export describe and meta from core
 const schemas_describe = describe;
 const schemas_meta = meta;
+const ZodInstanceOf = /*@__PURE__*/ $constructor("ZodInstanceOf", (inst, def) => {
+    ZodCustom.init(inst, def);
+}, {
+    properties(shape, params) {
+        // asserts in place, so the narrowed output type is truthful without a wrapper
+        return this.check(_properties(shape, params));
+    },
+});
 function _instanceof(cls, params = {}) {
-    const inst = new ZodCustom({
+    const inst = new ZodInstanceOf({
         type: "custom",
         check: "custom",
         fn: (data) => data instanceof cls,
@@ -63776,7 +70043,7 @@ function string_parseStringDef(def, refs) {
                             addFormat(res, "idn-email", check.message, refs);
                             break;
                         case "pattern:zod":
-                            addPattern(res, zodPatterns.email, check.message, refs);
+                            string_addPattern(res, zodPatterns.email, check.message, refs);
                             break;
                     }
                     break;
@@ -63787,19 +70054,19 @@ function string_parseStringDef(def, refs) {
                     addFormat(res, "uuid", check.message, refs);
                     break;
                 case "regex":
-                    addPattern(res, check.regex, check.message, refs);
+                    string_addPattern(res, check.regex, check.message, refs);
                     break;
                 case "cuid":
-                    addPattern(res, zodPatterns.cuid, check.message, refs);
+                    string_addPattern(res, zodPatterns.cuid, check.message, refs);
                     break;
                 case "cuid2":
-                    addPattern(res, zodPatterns.cuid2, check.message, refs);
+                    string_addPattern(res, zodPatterns.cuid2, check.message, refs);
                     break;
                 case "startsWith":
-                    addPattern(res, RegExp(`^${escapeLiteralCheckValue(check.value, refs)}`), check.message, refs);
+                    string_addPattern(res, RegExp(`^${escapeLiteralCheckValue(check.value, refs)}`), check.message, refs);
                     break;
                 case "endsWith":
-                    addPattern(res, RegExp(`${escapeLiteralCheckValue(check.value, refs)}$`), check.message, refs);
+                    string_addPattern(res, RegExp(`${escapeLiteralCheckValue(check.value, refs)}$`), check.message, refs);
                     break;
                 case "datetime":
                     addFormat(res, "date-time", check.message, refs);
@@ -63822,7 +70089,7 @@ function string_parseStringDef(def, refs) {
                         : check.value, check.message, refs);
                     break;
                 case "includes": {
-                    addPattern(res, RegExp(escapeLiteralCheckValue(check.value, refs)), check.message, refs);
+                    string_addPattern(res, RegExp(escapeLiteralCheckValue(check.value, refs)), check.message, refs);
                     break;
                 }
                 case "ip": {
@@ -63835,25 +70102,25 @@ function string_parseStringDef(def, refs) {
                     break;
                 }
                 case "base64url":
-                    addPattern(res, zodPatterns.base64url, check.message, refs);
+                    string_addPattern(res, zodPatterns.base64url, check.message, refs);
                     break;
                 case "jwt":
-                    addPattern(res, zodPatterns.jwt, check.message, refs);
+                    string_addPattern(res, zodPatterns.jwt, check.message, refs);
                     break;
                 case "cidr": {
                     if (check.version !== "v6") {
-                        addPattern(res, zodPatterns.ipv4Cidr, check.message, refs);
+                        string_addPattern(res, zodPatterns.ipv4Cidr, check.message, refs);
                     }
                     if (check.version !== "v4") {
-                        addPattern(res, zodPatterns.ipv6Cidr, check.message, refs);
+                        string_addPattern(res, zodPatterns.ipv6Cidr, check.message, refs);
                     }
                     break;
                 }
                 case "emoji":
-                    addPattern(res, zodPatterns.emoji(), check.message, refs);
+                    string_addPattern(res, zodPatterns.emoji(), check.message, refs);
                     break;
                 case "ulid": {
-                    addPattern(res, zodPatterns.ulid, check.message, refs);
+                    string_addPattern(res, zodPatterns.ulid, check.message, refs);
                     break;
                 }
                 case "base64": {
@@ -63867,14 +70134,14 @@ function string_parseStringDef(def, refs) {
                             break;
                         }
                         case "pattern:zod": {
-                            addPattern(res, zodPatterns.base64, check.message, refs);
+                            string_addPattern(res, zodPatterns.base64, check.message, refs);
                             break;
                         }
                     }
                     break;
                 }
                 case "nanoid": {
-                    addPattern(res, zodPatterns.nanoid, check.message, refs);
+                    string_addPattern(res, zodPatterns.nanoid, check.message, refs);
                 }
                 case "toLowerCase":
                 case "toUpperCase":
@@ -63936,7 +70203,7 @@ function addFormat(schema, value, message, refs) {
     }
 }
 // Adds a "pattern" keyword to the schema. If a pattern exists, both patterns will be joined in an allOf-node, along with subsequent ones.
-function addPattern(schema, regex, message, refs) {
+function string_addPattern(schema, regex, message, refs) {
     if (schema.pattern || schema.allOf?.some((x) => x.pattern)) {
         if (!schema.allOf) {
             schema.allOf = [];
@@ -64852,6 +71119,10 @@ class Protocol {
             this.setRequestHandler(GetTaskPayloadRequestSchema, async (request, extra) => {
                 const handleTaskResult = async () => {
                     const taskId = request.params.taskId;
+                    // Look the task up for this session first; queued messages are only delivered for a task it can see.
+                    if (!(await this._taskStore.getTask(taskId, extra.sessionId))) {
+                        throw new McpError(ErrorCode.InvalidParams, `Task not found: ${taskId}`);
+                    }
                     // Deliver queued messages
                     if (this._taskMessageQueue) {
                         let queuedMessage;
@@ -64897,14 +71168,14 @@ class Protocol {
                     // Block if task is not terminal (we've already delivered all queued messages above)
                     if (!isTerminal(task.status)) {
                         // Wait for status change or new messages
-                        await this._waitForTaskUpdate(taskId, extra.signal);
+                        await this._waitForTaskUpdate(taskId, extra.signal, extra.sessionId);
                         // After waking up, recursively call to deliver any new messages or result
                         return await handleTaskResult();
                     }
                     // If task is terminal, return the result
                     if (isTerminal(task.status)) {
                         const result = await this._taskStore.getTaskResult(taskId, extra.sessionId);
-                        this._clearTaskQueue(taskId);
+                        this._clearTaskQueue(taskId, extra.sessionId);
                         return {
                             ...result,
                             _meta: {
@@ -64945,7 +71216,7 @@ class Protocol {
                         throw new McpError(ErrorCode.InvalidParams, `Cannot cancel task in terminal status: ${task.status}`);
                     }
                     await this._taskStore.updateTaskStatus(request.params.taskId, 'cancelled', 'Client cancelled task execution.', extra.sessionId);
-                    this._clearTaskQueue(request.params.taskId);
+                    this._clearTaskQueue(request.params.taskId, extra.sessionId);
                     const cancelledTask = await this._taskStore.getTask(request.params.taskId, extra.sessionId);
                     if (!cancelledTask) {
                         // Task was deleted during cancellation (e.g., cleanup happened)
@@ -65087,6 +71358,20 @@ class Protocol {
         const capturedTransport = this._transport;
         // Extract taskId from request metadata if present (needed early for method not found case)
         const relatedTaskId = request.params?._meta?.[RELATED_TASK_META_KEY]?.taskId;
+        // With a session, the related task is looked up for that session first; replies are queued for it only if it is found.
+        const sessionId = capturedTransport?.sessionId;
+        const store = this._taskStore;
+        let relatedTaskFound = true;
+        let relatedTaskLookup;
+        if (relatedTaskId && store && this._taskMessageQueue && sessionId !== undefined) {
+            relatedTaskFound = false;
+            relatedTaskLookup = (async () => {
+                if (!(await store.getTask(relatedTaskId, sessionId))) {
+                    throw new McpError(ErrorCode.InvalidParams, `Task not found: ${relatedTaskId}`);
+                }
+                relatedTaskFound = true;
+            })();
+        }
         if (handler === undefined) {
             const errorResponse = {
                 jsonrpc: '2.0',
@@ -65097,7 +71382,13 @@ class Protocol {
                 }
             };
             // Queue or send the error response based on whether this is a task-related request
-            if (relatedTaskId && this._taskMessageQueue) {
+            if (relatedTaskId && relatedTaskLookup) {
+                const queuedError = { type: 'error', message: errorResponse, timestamp: Date.now() };
+                relatedTaskLookup
+                    .then(() => this._enqueueTaskMessage(relatedTaskId, queuedError, sessionId), () => capturedTransport?.send(errorResponse))
+                    .catch(error => this._onerror(new Error(`Failed to send an error response: ${error}`)));
+            }
+            else if (relatedTaskId && this._taskMessageQueue) {
                 this._enqueueTaskMessage(relatedTaskId, {
                     type: 'error',
                     message: errorResponse,
@@ -65156,8 +71447,12 @@ class Protocol {
             closeStandaloneSSEStream: extra?.closeStandaloneSSEStream
         };
         // Starting with Promise.resolve() puts any synchronous errors into the monad as well.
-        Promise.resolve()
+        (relatedTaskLookup ?? Promise.resolve())
             .then(() => {
+            // A request cancelled while its related task was looked up does not start its handler; nothing is replied.
+            if (relatedTaskLookup && abortController.signal.aborted) {
+                throw new McpError(ErrorCode.ConnectionClosed, 'Request was cancelled');
+            }
             // If this request asked for task creation, check capability first
             if (taskCreationParams) {
                 // Check if the request method supports task creation
@@ -65201,7 +71496,7 @@ class Protocol {
                 }
             };
             // Queue or send the error response based on whether this is a task-related request
-            if (relatedTaskId && this._taskMessageQueue) {
+            if (relatedTaskId && this._taskMessageQueue && relatedTaskFound) {
                 await this._enqueueTaskMessage(relatedTaskId, {
                     type: 'error',
                     message: errorResponse,
@@ -65751,7 +72046,8 @@ class Protocol {
             throw new Error('Cannot enqueue task message: taskStore and taskMessageQueue are not configured');
         }
         const maxQueueSize = this._options?.maxTaskQueueSize;
-        await this._taskMessageQueue.enqueue(taskId, message, sessionId, maxQueueSize);
+        // Messages queued by local code carry the session of the current connection, like the ones queued for a request.
+        await this._taskMessageQueue.enqueue(taskId, message, sessionId ?? this._transport?.sessionId, maxQueueSize);
     }
     /**
      * Clears the message queue for a task and rejects any pending request resolvers.
@@ -65784,13 +72080,14 @@ class Protocol {
      * Uses polling to check for updates at the task's configured poll interval.
      * @param taskId The task ID to wait for
      * @param signal Abort signal to cancel the wait
+     * @param sessionId Session of the request that waits, passed to the task store
      * @returns Promise that resolves when an update occurs or rejects if aborted
      */
-    async _waitForTaskUpdate(taskId, signal) {
+    async _waitForTaskUpdate(taskId, signal, sessionId) {
         // Get the task's poll interval, falling back to default
         let interval = this._options?.defaultTaskPollInterval ?? 1000;
         try {
-            const task = await this._taskStore?.getTask(taskId);
+            const task = await this._taskStore?.getTask(taskId, sessionId);
             if (task?.pollInterval) {
                 interval = task.pollInterval;
             }
@@ -67202,6 +73499,78 @@ function createFetchWithInit(baseFetch = fetch, baseInit) {
         return baseFetch(url, mergedInit);
     };
 }
+const MAX_REDIRECTS = 5;
+const REDIRECT_STATUSES = [301, 302, 303, 307, 308];
+/** @internal Whether `to` has the scheme, host and port of `from`, or is its https form with both on default ports. */
+function isWithinOrigin(from, to) {
+    if (from.protocol === to.protocol && from.hostname === to.hostname && from.port === to.port) {
+        return true;
+    }
+    return from.hostname === to.hostname && from.protocol === 'http:' && from.port === '' && to.protocol === 'https:' && to.port === '';
+}
+function redirectTarget(response, requestUrl) {
+    const location = REDIRECT_STATUSES.includes(response.status) ? response.headers.get('location') : null;
+    try {
+        return location ? new URL(location, requestUrl) : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/** @internal Follows the redirect in `response` while it stays within the origin of `url`; undefined when `response` is to be used as is. */
+function followWithinOrigin(baseFetch, url, init, response, followed = 0) {
+    const target = redirectTarget(response, url);
+    // 301, 302 and 303 turn a request with a body into a GET, so only 307 and 308 are followed for those.
+    const keepsMethod = response.status === 307 || response.status === 308 || (init?.method ?? 'GET').toUpperCase() === 'GET';
+    if (!target || followed === MAX_REDIRECTS || !keepsMethod) {
+        return undefined;
+    }
+    const from = new URL(url);
+    const addsUserinfo = (target.username || target.password) && (target.username !== from.username || target.password !== from.password);
+    if (addsUserinfo || !isWithinOrigin(from, target)) {
+        return undefined;
+    }
+    return Promise.resolve(response.body?.cancel())
+        .then(() => baseFetch(target, { ...init, redirect: 'manual' }))
+        .then(next => followWithinOrigin(baseFetch, target, init, next, followed + 1) ?? next);
+}
+const followingFetches = new WeakSet();
+/** @internal Wraps a fetch for `redirectPolicy: 'follow'`: `fetchWithinOrigin` returns the result as it is, so redirects are left to the fetch. */
+function fetchLeavingRedirects(baseFetch) {
+    const following = (url, init) => (baseFetch ?? fetch)(url, init);
+    followingFetches.add(following);
+    return following;
+}
+/** @internal Wraps a fetch so it follows a redirect only within the request's origin; any other redirect response is returned as is. */
+function fetchWithinOrigin(baseFetch = fetch) {
+    if (followingFetches.has(baseFetch)) {
+        return baseFetch;
+    }
+    return (url, init) => {
+        if (init?.redirect === 'error' || init?.redirect === 'manual') {
+            return baseFetch(url, init);
+        }
+        // Browsers answer a manual redirect with an opaque response: it is returned and nothing is followed.
+        return Promise.resolve(baseFetch(url, { ...init, redirect: 'manual' })).then(response => followWithinOrigin(baseFetch, url, init, response) ?? response);
+    };
+}
+/** @internal Describes a redirect that `fetchWithinOrigin` returned unfollowed, naming its target without userinfo, query or fragment. */
+function unfollowedRedirect(response, requestUrl) {
+    if (response.type === 'opaqueredirect') {
+        return 'Redirect not followed: this runtime does not expose the redirect target';
+    }
+    const from = response.url || requestUrl;
+    const target = redirectTarget(response, from);
+    if (!target) {
+        return undefined;
+    }
+    target.username = target.password = target.search = target.hash = '';
+    if (target.protocol === 'http:' && new URL(from).protocol === 'https:') {
+        target.protocol = 'https:';
+        return `Redirect to plain http not followed; try ${target.href} instead`;
+    }
+    return `Redirect to ${target.href} not followed`;
+}
 //# sourceMappingURL=transport.js.map
 ;// CONCATENATED MODULE: ./node_modules/pkce-challenge/dist/index.node.js
 let index_node_crypto;
@@ -67460,7 +73829,12 @@ const OAuthTokensSchema = object({
     token_type: schemas_string(),
     expires_in: coerce_number().optional(),
     scope: schemas_string().optional(),
-    refresh_token: schemas_string().optional()
+    refresh_token: schemas_string().optional(),
+    /**
+     * Not part of the wire format: the authorization server this value was obtained from, added by
+     * the client's `auth()` before it is stored and compared when it is read back.
+     */
+    issuer: schemas_string().optional().catch(undefined)
 })
     .strip();
 /**
@@ -67504,7 +73878,12 @@ const OAuthClientInformationSchema = object({
     client_id: schemas_string(),
     client_secret: schemas_string().optional(),
     client_id_issued_at: schemas_number().optional(),
-    client_secret_expires_at: schemas_number().optional()
+    client_secret_expires_at: schemas_number().optional(),
+    /**
+     * Not part of the wire format: the authorization server this value was obtained from, added by
+     * the client's `auth()` before it is stored and compared when it is read back.
+     */
+    issuer: schemas_string().optional().catch(undefined)
 })
     .strip();
 /**
@@ -67761,6 +74140,7 @@ const OAUTH_ERRORS = {
 
 
 
+
 class UnauthorizedError extends Error {
     constructor(message) {
         super(message ?? 'Unauthorized');
@@ -67890,9 +74270,48 @@ async function parseErrorResponse(input) {
     }
     catch (error) {
         // Not a valid OAuth error response, but try to inform the user of the raw data anyway
-        const errorMessage = `${statusCode ? `HTTP ${statusCode}: ` : ''}Invalid OAuth error response: ${error}. Raw body: ${body}`;
+        const redirect = input instanceof Response ? unfollowedRedirect(input, input.url) : undefined;
+        const errorMessage = `${statusCode ? `HTTP ${statusCode}: ` : ''}${redirect ?? `Invalid OAuth error response: ${error}. Raw body: ${body}`}`;
         return new ServerError(errorMessage);
     }
+}
+/**
+ * Compares two authorization server identifiers, tolerating a single trailing `/`
+ * difference (`String(new URL(...))` is slash-suffixed, advertised values often are not).
+ */
+function issuersMatch(a, b) {
+    let [x, y] = [a, b];
+    try {
+        // Two URLs are compared as parsed, so the spelling of scheme, host or default port does not matter.
+        [x, y] = [new URL(a).href, new URL(b).href];
+    }
+    catch {
+        // Not two URLs: compared as written.
+    }
+    return x === y || (x.endsWith('/') && x.slice(0, -1) === y) || (y.endsWith('/') && y.slice(0, -1) === x);
+}
+/**
+ * {@linkcode auth} stamps everything it passes to `saveClientInformation` / `saveTokens` with
+ * `issuer`, the authorization server URL used for discovery. This returns `stored` unless its
+ * stamp names a different authorization server, in which case the caller behaves as if nothing
+ * were stored. A value without a stamp (saved by an earlier version) is returned as-is, and
+ * is stamped once this authorization server has accepted it.
+ */
+function discardIfIssuerMismatch(stored, issuer) {
+    // `null`: a `JSON.parse(storage.getItem(...))`-style getter with nothing stored.
+    if (!stored)
+        return undefined;
+    // A stamp that is not a string (raw storage) counts as no stamp.
+    if (typeof stored.issuer !== 'string')
+        return stored.issuer == null ? stored : { ...stored, issuer: undefined };
+    return issuersMatch(stored.issuer, issuer) ? stored : undefined;
+}
+// `issuer` is added by the client when it stores a value; authorization server responses are parsed without it.
+const TokenResponseSchema = OAuthTokensSchema.omit({ issuer: true });
+const RegistrationResponseSchema = OAuthClientInformationFullSchema.omit({ issuer: true });
+function boundElsewhereError(stored, issuer) {
+    return new Error(`OAuth client information is bound to authorization server ${stored.issuer} and is not presented to ${issuer}. ` +
+        'Clear the stored client information, or correct `expectedIssuer`, if the authorization server has moved.');
 }
 /**
  * Orchestrates the full auth flow with a server.
@@ -67972,15 +74391,45 @@ async function authInternal(provider, { serverUrl, authorizationCode, scope, res
             authorizationServerMetadata: metadata
         });
     }
-    const resource = await selectResourceURL(serverUrl, provider, resourceMetadata);
+    // Binding key for stored credentials: the authorization server URL that discovery used
+    // (advertised by the resource server, restored from discoveryState(), or the legacy
+    // resource-origin fallback). `metadata.issuer` is deliberately not used: this version does
+    // not check that the metadata document echoes the URL it was fetched from.
+    const issuer = String(authorizationServerUrl);
+    // Send the metadata's resource indicator verbatim: `selectResourceURL` returns a parsed
+    // `URL`, and `URL.href` appends "/" to a pathless indicator such as `https://example.com`,
+    // which exact-match authorization servers reject (#1968). A URL returned by the
+    // provider's own `validateResourceURL` is used as returned.
+    const selectedResource = await selectResourceURL(serverUrl, provider, resourceMetadata);
+    const resource = selectedResource && resourceMetadata && !provider.validateResourceURL ? resourceMetadata.resource : selectedResource;
     // Apply scope selection strategy (SEP-835):
     // 1. WWW-Authenticate scope (passed via `scope` param)
     // 2. PRM scopes_supported
     // 3. Client metadata scope (user-configured fallback)
     // The resolved scope is used consistently for both DCR and the authorization request.
     const resolvedScope = scope || resourceMetadata?.scopes_supported?.join(' ') || provider.clientMetadata.scope;
-    // Handle client registration if needed
-    let clientInformation = await Promise.resolve(provider.clientInformation());
+    // Handle client registration if needed. Client information stamped for a different
+    // authorization server reads back as `undefined`, so the flow re-registers exactly as if
+    // nothing were stored.
+    const storedClientInformation = await Promise.resolve(provider.clientInformation());
+    let clientInformation = discardIfIssuerMismatch(storedClientInformation, issuer);
+    const canRegisterAgain = provider.saveClientInformation !== undefined && !!provider.redirectUrl;
+    if (storedClientInformation && !clientInformation && !canRegisterAgain) {
+        // Pre-registered credentials, or a non-interactive client running on configured
+        // credentials: neither can be re-created by registering with this authorization server.
+        throw boundElsewhereError(storedClientInformation, issuer);
+    }
+    // Saved by an earlier version: bound to the first authorization server that accepts it.
+    const unstampedClientInformation = clientInformation?.issuer == null ? clientInformation : undefined;
+    const bindClientInformation = async () => {
+        try {
+            if (unstampedClientInformation)
+                await provider.saveClientInformation?.({ ...unstampedClientInformation, issuer });
+        }
+        catch {
+            // A provider that only expects this call after a registration keeps working, unbound.
+        }
+    };
     if (!clientInformation) {
         if (authorizationCode !== undefined) {
             throw new Error('Existing OAuth client information is required when exchanging an authorization code');
@@ -67993,9 +74442,7 @@ async function authInternal(provider, { serverUrl, authorizationCode, scope, res
         const shouldUseUrlBasedClientId = supportsUrlBasedClientId && clientMetadataUrl;
         if (shouldUseUrlBasedClientId) {
             // SEP-991: URL-based Client IDs
-            clientInformation = {
-                client_id: clientMetadataUrl
-            };
+            clientInformation = { client_id: clientMetadataUrl, issuer };
             await provider.saveClientInformation?.(clientInformation);
         }
         else {
@@ -68009,8 +74456,8 @@ async function authInternal(provider, { serverUrl, authorizationCode, scope, res
                 scope: resolvedScope,
                 fetchFn
             });
-            await provider.saveClientInformation(fullInformation);
-            clientInformation = fullInformation;
+            clientInformation = { ...fullInformation, issuer };
+            await provider.saveClientInformation(clientInformation);
         }
     }
     // Non-interactive flows (e.g., client_credentials, jwt-bearer) don't need a redirect URL
@@ -68023,10 +74470,19 @@ async function authInternal(provider, { serverUrl, authorizationCode, scope, res
             authorizationCode,
             fetchFn
         });
-        await provider.saveTokens(tokens);
+        await bindClientInformation();
+        await provider.saveTokens({ ...tokens, issuer });
         return 'AUTHORIZED';
     }
-    const tokens = await provider.tokens();
+    // A refresh token stamped for a different authorization server reads back as `undefined`,
+    // so it is never posted to this one's token endpoint.
+    const tokens = discardIfIssuerMismatch(await provider.tokens(), issuer);
+    if (tokens?.refresh_token && tokens.issuer == null) {
+        // eslint-disable-next-line no-console
+        console.warn("[mcp-sdk] stored OAuth tokens have no 'issuer' property (saved by an earlier version, or by a provider that " +
+            'does not keep it) and are used as-is; make sure your OAuthClientProvider stores what saveTokens() and ' +
+            'saveClientInformation() receive unchanged.');
+    }
     // Handle token refresh or new authorization
     if (tokens?.refresh_token) {
         try {
@@ -68039,7 +74495,8 @@ async function authInternal(provider, { serverUrl, authorizationCode, scope, res
                 addClientAuthentication: provider.addClientAuthentication,
                 fetchFn
             });
-            await provider.saveTokens(newTokens);
+            await bindClientInformation();
+            await provider.saveTokens({ ...newTokens, issuer });
             return 'AUTHORIZED';
         }
         catch (error) {
@@ -68082,6 +74539,17 @@ function isHttpsUrl(value) {
         return false;
     }
 }
+/**
+ * Selects the RFC 8707 resource indicator for an MCP server: the provider's
+ * {@linkcode OAuthClientProvider.validateResourceURL | validateResourceURL} result when
+ * implemented, otherwise the protected resource metadata's `resource` (checked against the
+ * server URL with `checkResourceAllowed`), or `undefined` when there is no metadata.
+ *
+ * The result is a parsed `URL`, so a pathless indicator such as `https://example.com` has
+ * the `href` `https://example.com/`. {@linkcode auth} therefore sends the metadata string
+ * verbatim instead of this URL's `href` (#1968); callers that emit the `resource`
+ * parameter themselves should do the same.
+ */
 async function selectResourceURL(serverUrl, provider, resourceMetadata) {
     const defaultResource = resourceUrlFromServerUrl(serverUrl);
     // If provider has custom validation, delegate to it
@@ -68200,7 +74668,7 @@ async function discoverOAuthProtectedResourceMetadata(serverUrl, opts, fetchFn =
  */
 async function fetchWithCorsRetry(url, headers, fetchFn = fetch) {
     try {
-        return await fetchFn(url, { headers });
+        return await fetchWithinOrigin(fetchFn)(url, { headers });
     }
     catch (error) {
         if (error instanceof TypeError) {
@@ -68239,7 +74707,7 @@ async function tryMetadataDiscovery(url, protocolVersion, fetchFn = fetch) {
  * Determines if fallback to root discovery should be attempted
  */
 function shouldAttemptFallback(response, pathname) {
-    return !response || (response.status >= 400 && response.status < 500 && pathname !== '/');
+    return !response || (!response.ok && response.status < 500 && pathname !== '/');
 }
 /**
  * Generic function for discovering OAuth metadata with fallback support
@@ -68380,8 +74848,8 @@ async function discoverAuthorizationServerMetadata(authorizationServerUrl, { fet
         }
         if (!response.ok) {
             await response.body?.cancel();
-            // Continue looking for any 4xx response code.
-            if (response.status >= 400 && response.status < 500) {
+            // Continue looking for any 4xx response code, or a redirect that was not followed.
+            if (response.status < 500) {
                 continue; // Try next URL
             }
             throw new Error(`HTTP ${response.status} trying to load ${type === 'oauth' ? 'OAuth' : 'OpenID provider'} metadata from ${endpointUrl}`);
@@ -68440,6 +74908,9 @@ async function discoverOAuthServerInfo(serverUrl, opts) {
         resourceMetadata
     };
 }
+function resourceIndicatorToString(resource) {
+    return typeof resource === 'string' ? resource : resource.href;
+}
 /**
  * Begins the authorization flow with the given server, by generating a PKCE challenge and constructing the authorization URL.
  */
@@ -68480,7 +74951,7 @@ async function startAuthorization(authorizationServerUrl, { metadata, clientInfo
         authorizationUrl.searchParams.append('prompt', 'consent');
     }
     if (resource) {
-        authorizationUrl.searchParams.set('resource', resource.href);
+        authorizationUrl.searchParams.set('resource', resourceIndicatorToString(resource));
     }
     return { authorizationUrl, codeVerifier };
 }
@@ -68514,7 +74985,7 @@ async function executeTokenRequest(authorizationServerUrl, { metadata, tokenRequ
         Accept: 'application/json'
     });
     if (resource) {
-        tokenRequestParams.set('resource', resource.href);
+        tokenRequestParams.set('resource', resourceIndicatorToString(resource));
     }
     if (addClientAuthentication) {
         await addClientAuthentication(headers, tokenRequestParams, tokenUrl, metadata);
@@ -68524,7 +74995,7 @@ async function executeTokenRequest(authorizationServerUrl, { metadata, tokenRequ
         const authMethod = selectClientAuthMethod(clientInformation, supportedMethods);
         applyClientAuthentication(authMethod, clientInformation, headers, tokenRequestParams);
     }
-    const response = await (fetchFn ?? fetch)(tokenUrl, {
+    const response = await fetchWithinOrigin(fetchFn ?? fetch)(tokenUrl, {
         method: 'POST',
         headers,
         body: tokenRequestParams
@@ -68532,7 +75003,7 @@ async function executeTokenRequest(authorizationServerUrl, { metadata, tokenRequ
     if (!response.ok) {
         throw await parseErrorResponse(response);
     }
-    return OAuthTokensSchema.parse(await response.json());
+    return TokenResponseSchema.parse(await response.json());
 }
 /**
  * Exchanges an authorization code for an access token with the given server.
@@ -68612,6 +75083,16 @@ async function refreshAuthorization(authorizationServerUrl, { metadata, clientIn
  * const tokens = await fetchToken(provider, authServerUrl, { metadata });
  */
 async function fetchToken(provider, authorizationServerUrl, { metadata, resource, authorizationCode, fetchFn } = {}) {
+    // Nothing is sent to an authorization server other than the one the client information is stamped for.
+    const readClientInformation = async () => {
+        const storedClientInformation = await provider.clientInformation();
+        const checked = discardIfIssuerMismatch(storedClientInformation, String(authorizationServerUrl));
+        if (storedClientInformation && !checked) {
+            throw boundElsewhereError(storedClientInformation, String(authorizationServerUrl));
+        }
+        return checked;
+    };
+    let clientInformation = await readClientInformation();
     const scope = provider.clientMetadata.scope;
     // Use provider's prepareTokenRequest if available, otherwise fall back to authorization_code
     let tokenRequestParams;
@@ -68629,11 +75110,12 @@ async function fetchToken(provider, authorizationServerUrl, { metadata, resource
         const codeVerifier = await provider.codeVerifier();
         tokenRequestParams = prepareAuthorizationCodeRequest(authorizationCode, codeVerifier, provider.redirectUrl);
     }
-    const clientInformation = await provider.clientInformation();
+    // A provider may fill in its client information while the request is prepared.
+    clientInformation ?? (clientInformation = await readClientInformation());
     return executeTokenRequest(authorizationServerUrl, {
         metadata,
         tokenRequestParams,
-        clientInformation: clientInformation ?? undefined,
+        clientInformation,
         addClientAuthentication: provider.addClientAuthentication,
         resource,
         fetchFn
@@ -68657,7 +75139,7 @@ async function registerClient(authorizationServerUrl, { metadata, clientMetadata
     else {
         registrationUrl = new URL('/register', authorizationServerUrl);
     }
-    const response = await (fetchFn ?? fetch)(registrationUrl, {
+    const response = await fetchWithinOrigin(fetchFn ?? fetch)(registrationUrl, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json'
@@ -68670,7 +75152,7 @@ async function registerClient(authorizationServerUrl, { metadata, clientMetadata
     if (!response.ok) {
         throw await parseErrorResponse(response);
     }
-    return OAuthClientInformationFullSchema.parse(await response.json());
+    return RegistrationResponseSchema.parse(await response.json());
 }
 //# sourceMappingURL=auth.js.map
 ;// CONCATENATED MODULE: ./node_modules/eventsource-parser/dist/index.js
@@ -68912,8 +75394,18 @@ class StreamableHTTPClientTransport {
         this._authProvider = opts?.authProvider;
         this._fetch = opts?.fetch;
         this._fetchWithInit = createFetchWithInit(opts?.fetch, opts?.requestInit);
+        this._followRedirects = opts?.redirectPolicy === 'follow';
+        if (this._followRedirects) {
+            this._fetch = fetchLeavingRedirects(this._fetch);
+            this._fetchWithInit = fetchLeavingRedirects(this._fetchWithInit);
+        }
         this._sessionId = opts?.sessionId;
         this._reconnectionOptions = opts?.reconnectionOptions ?? DEFAULT_STREAMABLE_HTTP_RECONNECTION_OPTIONS;
+    }
+    /** Error text for a redirect `response` that was not followed, or `undefined` for any other response. */
+    _unfollowedRedirect(response, url) {
+        const text = unfollowedRedirect(response, url);
+        return text && !this._followRedirects ? `${text} (redirectPolicy: 'same-origin')` : text;
     }
     async _authThenStart() {
         if (!this._authProvider) {
@@ -68968,11 +75460,14 @@ class StreamableHTTPClientTransport {
             if (resumptionToken) {
                 headers.set('last-event-id', resumptionToken);
             }
-            const response = await (this._fetch ?? fetch)(this._url, {
-                method: 'GET',
-                headers,
-                signal: this._abortController?.signal
-            });
+            const fetchFn = this._fetch ?? fetch;
+            const init = { method: 'GET', headers, signal: this._abortController?.signal };
+            // A response that is not a redirect is used as it arrives, so reading the stream starts as early as before.
+            let response = await fetchFn(this._url, this._followRedirects ? init : { ...init, redirect: 'manual' });
+            const followed = this._followRedirects ? undefined : followWithinOrigin(fetchFn, this._url, init, response);
+            if (followed) {
+                response = await followed;
+            }
             if (!response.ok) {
                 await response.body?.cancel();
                 if (response.status === 401 && this._authProvider) {
@@ -68984,7 +75479,7 @@ class StreamableHTTPClientTransport {
                 if (response.status === 405) {
                     return;
                 }
-                throw new StreamableHTTPError(response.status, `Failed to open SSE stream: ${response.statusText}`);
+                throw new StreamableHTTPError(response.status, `Failed to open SSE stream: ${this._unfollowedRedirect(response, this._url) ?? response.statusText}`);
             }
             this._handleSseStream(response.body, options, true);
         }
@@ -69185,7 +75680,7 @@ class StreamableHTTPClientTransport {
                 body: JSON.stringify(message),
                 signal: this._abortController?.signal
             };
-            const response = await (this._fetch ?? fetch)(this._url, init);
+            const response = await fetchWithinOrigin(this._fetch ?? fetch)(this._url, init);
             // Handle session ID received during initialization
             const sessionId = response.headers.get('mcp-session-id');
             if (sessionId) {
@@ -69243,7 +75738,7 @@ class StreamableHTTPClientTransport {
                         return this.send(message);
                     }
                 }
-                throw new StreamableHTTPError(response.status, `Error POSTing to endpoint: ${text}`);
+                throw new StreamableHTTPError(response.status, `Error POSTing to endpoint: ${this._unfollowedRedirect(response, this._url) ?? text}`);
             }
             // Reset auth loop flag on successful response
             this._hasCompletedAuthFlow = false;
@@ -69323,12 +75818,12 @@ class StreamableHTTPClientTransport {
                 headers,
                 signal: this._abortController?.signal
             };
-            const response = await (this._fetch ?? fetch)(this._url, init);
+            const response = await fetchWithinOrigin(this._fetch ?? fetch)(this._url, init);
             await response.body?.cancel();
             // We specifically handle 405 as a valid response according to the spec,
             // meaning the server does not support explicit session termination
             if (!response.ok && response.status !== 405) {
-                throw new StreamableHTTPError(response.status, `Failed to terminate session: ${response.statusText}`);
+                throw new StreamableHTTPError(response.status, `Failed to terminate session: ${this._unfollowedRedirect(response, this._url) ?? response.statusText}`);
             }
             this._sessionId = undefined;
         }
@@ -69641,7 +76136,7 @@ class JsonRpcRemoteError extends Error {
  * and required reserved `_meta`. Responses come back as a single SSE frame
  * with Content-Type: text/event-stream — we parse the `data:` line as JSON.
  */
-function openStatelessHttp(url, baseHeaders, protocolVersion, clientCapabilities) {
+function openStatelessHttp(url, baseHeaders, protocolVersion, clientCapabilities, timeoutMs) {
     let nextId = 1;
     const reservedMeta = buildStatelessReservedMeta(protocolVersion, clientCapabilities);
     return {
@@ -69665,6 +76160,7 @@ function openStatelessHttp(url, baseHeaders, protocolVersion, clientCapabilities
                     "Mcp-Method": method,
                 },
                 body,
+                ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
             });
             const rawBody = await resp.text();
             if (!resp.ok) {
@@ -69695,7 +76191,7 @@ function openStatelessHttp(url, baseHeaders, protocolVersion, clientCapabilities
  * JSON-RPC responses from stdout, correlating by `id`. There are no
  * SEP-2243 HTTP headers over stdio — only the reserved `_meta` on params.
  */
-function openStatelessStdio(command, args, env, workingDir, protocolVersion, clientCapabilities) {
+function openStatelessStdio(command, args, env, workingDir, protocolVersion, clientCapabilities, timeoutMs) {
     const child = (0,external_node_child_process_namespaceObject.spawn)(command, args, {
         env,
         cwd: workingDir,
@@ -69726,6 +76222,8 @@ function openStatelessStdio(command, args, env, workingDir, protocolVersion, cli
         if (!handler)
             return;
         pending.delete(msg.id);
+        if (handler.timeout)
+            clearTimeout(handler.timeout);
         if (msg.error) {
             handler.reject(new JsonRpcRemoteError(msg.error.code, msg.error.message));
         }
@@ -69734,14 +76232,20 @@ function openStatelessStdio(command, args, env, workingDir, protocolVersion, cli
         }
     });
     child.on("error", (err) => {
-        for (const { reject } of pending.values())
+        for (const { reject, timeout } of pending.values()) {
+            if (timeout)
+                clearTimeout(timeout);
             reject(err);
+        }
         pending.clear();
     });
     child.on("exit", (code) => {
         const err = new Error(`stdio child exited prematurely with code ${code}`);
-        for (const { reject } of pending.values())
+        for (const { reject, timeout } of pending.values()) {
+            if (timeout)
+                clearTimeout(timeout);
             reject(err);
+        }
         pending.clear();
     });
     let nextId = 1;
@@ -69758,9 +76262,19 @@ function openStatelessStdio(command, args, env, workingDir, protocolVersion, cli
                     ...reservedMeta,
                 };
                 const line = JSON.stringify({ jsonrpc: "2.0", id, method, params: mergedParams }) + "\n";
-                pending.set(id, { resolve, reject });
+                const timeout = timeoutMs === undefined
+                    ? undefined
+                    : setTimeout(() => {
+                        if (pending.delete(id)) {
+                            reject(new Error(`Request '${method}' timed out after ${timeoutMs}ms`));
+                        }
+                    }, timeoutMs);
+                pending.set(id, { resolve, reject, timeout });
                 child.stdin.write(line, (err) => {
                     if (err) {
+                        const handler = pending.get(id);
+                        if (handler?.timeout)
+                            clearTimeout(handler.timeout);
                         pending.delete(id);
                         reject(err);
                     }
@@ -69853,13 +76367,13 @@ async function probeViaDiscover(options, result, clientCapabilities) {
             }
             for (const [key, value] of Object.entries(options.envVars || {}))
                 env[key] = value;
-            connection = openStatelessStdio(options.command, options.args || [], env, options.workingDir, STATELESS_PROBE_PROTOCOL_VERSION, clientCapabilities);
+            connection = openStatelessStdio(options.command, options.args || [], env, options.workingDir, STATELESS_PROBE_PROTOCOL_VERSION, clientCapabilities, options.timeoutMs);
         }
         else {
             if (!options.url)
                 return "http url missing";
             log.info(`  Probing via server/discover (http): ${options.url}`);
-            connection = openStatelessHttp(options.url, options.headers ?? {}, STATELESS_PROBE_PROTOCOL_VERSION, clientCapabilities);
+            connection = openStatelessHttp(options.url, options.headers ?? {}, STATELESS_PROBE_PROTOCOL_VERSION, clientCapabilities, options.timeoutMs);
         }
     }
     catch (err) {
@@ -70012,6 +76526,7 @@ async function probeViaInitialize(options, result, clientCapabilities) {
         // while MCP explicitly permits additional top-level capability objects.
         capabilities: clientCapabilities,
     });
+    const requestOptions = options.timeoutMs === undefined ? undefined : { timeout: options.timeoutMs };
     let transport;
     try {
         if (options.transport === "stdio") {
@@ -70060,7 +76575,7 @@ async function probeViaInitialize(options, result, clientCapabilities) {
             originalSetProtocolVersion?.(version);
         };
         // Connect to the server
-        await client.connect(transport);
+        await client.connect(transport, requestOptions);
         log.info("  Connected successfully");
         // Get server info and capabilities
         const serverCapabilities = client.getServerCapabilities();
@@ -70082,7 +76597,7 @@ async function probeViaInitialize(options, result, clientCapabilities) {
         // Probe tools if supported
         if (serverCapabilities?.tools) {
             try {
-                const toolsResult = await client.listTools();
+                const toolsResult = await client.listTools(undefined, requestOptions);
                 result.tools = toolsResult;
                 log.info(`  Listed ${result.tools.tools.length} tools`);
             }
@@ -70101,7 +76616,7 @@ async function probeViaInitialize(options, result, clientCapabilities) {
         // Probe prompts if supported
         if (serverCapabilities?.prompts) {
             try {
-                const promptsResult = await client.listPrompts();
+                const promptsResult = await client.listPrompts(undefined, requestOptions);
                 result.prompts = promptsResult;
                 log.info(`  Listed ${result.prompts.prompts.length} prompts`);
             }
@@ -70120,7 +76635,7 @@ async function probeViaInitialize(options, result, clientCapabilities) {
         // Probe resources if supported
         if (serverCapabilities?.resources) {
             try {
-                const resourcesResult = await client.listResources();
+                const resourcesResult = await client.listResources(undefined, requestOptions);
                 result.resources = resourcesResult;
                 log.info(`  Listed ${result.resources.resources.length} resources`);
             }
@@ -70134,7 +76649,7 @@ async function probeViaInitialize(options, result, clientCapabilities) {
             }
             // Also try resource templates - some servers support resources but not templates
             try {
-                const templatesResult = await client.listResourceTemplates();
+                const templatesResult = await client.listResourceTemplates(undefined, requestOptions);
                 result.resourceTemplates = templatesResult;
                 log.info(`  Listed ${result.resourceTemplates.resourceTemplates.length} resource templates`);
             }
@@ -70157,7 +76672,7 @@ async function probeViaInitialize(options, result, clientCapabilities) {
             for (const customMsg of options.customMessages) {
                 try {
                     // Cast message to the expected request type - custom messages should have a method field
-                    const response = await client.request(customMsg.message, anyResponseSchema);
+                    const response = await client.request(customMsg.message, anyResponseSchema, requestOptions);
                     result.customResponses.set(customMsg.name, response);
                     log.info(`  Custom message '${customMsg.name}' successful`);
                 }
@@ -70702,7 +77217,7 @@ async function runPostTestCommand(config, workDir) {
  * @param overrideCommand - If provided, use this command instead of config.start_command (for base_start_command)
  * @param overrideUrl - If provided, use this URL instead of config.server_url (for base_server_url)
  */
-async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, useSharedServer = false, overrideCommand, overrideUrl) {
+async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, timeoutMs, useSharedServer = false, overrideCommand, overrideUrl) {
     const configEnvVars = parseEnvVars(config.env_vars);
     const envVars = { ...globalEnvVars, ...configEnvVars };
     const headers = { ...globalHeaders, ...config.headers };
@@ -70727,6 +77242,7 @@ async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, gl
             envVars,
             customMessages,
             clientCapabilities,
+            timeoutMs,
         });
     }
     else {
@@ -70748,6 +77264,7 @@ async function probeWithConfig(config, workDir, globalEnvVars, globalHeaders, gl
                 envVars,
                 customMessages,
                 clientCapabilities,
+                timeoutMs,
             });
         }
         finally {
@@ -71070,7 +77587,7 @@ async function startSharedHttpServer(command, workDir, waitMs, envVars) {
  * @param overrideCommand - If provided, use this command instead of config.start_command
  * @param overrideUrl - If provided, use this URL instead of config.server_url
  */
-async function probeConfig(config, workDir, envVars, headers, customMessages, clientCapabilities, useSharedServer, overrideCommand, overrideUrl) {
+async function probeConfig(config, workDir, envVars, headers, customMessages, clientCapabilities, timeoutMs, useSharedServer, overrideCommand, overrideUrl) {
     const displayName = overrideCommand
         ? `${config.name} (base: ${overrideCommand.slice(0, 50)}${overrideCommand.length > 50 ? "..." : ""})`
         : config.name;
@@ -71078,7 +77595,7 @@ async function probeConfig(config, workDir, envVars, headers, customMessages, cl
     const start = Date.now();
     let result;
     try {
-        result = await probeWithConfig(config, workDir, envVars, headers, customMessages, clientCapabilities, useSharedServer, overrideCommand, overrideUrl);
+        result = await probeWithConfig(config, workDir, envVars, headers, customMessages, clientCapabilities, timeoutMs, useSharedServer, overrideCommand, overrideUrl);
     }
     finally {
         await runPostTestCommand(config, workDir);
@@ -71114,7 +77631,7 @@ async function runAllTests(ctx) {
         for (const config of ctx.inputs.configurations) {
             const configUsesSharedServer = useSharedServer && config.transport === "streamable-http";
             try {
-                const probeData = await probeConfig(config, ctx.workDir, globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, configUsesSharedServer);
+                const probeData = await probeConfig(config, ctx.workDir, globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, ctx.inputs.serverTimeout * 1000, configUsesSharedServer);
                 branchResults.set(config.name, probeData);
             }
             catch (error) {
@@ -71156,7 +77673,7 @@ async function runAllTests(ctx) {
             try {
                 // Use base_start_command/base_server_url for comparison
                 const probeData = await probeConfig(config, ctx.workDir, // Use current workdir since we're not checking out
-                globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, false, // Don't use shared server for base commands
+                globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, ctx.inputs.serverTimeout * 1000, false, // Don't use shared server for base commands
                 config.base_start_command, config.base_server_url);
                 baseResults.set(config.name, probeData);
             }
@@ -71203,7 +77720,7 @@ async function runAllTests(ctx) {
                 for (const config of configsNeedingGit) {
                     const configUsesSharedServer = useSharedServer && config.transport === "streamable-http";
                     try {
-                        const probeData = await probeConfig(config, baseWorkDir, globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, configUsesSharedServer);
+                        const probeData = await probeConfig(config, baseWorkDir, globalEnvVars, globalHeaders, globalCustomMessages, globalClientCapabilities, ctx.inputs.serverTimeout * 1000, configUsesSharedServer);
                         baseResults.set(config.name, probeData);
                     }
                     catch (error) {
@@ -71682,10 +78199,17 @@ function getInputs() {
     // Parse global headers
     const headersInput = getInput("headers");
     const headers = parseHeaders(headersInput);
+    const serverTimeoutInput = getInput("server_timeout").trim();
+    const serverTimeout = serverTimeoutInput ? Number(serverTimeoutInput) : 10;
+    if (!Number.isSafeInteger(serverTimeout) ||
+        serverTimeout <= 0 ||
+        !Number.isSafeInteger(serverTimeout * 1000)) {
+        throw new Error("server_timeout must be a positive whole number of seconds");
+    }
     return {
         // Language setup
         setupNode: getBooleanInput("setup_node"),
-        nodeVersion: getInput("node_version") || "20",
+        nodeVersion: getInput("node_version") || "22",
         setupPython: getBooleanInput("setup_python"),
         pythonVersion: getInput("python_version") || "3.11",
         setupGo: getBooleanInput("setup_go"),
@@ -71713,7 +78237,7 @@ function getInputs() {
         failOnError: getBooleanInput("fail_on_error") !== false, // default true
         failOnDiff: getBooleanInput("fail_on_diff") === true, // default false
         envVars: getInput("env_vars"),
-        serverTimeout: parseInt(getInput("server_timeout") || "30000", 10),
+        serverTimeout,
     };
 }
 /**

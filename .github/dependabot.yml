@@ -11,7 +11,7 @@ updates:
       - "github-actions"
 
   - package-ecosystem: "npm"
-    directory: "/probe"
+    directory: "/"
     schedule:
       interval: "weekly"
     commit-message:
