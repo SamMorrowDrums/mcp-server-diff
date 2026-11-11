@@ -47,5 +47,5 @@ jobs:
       - name: Verify dist is up to date
         if: matrix.node-version == 22
         run: |
-          # Check if bundled action files are up to date
-          git diff --exit-code dist/ comment/dist/ || (echo "::error::bundled action files are out of date. Run 'npm run build' and commit the changes." && exit 1)
+          # Check if dist files are up to date
+          git diff --exit-code dist/ || (echo "::error::dist/ is out of date. Run 'npm run build' and commit the changes." && exit 1)
