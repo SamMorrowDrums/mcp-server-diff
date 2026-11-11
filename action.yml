@@ -145,6 +145,9 @@ outputs:
   report_path:
     description: 'Path to the diff report'
     value: 'mcp-diff-report/MCP_DIFF_REPORT.md'
+  report_artifact_url:
+    description: 'URL to the uploaded diff report artifact'
+    value: ${{ steps.upload.outputs.artifact-url }}
   json_report_path:
     description: 'Path to the JSON report'
     value: ${{ steps.diff.outputs.json_report_path }}
@@ -199,8 +202,10 @@ runs:
     - name: Set environment variables
       if: inputs.env_vars != ''
       shell: bash
+      env:
+        INPUT_ENV_VARS: ${{ inputs.env_vars }}
       run: |
-        echo "${{ inputs.env_vars }}" >> $GITHUB_ENV
+        printf '%s\n' "$INPUT_ENV_VARS" >> "$GITHUB_ENV"
 
     - name: Run MCP server diff
       id: diff
@@ -236,12 +241,15 @@ runs:
 
     - name: Generate Job Summary
       shell: bash
+      env:
+        INPUT_COMPARE_REF: ${{ inputs.compare_ref }}
+        DIFF_STATUS: ${{ steps.diff.outputs.status }}
       run: |
         echo "# MCP Server Diff Report" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        if [ -n "${{ inputs.compare_ref }}" ]; then
-          echo "Comparing against: \`${{ inputs.compare_ref }}\`" >> $GITHUB_STEP_SUMMARY
-        elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+        if [ -n "$INPUT_COMPARE_REF" ]; then
+          printf 'Comparing against: `%s`\n' "$INPUT_COMPARE_REF" >> "$GITHUB_STEP_SUMMARY"
+        elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
           echo "Comparing tag against previous tag (auto-detected)" >> $GITHUB_STEP_SUMMARY
         else
           echo "Comparing against merge-base with \`origin/main\`" >> $GITHUB_STEP_SUMMARY
@@ -258,16 +266,25 @@ runs:
         echo "---" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         
-        if [ "${{ steps.diff.outputs.status }}" = "passed" ]; then
+        if [ "$DIFF_STATUS" = "passed" ]; then
           echo "**No API changes detected** between the branches." >> $GITHUB_STEP_SUMMARY
         else
           echo "**API changes detected** — review above to confirm they are expected." >> $GITHUB_STEP_SUMMARY
         fi
 
     - name: Upload diff report
+      id: upload
       if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: mcp-diff-report
         path: mcp-diff-report/
         if-no-files-found: ignore
+
+    - name: Link report artifact in job summary
+      if: always() && steps.upload.outputs.artifact-url != ''
+      shell: bash
+      env:
+        REPORT_ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+      run: |
+        printf '\n[Download the full diff report artifact](%s)\n' "$REPORT_ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"

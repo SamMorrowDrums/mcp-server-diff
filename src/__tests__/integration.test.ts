@@ -9,6 +9,7 @@ import { spawn, ChildProcess } from "child_process";
 import * as path from "path";
 import { fileURLToPath } from "url";
 import { jest } from "@jest/globals";
+import { createServer } from "node:http";
 import { DEFAULT_CLIENT_CAPABILITIES, type ClientCapabilities } from "../client-capabilities.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -73,6 +74,19 @@ describe("Integration: stdio transport", () => {
 
     // Should have an error
     expect(result.error).toBeDefined();
+  });
+
+  it("times out a stdio server that never responds", async () => {
+    const start = Date.now();
+    const result = await probeServer({
+      transport: "stdio",
+      command: process.execPath,
+      args: ["-e", "process.stdin.resume()"],
+      timeoutMs: 50,
+    });
+
+    expect(result.error).toBeDefined();
+    expect(Date.now() - start).toBeLessThan(2000);
   });
 });
 
@@ -199,6 +213,30 @@ describe("Integration: streamable-http transport", () => {
 
     // Should have an error
     expect(result.error).toBeDefined();
+  });
+
+  it("times out an HTTP server that never responds", async () => {
+    const stalledServer = createServer(() => {});
+    await new Promise<void>((resolve) => stalledServer.listen(0, "127.0.0.1", resolve));
+    const address = stalledServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Failed to get stalled server address");
+    }
+
+    const start = Date.now();
+    try {
+      const result = await probeServer({
+        transport: "streamable-http",
+        url: `http://127.0.0.1:${address.port}/mcp`,
+        timeoutMs: 50,
+      });
+
+      expect(result.error).toBeDefined();
+      expect(Date.now() - start).toBeLessThan(2000);
+    } finally {
+      stalledServer.closeAllConnections();
+      await new Promise<void>((resolve) => stalledServer.close(() => resolve()));
+    }
   });
 });
 

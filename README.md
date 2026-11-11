@@ -41,11 +41,11 @@ jobs:
   mcp-diff:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
         with:
           fetch-depth: 0
 
-      - uses: SamMorrowDrums/mcp-server-diff@v2
+      - uses: SamMorrowDrums/mcp-server-diff@v3
         with:
           setup_node: true
           install_command: npm ci
@@ -58,7 +58,7 @@ jobs:
 ### Node.js / TypeScript
 
 ```yaml
-- uses: SamMorrowDrums/mcp-server-diff@v2
+- uses: SamMorrowDrums/mcp-server-diff@v3
   with:
     setup_node: true
     node_version: '22'
@@ -70,7 +70,7 @@ jobs:
 ### Python
 
 ```yaml
-- uses: SamMorrowDrums/mcp-server-diff@v2
+- uses: SamMorrowDrums/mcp-server-diff@v3
   with:
     setup_python: true
     python_version: '3.12'
@@ -81,7 +81,7 @@ jobs:
 ### Go
 
 ```yaml
-- uses: SamMorrowDrums/mcp-server-diff@v2
+- uses: SamMorrowDrums/mcp-server-diff@v3
   with:
     setup_go: true
     install_command: go mod download
@@ -92,7 +92,7 @@ jobs:
 ### Rust
 
 ```yaml
-- uses: SamMorrowDrums/mcp-server-diff@v2
+- uses: SamMorrowDrums/mcp-server-diff@v3
   with:
     setup_rust: true
     install_command: cargo fetch
@@ -103,7 +103,7 @@ jobs:
 ### C# / .NET
 
 ```yaml
-- uses: SamMorrowDrums/mcp-server-diff@v2
+- uses: SamMorrowDrums/mcp-server-diff@v3
   with:
     setup_dotnet: true
     dotnet_version: '9.0.x'
@@ -118,17 +118,17 @@ If you need more control over environment setup (caching, specific registries, e
 
 ```yaml
 steps:
-  - uses: actions/checkout@v4
+  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
     with:
       fetch-depth: 0
 
-  - uses: actions/setup-node@v4
+  - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
     with:
       node-version: '22'
       cache: 'npm'
       registry-url: 'https://npm.pkg.github.com'
 
-  - uses: SamMorrowDrums/mcp-server-diff@v2
+  - uses: SamMorrowDrums/mcp-server-diff@v3
     with:
       install_command: npm ci
       build_command: npm run build
@@ -140,7 +140,7 @@ steps:
 Test both stdio and HTTP transports in a single run using the `configurations` input:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-server-diff@v2
+- uses: SamMorrowDrums/mcp-server-diff@v3
   with:
     setup_node: true
     install_command: npm ci
@@ -168,7 +168,7 @@ Test both stdio and HTTP transports in a single run using the `configurations` i
 | Input | Description | Default |
 |-------|-------------|---------|
 | `setup_node` | Set up Node.js environment | `false` |
-| `node_version` | Node.js version | `20` |
+| `node_version` | Node.js version | `22` |
 | `setup_python` | Set up Python environment | `false` |
 | `python_version` | Python version | `3.11` |
 | `setup_go` | Set up Go environment | `false` |
@@ -333,6 +333,14 @@ configurations: |
   ]
 ```
 
+## Security
+
+The action executes configured install, build, and server commands, and its server
+processes inherit the job environment. Use trusted configuration and avoid exposing
+secrets or write-capable tokens when running it against untrusted pull request code.
+Grant workflows only the permissions they need, and pass servers only the credentials
+required for the probe.
+
 ## How It Works
 
 ### Execution Flow
@@ -399,7 +407,7 @@ error and trips `fail_on_error` (when enabled).
 The default transport communicates with your server via stdin/stdout using JSON-RPC. For stdio, each configuration spawns a fresh server process:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-server-diff@v2
+- uses: SamMorrowDrums/mcp-server-diff@v3
   with:
     setup_node: true
     install_command: npm ci
@@ -453,7 +461,7 @@ configurations: |
 **Pre-deployed servers**: For already-running servers (staging, production), omit lifecycle commands entirely:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-server-diff@v2
+- uses: SamMorrowDrums/mcp-server-diff@v3
   with:
     install_command: 'true'
     transport: streamable-http
@@ -483,7 +491,7 @@ on:
 Specify any git ref to compare against:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-server-diff@v2
+- uses: SamMorrowDrums/mcp-server-diff@v3
   with:
     setup_node: true
     install_command: npm ci
@@ -497,7 +505,7 @@ Specify any git ref to compare against:
 For release workflows where you want to ensure no API changes, use `fail_on_diff`:
 
 ```yaml
-- uses: SamMorrowDrums/mcp-server-diff@v2
+- uses: SamMorrowDrums/mcp-server-diff@v3
   with:
     setup_node: true
     install_command: npm ci
@@ -588,11 +596,11 @@ jobs:
   mcp-diff:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
         with:
           fetch-depth: 0
 
-      - uses: SamMorrowDrums/mcp-server-diff@v2
+      - uses: SamMorrowDrums/mcp-server-diff@v3
         with:
           setup_node: true
           install_command: npm ci

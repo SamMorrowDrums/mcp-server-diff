@@ -15,6 +15,7 @@ export interface ProbeOptions {
     envVars?: Record<string, string>;
     customMessages?: CustomMessage[];
     clientCapabilities?: ClientCapabilities;
+    timeoutMs?: number;
 }
 /**
  * Probes an MCP server and returns capability snapshots.
