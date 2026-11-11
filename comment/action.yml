@@ -1,0 +1,24 @@
+name: 'MCP Server Diff PR Comment'
+description: 'Create or update a sticky pull request comment with an MCP diff report'
+author: 'Sam Morrow'
+inputs:
+  github_token:
+    description: 'Token with pull-requests: write permission'
+    required: true
+  pull_request_number:
+    description: 'Pull request number to comment on'
+    required: true
+  comment_author:
+    description: 'Login that owns the sticky comment (defaults to github-actions[bot])'
+    required: false
+    default: 'github-actions[bot]'
+  report_path:
+    description: 'Path to the downloaded MCP diff Markdown report'
+    required: true
+  artifact_url:
+    description: 'Optional URL to the uploaded report artifact'
+    required: false
+    default: ''
+runs:
+  using: 'node24'
+  main: 'dist/index.js'
