@@ -16,9 +16,10 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "npm run build:action && npm run build:cli",
+    "build": "npm run build:action && npm run build:cli && npm run build:comment",
     "build:action": "ncc build src/index.ts -o dist --license licenses.txt --no-source-map-register",
     "build:cli": "ncc build src/cli.ts -o dist/cli --license licenses.txt --no-source-map-register && node -e \"const fs=require('fs'); const p='dist/cli/index.js'; fs.writeFileSync(p, '#!/usr/bin/env node\\n' + fs.readFileSync(p))\"",
+    "build:comment": "ncc build src/comment.ts -o comment/dist --license licenses.txt --no-source-map-register",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write src/",

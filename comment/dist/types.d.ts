@@ -1,0 +1,170 @@
+/**
+ * Type definitions for MCP Conformance Action
+ */
+import type { ClientCapabilities } from "./client-capabilities.js";
+export interface TestConfiguration {
+    name: string;
+    transport: "stdio" | "streamable-http";
+    start_command?: string;
+    args?: string;
+    server_url?: string;
+    headers?: Record<string, string>;
+    env_vars?: string;
+    custom_messages?: CustomMessage[];
+    /** Client capability declaration for this configuration; replaces the global/default profile */
+    client_capabilities?: ClientCapabilities;
+    /** Command to run before starting the MCP server for this config */
+    pre_test_command?: string;
+    /** Milliseconds to wait after pre_test_command before starting the server */
+    pre_test_wait_ms?: number;
+    /** Milliseconds to wait for HTTP server to start (when using start_command with HTTP transport) */
+    startup_wait_ms?: number;
+    /** Command to run after stopping the MCP server for this config (cleanup) */
+    post_test_command?: string;
+    /**
+     * Command to use for the base/comparison server instead of checking out a git ref.
+     * When set, skips git operations and uses this command directly for comparison.
+     * Useful for comparing against external servers (e.g., docker images of previous releases).
+     */
+    base_start_command?: string;
+    /** Server URL for base comparison (for HTTP transport with base_start_command) */
+    base_server_url?: string;
+}
+export interface CustomMessage {
+    id: number;
+    name: string;
+    message: Record<string, unknown>;
+}
+export interface ActionInputs {
+    setupNode: boolean;
+    nodeVersion: string;
+    setupPython: boolean;
+    pythonVersion: string;
+    setupGo: boolean;
+    goVersion: string;
+    setupRust: boolean;
+    rustToolchain: string;
+    setupDotnet: boolean;
+    dotnetVersion: string;
+    installCommand: string;
+    buildCommand: string;
+    startCommand: string;
+    transport: "stdio" | "streamable-http";
+    serverUrl: string;
+    headers: Record<string, string>;
+    configurations: TestConfiguration[];
+    customMessages: CustomMessage[];
+    clientCapabilities: ClientCapabilities;
+    compareRef: string;
+    failOnError: boolean;
+    failOnDiff: boolean;
+    envVars: string;
+    /** Maximum wait for each server response, in seconds */
+    serverTimeout: number;
+    httpStartCommand: string;
+    httpStartupWaitMs: number;
+}
+export interface ProbeResult {
+    initialize: InitializeInfo | null;
+    instructions: string | null;
+    tools: ToolsResult | null;
+    prompts: PromptsResult | null;
+    resources: ResourcesResult | null;
+    resourceTemplates: ResourceTemplatesResult | null;
+    customResponses: Map<string, unknown>;
+    error?: string;
+}
+export interface InitializeInfo {
+    /** Negotiated MCP protocol version (captured via transport hook). */
+    protocolVersion?: string;
+    serverInfo?: {
+        name: string;
+        version: string;
+    };
+    capabilities?: Record<string, unknown>;
+}
+export interface ToolsResult {
+    [key: string]: unknown;
+    tools: Array<{
+        name: string;
+        description?: string;
+        inputSchema?: Record<string, unknown>;
+    } & Record<string, unknown>>;
+}
+export interface PromptsResult {
+    [key: string]: unknown;
+    prompts: Array<{
+        name: string;
+        description?: string;
+        arguments?: Array<{
+            name: string;
+            description?: string;
+            required?: boolean;
+        }>;
+    } & Record<string, unknown>>;
+}
+export interface ResourcesResult {
+    [key: string]: unknown;
+    resources: Array<{
+        uri: string;
+        name: string;
+        description?: string;
+        mimeType?: string;
+    } & Record<string, unknown>>;
+}
+export interface ResourceTemplatesResult {
+    [key: string]: unknown;
+    resourceTemplates: Array<{
+        uriTemplate: string;
+        name: string;
+        description?: string;
+        mimeType?: string;
+    } & Record<string, unknown>>;
+}
+/** Counts of MCP primitives discovered */
+export interface PrimitiveCounts {
+    tools: number;
+    prompts: number;
+    resources: number;
+    resourceTemplates: number;
+}
+export interface TestResult {
+    configName: string;
+    transport: string;
+    branchTime: number;
+    baseTime: number;
+    hasDifferences: boolean;
+    diffs: Map<string, string>;
+    /** Primitive counts from current branch */
+    branchCounts?: PrimitiveCounts;
+    /** Primitive counts from base ref */
+    baseCounts?: PrimitiveCounts;
+    /** Negotiated MCP protocol version on the current branch probe */
+    branchProtocolVersion?: string;
+    /** Negotiated MCP protocol version on the base ref probe */
+    baseProtocolVersion?: string;
+    /** Error message if probing failed */
+    error?: string;
+    /**
+     * Set when the configuration failed to start on exactly one side of the
+     * comparison (e.g. a new config that does not exist on the compare ref). The
+     * working side is still diffed against an empty baseline; this records which
+     * side could not start and the underlying startup error.
+     */
+    configMissing?: {
+        /** Side that failed to start: "branch" (current) or "base" (compare ref) */
+        side: "branch" | "base";
+        /** Underlying startup error from the failed side */
+        error: string;
+    };
+}
+export interface ConformanceReport {
+    generatedAt: string;
+    currentBranch: string;
+    compareRef: string;
+    results: TestResult[];
+    totalBranchTime: number;
+    totalBaseTime: number;
+    passedCount: number;
+    diffCount: number;
+}

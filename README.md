@@ -578,6 +578,10 @@ This makes it easy to see exactly what changed without wading through entire JSO
 
 ## Recommended Workflow
 
+This workflow opts into a sticky PR comment using the companion action. The diff job
+has read-only permissions; the comment job does not check out or execute PR code.
+Fork and Dependabot PRs keep the job summary and artifact without a comment.
+
 ```yaml
 name: MCP Server Diff
 
@@ -595,12 +599,15 @@ permissions:
 jobs:
   mcp-diff:
     runs-on: ubuntu-latest
+    outputs:
+      artifact_url: ${{ steps.diff.outputs.report_artifact_url }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
         with:
           fetch-depth: 0
 
       - uses: SamMorrowDrums/mcp-server-diff@v3
+        id: diff
         with:
           setup_node: true
           install_command: npm ci
@@ -619,7 +626,33 @@ jobs:
                 "server_url": "http://localhost:3000/mcp"
               }
             ]
+
+  comment:
+    needs: mcp-diff
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: mcp-diff-report
+          path: mcp-diff-report
+
+      - uses: SamMorrowDrums/mcp-server-diff/comment@v3
+        with:
+          github_token: ${{ github.token }}
+          pull_request_number: ${{ github.event.pull_request.number }}
+          report_path: mcp-diff-report/MCP_DIFF_REPORT.md
+          artifact_url: ${{ needs.mcp-diff.outputs.artifact_url }}
 ```
+
+The comment action updates its own sticky comment on later runs. If you use a token
+other than `GITHUB_TOKEN`, set `comment_author` to the login that owns the comment.
+The artifact and run links are also available in the comment and job summary.
 
 ## Troubleshooting
 
