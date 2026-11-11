@@ -54,7 +54,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/diff": "^7.0.2",
+    "@types/diff": "^8.0.0",
     "@types/jest": "^30.0.0",
     "@types/node": "^24.0.0",
     "@vercel/ncc": "^0.44.0",
